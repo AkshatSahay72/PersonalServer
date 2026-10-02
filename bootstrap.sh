@@ -7,7 +7,7 @@ echo "       PERSONAL SERVER"
 echo "================================="
 echo
 
-SERVER_DIR="$HOME/personal-server"
+SERVER_DIR="$HOME/PersonalServer"
 
 echo "[1/4] Detecting system..."
 
