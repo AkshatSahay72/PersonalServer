@@ -14,6 +14,7 @@ config/secrets/
 logs/
 runtime/
 data/
+controller/data/
 
 # OS files
 .DS_Store
