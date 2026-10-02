@@ -473,7 +473,38 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # 7. Proxy to Controller for UI: /api/cluster, /api/jobs, /api/jobs/<job_id>
+        # 7. Session Info: GET /api/session
+        if path == "/api/session":
+            cf_email = self.headers.get("Cf-Access-Authenticated-User-Email") or self.headers.get("cf-access-authenticated-user-email")
+            client_ip = self.client_address[0]
+            is_local = client_ip in ("127.0.0.1", "::1", "localhost")
+            self.send_json(200, {
+                "authenticated": bool(cf_email or is_local),
+                "user": cf_email if cf_email else ("admin" if is_local else "anonymous"),
+                "auth_method": "cloudflare-access" if cf_email else ("tailscale-local" if is_local else "none")
+            })
+            return
+
+        # 8. Services Status: GET /api/services
+        if path == "/api/services":
+            config = load_config()
+            controller_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+            controller_connected = False
+            try:
+                with urllib.request.urlopen(f"{controller_url}/health", timeout=2) as r:
+                    if r.status == 200:
+                        controller_connected = True
+            except Exception:
+                pass
+
+            self.send_json(200, {
+                "node_api": "running",
+                "cloudflare": "connected",
+                "controller": "connected" if controller_connected else "disconnected"
+            })
+            return
+
+        # 9. Proxy to Controller for UI: /api/cluster, /api/jobs, /api/jobs/<job_id>
         if path.startswith("/api/"):
             subpath = path[4:]  # /api/cluster -> /cluster, /api/jobs -> /jobs
             self.proxy_to_controller("GET", subpath, parsed.query)

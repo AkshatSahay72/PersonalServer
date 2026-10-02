@@ -1,40 +1,50 @@
-// PersonalServer v1.0 - Self-Hosted Server Admin Logic
+// PersonalServer v1.1 - Client Application Logic
 
 let currentPath = "";
-let authToken = localStorage.getItem("ps_auth_token") || "";
 let cachedNodes = [];
 let cachedJobs = [];
 
-function getHeaders() {
-  const headers = {};
-  if (authToken) {
-    headers["Authorization"] = "Bearer " + authToken;
-    headers["X-Auth-Token"] = authToken;
+// API Helper
+async function apiFetch(endpoint, options = {}) {
+  try {
+    const res = await fetch(endpoint, options);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status} ${res.statusText}`);
+    }
+    return await res.json();
+  } catch (err) {
+    console.error(`API error on ${endpoint}:`, err);
+    throw err;
   }
-  return headers;
 }
 
 // Router
 function navigate() {
   const hash = window.location.hash.replace("#", "") || "dashboard";
   document.querySelectorAll(".page-view").forEach(el => el.classList.remove("active"));
-  document.querySelectorAll(".nav-item").forEach(el => el.classList.remove("active"));
+  document.querySelectorAll(".nav-link").forEach(el => el.classList.remove("active"));
 
   const targetView = document.getElementById(`view-${hash}`);
-  const targetNav = document.querySelector(`.nav-item[data-page="${hash}"]`);
+  const targetNav = document.querySelector(`.nav-link[data-page="${hash}"]`);
   const heading = document.getElementById("page-heading");
+  const subHeading = document.getElementById("page-subheading");
 
   if (targetView) targetView.classList.add("active");
   if (targetNav) targetNav.classList.add("active");
 
   const titles = {
-    dashboard: "Dashboard",
-    nodes: "Nodes",
-    jobs: "Workload jobs",
-    storage: "Personal storage"
+    dashboard: { main: "PersonalServer", sub: "Cluster overview" },
+    nodes: { main: "Nodes", sub: "Cluster inventory & telemetry" },
+    jobs: { main: "Jobs", sub: "Workload execution & lifecycle" },
+    storage: { main: "Storage", sub: "Personal file manager" }
   };
-  if (heading) heading.textContent = titles[hash] || "Admin";
 
+  const meta = titles[hash] || { main: "PersonalServer", sub: "Administration" };
+  if (heading) heading.textContent = meta.main;
+  if (subHeading) subHeading.textContent = meta.sub;
+
+  loadSession();
   if (hash === "dashboard") loadDashboard();
   else if (hash === "nodes") loadNodes();
   else if (hash === "jobs") loadJobs();
@@ -43,21 +53,11 @@ function navigate() {
 
 window.addEventListener("hashchange", navigate);
 
-// Auth management
-document.getElementById("auth-btn")?.addEventListener("click", () => {
-  const key = prompt("Enter Server Auth Token / Key:", authToken);
-  if (key !== null) {
-    authToken = key.trim();
-    localStorage.setItem("ps_auth_token", authToken);
-    navigate();
-  }
-});
-
 document.getElementById("refresh-btn")?.addEventListener("click", () => {
   navigate();
 });
 
-// Helper formatting
+// Formatters
 function formatBytes(bytes) {
   if (bytes === 0 || bytes === "0") return "0 B";
   const num = parseInt(bytes, 10);
@@ -82,31 +82,53 @@ function timeAgo(isoStr) {
     if (sec < 5) return "just now";
     if (sec < 60) return sec + "s ago";
     if (sec < 3600) return Math.floor(sec / 60) + "m ago";
-    return Math.floor(sec / 3600) + "h ago";
+    if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
+    return Math.floor(sec / 86400) + "d ago";
   } catch {
     return "-";
   }
 }
 
-function renderStatusDot(status) {
-  const s = (status || "").toUpperCase();
-  if (s === "ONLINE" || s === "SUCCEEDED" || s === "RUNNING") {
-    return `<span class="status-dot dot-online" title="${s}">●</span>`;
-  } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING") {
-    return `<span class="status-dot dot-warning" title="${s}">●</span>`;
-  } else if (s === "FAILED" || s === "TIMEOUT" || s === "OFFLINE" || s === "REJECTED") {
-    return `<span class="status-dot dot-error" title="${s}">●</span>`;
-  }
-  return `<span class="status-dot dot-offline" title="${s}">○</span>`;
+function getFileTypeCategory(filename, isDir) {
+  if (isDir) return "folder";
+  const ext = (filename.split('.').pop() || "").toLowerCase();
+  if (["zip", "tar", "gz", "tgz", "bz2", "7z", "rar"].includes(ext)) return "archive";
+  if (["jpg", "jpeg", "png", "gif", "svg", "webp", "ico"].includes(ext)) return "image";
+  if (["mp4", "mkv", "webm", "mov", "avi"].includes(ext)) return "video";
+  if (["mp3", "wav", "flac", "ogg"].includes(ext)) return "audio";
+  if (["pdf", "doc", "docx", "txt", "md", "csv", "json", "yml", "yaml", "xml"].includes(ext)) return "document";
+  if (["py", "sh", "js", "ts", "html", "css", "c", "cpp", "go", "rs"].includes(ext)) return "code";
+  return "file";
 }
 
-function renderStatusTag(state) {
+function getFileIcon(typeCategory) {
+  switch (typeCategory) {
+    case "folder": return "📁";
+    case "archive": return "📦";
+    case "image": return "🖼️";
+    case "video": return "🎬";
+    case "audio": return "🎵";
+    case "code": return "📜";
+    default: return "📄";
+  }
+}
+
+function renderStatusPill(state) {
   const s = (state || "").toUpperCase();
-  let tagClass = "tag-neutral";
-  if (s === "ONLINE" || s === "SUCCEEDED") tagClass = "tag-succeeded";
-  else if (s === "FAILED" || s === "OFFLINE" || s === "TIMEOUT") tagClass = "tag-failed";
-  else if (s === "RUNNING" || s === "CLAIMED" || s === "QUEUED" || s === "RECOVERING") tagClass = "tag-queued";
-  return `<span class="status-tag ${tagClass}">${s || "UNKNOWN"}</span>`;
+  if (s === "ONLINE" || s === "SUCCEEDED") {
+    return `<span class="status-pill pill-online"><span class="status-dot dot-online">●</span> ${s === "ONLINE" ? "Online" : "Succeeded"}</span>`;
+  } else if (s === "RUNNING") {
+    return `<span class="status-pill pill-online"><span class="status-dot dot-online">●</span> Running</span>`;
+  } else if (s === "QUEUED" || s === "CLAIMED") {
+    return `<span class="status-pill pill-warning"><span class="status-dot dot-warning">●</span> ${s === "QUEUED" ? "Queued" : "Claimed"}</span>`;
+  } else if (s === "RECOVERING") {
+    return `<span class="status-pill pill-warning"><span class="status-dot dot-warning">●</span> Recovering</span>`;
+  } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED") {
+    return `<span class="status-pill pill-failed"><span class="status-dot dot-error">●</span> ${s}</span>`;
+  } else if (s === "OFFLINE") {
+    return `<span class="status-pill pill-offline"><span class="status-dot dot-offline">○</span> Offline</span>`;
+  }
+  return `<span class="status-pill pill-neutral"><span class="status-dot dot-offline">○</span> ${s || "Unknown"}</span>`;
 }
 
 function updateLastRefreshed() {
@@ -114,98 +136,101 @@ function updateLastRefreshed() {
   if (el) el.textContent = new Date().toLocaleTimeString();
 }
 
+// 0. Session Info
+async function loadSession() {
+  try {
+    const session = await apiFetch("/api/session").catch(() => null);
+    const userEl = document.getElementById("side-session-user");
+    if (session && session.authenticated) {
+      if (userEl) userEl.textContent = session.user || "Signed in";
+    } else {
+      if (userEl) userEl.textContent = "Signed in";
+    }
+  } catch {
+    const userEl = document.getElementById("side-session-user");
+    if (userEl) userEl.textContent = "Signed in";
+  }
+}
+
 // 1. Dashboard
 async function loadDashboard() {
   updateLastRefreshed();
   try {
-    const [healthRes, clusterRes, jobsRes, storageRes] = await Promise.allSettled([
-      fetch("/health"),
-      fetch("/api/cluster", { headers: getHeaders() }),
-      fetch("/api/jobs", { headers: getHeaders() }),
-      fetch("/storage/usage", { headers: getHeaders() })
+    const [clusterData, jobsData, storageData, srvData] = await Promise.allSettled([
+      apiFetch("/api/cluster"),
+      apiFetch("/api/jobs"),
+      apiFetch("/storage/usage"),
+      apiFetch("/api/services")
     ]);
 
-    // Local Node Health & Sidebar
-    let localNodeName = "vivo-y31";
-    let localNodeStatus = "ONLINE";
-    if (healthRes.status === "fulfilled" && healthRes.value.ok) {
-      const h = await healthRes.value.json();
-      localNodeName = h.node?.name || "vivo-y31";
-      localNodeStatus = (h.status || "ONLINE").toUpperCase();
-      document.getElementById("side-node-name").textContent = localNodeName;
-      document.getElementById("side-node-state").textContent = localNodeStatus;
-      const dot = document.getElementById("side-node-dot");
-      if (dot) {
-        dot.className = "status-dot " + (localNodeStatus === "ONLINE" ? "dot-online" : "dot-offline");
-      }
-    }
+    // Cluster Summary & Nodes Table
+    let nodes = [];
+    if (clusterData.status === "fulfilled") {
+      const c = clusterData.value;
+      nodes = (c.nodes || []).filter(n => n.status !== "REMOVED");
+      cachedNodes = nodes;
 
-    // Cluster Summary & Nodes table
-    let nodesList = [];
-    if (clusterRes.status === "fulfilled" && clusterRes.value.ok) {
-      const c = await clusterRes.value.json();
-      nodesList = (c.nodes || []).filter(n => n.status !== "REMOVED");
-      cachedNodes = nodesList;
+      const onlineCount = nodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
+      const offlineCount = nodes.length - onlineCount;
 
-      const onlineCount = nodesList.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
-      const offlineCount = nodesList.length - onlineCount;
-      const nodeWord = nodesList.length === 1 ? "node" : "nodes";
-      document.getElementById("sum-cluster-text").textContent = 
-        `${nodesList.length} ${nodeWord} · ${onlineCount} online · ${offlineCount} offline`;
+      document.getElementById("sum-cluster-val").textContent = `${onlineCount} online · ${offlineCount} offline`;
+      document.getElementById("side-cluster-online").textContent = `${onlineCount} online`;
 
-      // Render Dashboard Nodes table
-      const nodesTbody = document.getElementById("dash-nodes-tbody");
-      if (nodesList.length === 0) {
-        nodesTbody.innerHTML = `<tr><td colspan="6" class="muted">No active cluster nodes.</td></tr>`;
+      const tbody = document.getElementById("dash-nodes-tbody");
+      if (nodes.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="cell-muted">No cluster nodes registered.</td></tr>`;
       } else {
-        nodesTbody.innerHTML = nodesList.map(n => {
+        tbody.innerHTML = nodes.map(n => {
           const isOnline = (n.status || "").toUpperCase() === "ONLINE";
           const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${n.resources.ram_mb} MB` : "-");
           const cores = n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-";
           const lastSeen = isOnline ? timeAgo(n.last_seen) : (n.last_seen ? timeAgo(n.last_seen) : "offline");
 
           return `
-            <tr>
-              <td>${renderStatusDot(n.status)}</td>
-              <td><a href="#nodes" onclick="viewNodeById('${n.node_id}')"><strong>${n.name || n.node_id}</strong></a></td>
-              <td class="muted">${n.role || 'compute'}</td>
+            <tr style="cursor: pointer;" onclick="window.location.hash='#nodes'; setTimeout(() => viewNodeById('${n.node_id}'), 50);">
+              <td>${renderStatusPill(n.status)}</td>
+              <td><strong>${n.name || n.node_id}</strong></td>
+              <td class="cell-muted">${n.role || 'compute'}</td>
               <td class="mono">${cores} cores</td>
               <td class="mono">${memStr}</td>
-              <td class="mono muted">${lastSeen}</td>
+              <td class="mono cell-muted">${lastSeen}</td>
             </tr>
           `;
         }).join("");
       }
     }
 
-    // Jobs Summary & Recent table
-    if (jobsRes.status === "fulfilled" && jobsRes.value.ok) {
-      const jData = await jobsRes.value.json();
+    // Jobs Summary & Recent Jobs Table
+    if (jobsData.status === "fulfilled") {
+      const jData = jobsData.value;
       const allJobs = jData.jobs || [];
       cachedJobs = allJobs;
 
       const runningCount = allJobs.filter(j => j.status === "RUNNING" || j.status === "CLAIMED").length;
       const queuedCount = allJobs.filter(j => j.status === "QUEUED" || j.status === "RECOVERING").length;
-      document.getElementById("sum-jobs-text").textContent = 
+
+      document.getElementById("sum-jobs-val").textContent = 
         `${allJobs.length} total · ${runningCount} running · ${queuedCount} queued`;
 
       const jobsTbody = document.getElementById("dash-jobs-tbody");
       if (allJobs.length === 0) {
-        jobsTbody.innerHTML = `<tr><td colspan="5" class="muted">No jobs recorded.</td></tr>`;
+        jobsTbody.innerHTML = `<tr><td colspan="6" class="cell-muted">No workload jobs executed yet.</td></tr>`;
       } else {
-        const recentJobs = [...allJobs].reverse().slice(0, 5);
-        jobsTbody.innerHTML = recentJobs.map(j => {
-          const duration = j.result?.duration_ms ? (j.result.duration_ms + "ms") : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
+        const recent = [...allJobs].reverse().slice(0, 5);
+        jobsTbody.innerHTML = recent.map(j => {
+          const jobId = j.job_id || j.id || "";
           const target = j.assigned_node || j.target_node || j.target || "auto";
-          const displayId = (j.job_id || j.id || "").slice(0, 12);
+          const duration = j.result?.duration_ms ? (j.result.duration_ms + "ms") : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
+          const createdStr = j.created_at ? new Date(j.created_at).toLocaleTimeString() : "-";
 
           return `
             <tr>
-              <td class="mono"><a href="#jobs" onclick="viewJobById('${j.job_id || j.id}')">${displayId}</a></td>
+              <td class="mono"><a href="#jobs" onclick="setTimeout(() => viewJobById('${jobId}'), 50)">${jobId.slice(0, 12)}</a></td>
               <td>${j.type}</td>
               <td class="mono">${target}</td>
-              <td>${renderStatusTag(j.status || j.state)}</td>
-              <td class="mono muted">${duration}</td>
+              <td>${renderStatusPill(j.status || j.state)}</td>
+              <td class="mono cell-muted">${duration}</td>
+              <td class="mono cell-muted">${createdStr}</td>
             </tr>
           `;
         }).join("");
@@ -213,18 +238,34 @@ async function loadDashboard() {
     }
 
     // Storage Summary
-    if (storageRes.status === "fulfilled" && storageRes.value.ok) {
-      const sData = await storageRes.value.json();
-      const freeStr = sData.disk?.available || "Available";
-      const usedPct = sData.disk?.used_percent || "-";
-      document.getElementById("sum-storage-text").textContent = `${freeStr} free · ${usedPct} used`;
-      document.getElementById("dash-storage-root").textContent = sData.storage_root || "~/PersonalServer/storage";
+    if (storageData.status === "fulfilled") {
+      const s = storageData.value;
+      const freeStr = s.disk?.available ? `${s.disk.available} free` : "Available";
+      const usedPct = s.disk?.used_percent ? `${s.disk.used_percent} used` : "-";
+      document.getElementById("sum-storage-val").textContent = `${freeStr} · ${usedPct}`;
+      document.getElementById("dash-storage-root").textContent = s.storage_root || "~/PersonalServer/storage";
       document.getElementById("dash-storage-stats").textContent = 
-        `${freeStr} free · ${usedPct} used · ${sData.files_count || 0} files · ${sData.folders_count || 0} folders`;
+        `${freeStr} · ${usedPct} · ${s.files_count || 0} files · ${s.folders_count || 0} folders`;
+    }
+
+    // Services Status
+    if (srvData.status === "fulfilled") {
+      const srv = srvData.value;
+      const setSrv = (id, label, isOk) => {
+        const el = document.getElementById(id);
+        if (el) {
+          el.innerHTML = isOk 
+            ? `<span class="status-dot dot-online">●</span> ${label}`
+            : `<span class="status-dot dot-error">●</span> Disconnected`;
+        }
+      };
+      setSrv("srv-node-api", "Running", srv.node_api === "running");
+      setSrv("srv-cloudflare", "Connected", srv.cloudflare === "connected");
+      setSrv("srv-controller", "Connected", srv.controller === "connected");
     }
 
   } catch (err) {
-    console.error("Dashboard refresh error:", err);
+    console.error("Dashboard render error:", err);
   }
 }
 
@@ -235,20 +276,18 @@ async function loadNodes() {
   const targetSelect = document.getElementById("job-target");
 
   try {
-    const res = await fetch("/api/cluster", { headers: getHeaders() });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const data = await apiFetch("/api/cluster");
     cachedNodes = (data.nodes || []).filter(n => n.status !== "REMOVED");
 
     if (targetSelect) {
-      const currentVal = targetSelect.value;
+      const cur = targetSelect.value;
       targetSelect.innerHTML = `<option value="auto">Auto (Scheduler)</option>` +
         cachedNodes.map(n => `<option value="${n.node_id}">${n.name || n.node_id} (${n.node_id.slice(0, 8)})</option>`).join("");
-      targetSelect.value = currentVal;
+      targetSelect.value = cur;
     }
 
     if (cachedNodes.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="9" class="muted">No cluster nodes registered.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="cell-muted">No cluster nodes registered.</td></tr>`;
       return;
     }
 
@@ -256,18 +295,18 @@ async function loadNodes() {
       const isOnline = (n.status || "").toUpperCase() === "ONLINE";
       const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${n.resources.ram_mb} MB` : "-");
       const cores = n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-";
-      const platStr = `${n.platform || '-'} / ${n.architecture || '-'}`;
+      const lastSeen = isOnline ? timeAgo(n.last_seen) : (n.last_seen ? timeAgo(n.last_seen) : "offline");
 
       return `
         <tr>
-          <td>${renderStatusDot(n.status)}</td>
-          <td><strong>${n.name || 'node'}</strong></td>
-          <td class="mono muted">${n.node_id}</td>
-          <td class="muted">${n.role || 'compute'}</td>
-          <td class="muted">${platStr}</td>
-          <td class="mono">${cores}</td>
+          <td>${renderStatusPill(n.status)}</td>
+          <td><strong>${n.name || n.node_id}</strong></td>
+          <td class="cell-muted">${n.role || 'compute'}</td>
+          <td class="cell-muted">${n.platform || '-'}</td>
+          <td class="mono cell-muted">${n.architecture || '-'}</td>
+          <td class="mono">${cores} cores</td>
           <td class="mono">${memStr}</td>
-          <td>${renderStatusTag(n.status)}</td>
+          <td class="mono cell-muted">${lastSeen}</td>
           <td>
             <button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button>
           </td>
@@ -276,7 +315,7 @@ async function loadNodes() {
     }).join("");
 
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="9" class="tag-failed">Error loading nodes: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="pill-failed">Unable to load nodes: ${err.message}</td></tr>`;
   }
 }
 
@@ -285,29 +324,29 @@ window.viewNodeById = function(nodeId) {
   if (!node) return;
 
   const panel = document.getElementById("node-detail-panel");
-  const heading = document.getElementById("node-detail-heading");
+  const title = document.getElementById("node-detail-title");
   const grid = document.getElementById("node-detail-grid");
 
-  if (heading) heading.textContent = `Node: ${node.name || node.node_id}`;
+  if (title) title.textContent = `Node: ${node.name || node.node_id}`;
 
   const hb = node.last_heartbeat || {};
   const sys = hb.system || {};
   const srv = hb.services || {};
-  const caps = Object.keys(node.capabilities || {}).filter(k => node.capabilities[k]).join(", ") || "none";
+  const caps = Object.keys(node.capabilities || {}).filter(k => node.capabilities[k]).join(", ") || "compute, storage, network";
 
   grid.innerHTML = `
-    <div class="detail-row"><span class="detail-label">Status</span><span class="detail-val">${renderStatusTag(node.status)}</span></div>
-    <div class="detail-row"><span class="detail-label">Node ID</span><span class="detail-val mono">${node.node_id}</span></div>
-    <div class="detail-row"><span class="detail-label">Role</span><span class="detail-val">${node.role || 'compute'}</span></div>
-    <div class="detail-row"><span class="detail-label">Platform</span><span class="detail-val">${node.platform || '-'} (${node.os || '-'})</span></div>
-    <div class="detail-row"><span class="detail-label">Architecture</span><span class="detail-val mono">${node.architecture || '-'}</span></div>
-    <div class="detail-row"><span class="detail-label">CPU Cores</span><span class="detail-val mono">${sys.cpu_cores || node.resources?.cpu_cores || '-'}</span></div>
-    <div class="detail-row"><span class="detail-label">Memory</span><span class="detail-val mono">${sys.memory || (node.resources?.ram_mb ? node.resources.ram_mb + ' MB' : '-')}</span></div>
-    <div class="detail-row"><span class="detail-label">Storage</span><span class="detail-val mono">${sys.storage || (node.resources?.storage_gb ? node.resources.storage_gb + ' GB' : '-')}</span></div>
-    <div class="detail-row"><span class="detail-label">Capabilities</span><span class="detail-val mono">${caps}</span></div>
-    <div class="detail-row"><span class="detail-label">Last Heartbeat</span><span class="detail-val mono">${node.last_seen || '-'} (${timeAgo(node.last_seen)})</span></div>
-    <div class="detail-row"><span class="detail-label">Services</span><span class="detail-val mono">Node API: ${srv.node_api || srv['node-api'] || 'active'} · Tunnel: ${srv.cloudflare || 'connected'}</span></div>
-    <div class="detail-row"><span class="detail-label">Load Average</span><span class="detail-val mono">${(sys.load_average || []).join(', ') || '-'}</span></div>
+    <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(node.status)}</span></div>
+    <div class="detail-item"><span class="detail-label">Node ID</span><span class="detail-value mono">${node.node_id}</span></div>
+    <div class="detail-item"><span class="detail-label">Role</span><span class="detail-value">${node.role || 'compute'}</span></div>
+    <div class="detail-item"><span class="detail-label">Platform</span><span class="detail-value">${node.platform || '-'} (${node.os || 'Linux'})</span></div>
+    <div class="detail-item"><span class="detail-label">Architecture</span><span class="detail-value mono">${node.architecture || '-'}</span></div>
+    <div class="detail-item"><span class="detail-label">CPU Cores</span><span class="detail-value mono">${sys.cpu_cores || node.resources?.cpu_cores || '-'} cores</span></div>
+    <div class="detail-item"><span class="detail-label">Memory</span><span class="detail-value mono">${sys.memory || (node.resources?.ram_mb ? node.resources.ram_mb + ' MB' : '-')}</span></div>
+    <div class="detail-item"><span class="detail-label">Storage</span><span class="detail-value mono">${sys.storage || (node.resources?.storage_gb ? node.resources.storage_gb + ' GB' : '-')}</span></div>
+    <div class="detail-item"><span class="detail-label">Capabilities</span><span class="detail-value mono">${caps}</span></div>
+    <div class="detail-item"><span class="detail-label">Last Heartbeat</span><span class="detail-value mono">${node.last_seen || '-'} (${timeAgo(node.last_seen)})</span></div>
+    <div class="detail-item"><span class="detail-label">Services</span><span class="detail-value mono">Node API: ${srv.node_api || srv['node-api'] || 'running'} · Tunnel: ${srv.cloudflare || 'connected'}</span></div>
+    <div class="detail-item"><span class="detail-label">Load Average</span><span class="detail-value mono">${(sys.load_average || []).join(', ') || '-'}</span></div>
   `;
 
   panel.style.display = "block";
@@ -325,13 +364,11 @@ async function loadJobs() {
   const tbody = document.getElementById("jobs-tbody");
 
   try {
-    const res = await fetch("/api/jobs", { headers: getHeaders() });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const data = await apiFetch("/api/jobs");
     cachedJobs = data.jobs || [];
 
     if (cachedJobs.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="8" class="muted">No workload jobs recorded.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="cell-muted">No workload jobs recorded.</td></tr>`;
       return;
     }
 
@@ -348,10 +385,10 @@ async function loadJobs() {
           <td class="mono"><strong>${jobId}</strong></td>
           <td>${j.type}</td>
           <td class="mono">${target}</td>
-          <td>${renderStatusTag(j.status || j.state)}</td>
+          <td>${renderStatusPill(j.status || j.state)}</td>
           <td class="mono">${attemptStr}</td>
-          <td class="mono muted">${duration}</td>
-          <td class="mono muted">${createdStr}</td>
+          <td class="mono cell-muted">${duration}</td>
+          <td class="mono cell-muted">${createdStr}</td>
           <td>
             <button class="btn btn-sm" onclick="viewJobById('${jobId}')">Details</button>
           </td>
@@ -360,35 +397,49 @@ async function loadJobs() {
     }).join("");
 
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" class="tag-failed">Error loading jobs: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="pill-failed">Unable to load jobs: ${err.message}</td></tr>`;
   }
 }
 
 window.viewJobById = function(jobId) {
   const job = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
   const panel = document.getElementById("job-detail-panel");
-  const heading = document.getElementById("job-detail-heading");
-  const jsonBox = document.getElementById("job-detail-json");
+  const title = document.getElementById("job-detail-title");
+  const sumGrid = document.getElementById("job-detail-summary");
+  const stdoutBox = document.getElementById("job-detail-stdout");
+
+  const renderJobInfo = (j) => {
+    if (title) title.textContent = `Job: ${j.job_id || j.id}`;
+    
+    const sched = j.scheduler || {};
+    const res = j.result || {};
+    
+    sumGrid.innerHTML = `
+      <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(j.status || j.state)}</span></div>
+      <div class="detail-item"><span class="detail-label">Workload</span><span class="detail-value">${j.type}</span></div>
+      <div class="detail-item"><span class="detail-label">Target</span><span class="detail-value mono">${j.target || 'auto'}</span></div>
+      <div class="detail-item"><span class="detail-label">Assigned Node</span><span class="detail-value mono">${j.assigned_node || j.target_node || '-'}</span></div>
+      <div class="detail-item"><span class="detail-label">Attempt</span><span class="detail-value mono">${j.attempt || 1}/${j.max_attempts || 3}</span></div>
+      <div class="detail-item"><span class="detail-label">Duration</span><span class="detail-value mono">${res.duration_ms ? res.duration_ms + 'ms' : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : '-')}</span></div>
+      <div class="detail-item"><span class="detail-label">Exit Code</span><span class="detail-value mono">${res.exit_code !== undefined ? res.exit_code : '-'}</span></div>
+      <div class="detail-item"><span class="detail-label">Created At</span><span class="detail-value mono">${j.created_at || '-'}</span></div>
+      <div class="detail-item"><span class="detail-label">Scheduler Decision</span><span class="detail-value">${sched.reason || 'Explicit selection'}</span></div>
+      <div class="detail-item"><span class="detail-label">Retry Reason</span><span class="detail-value">${j.retry_reason || 'None'}</span></div>
+    `;
+
+    const outText = res.stdout || res.stderr || (j.result ? JSON.stringify(j.result, null, 2) : "No output recorded.");
+    stdoutBox.textContent = outText;
+
+    panel.style.display = "block";
+    panel.scrollIntoView({ behavior: "smooth" });
+  };
 
   if (job) {
-    if (heading) heading.textContent = `Job details: ${job.job_id || job.id}`;
-    if (jsonBox) jsonBox.textContent = JSON.stringify(job, null, 2);
-    if (panel) {
-      panel.style.display = "block";
-      panel.scrollIntoView({ behavior: "smooth" });
-    }
+    renderJobInfo(job);
   } else {
-    fetch(`/api/jobs/${jobId}`, { headers: getHeaders() })
-      .then(r => r.json())
-      .then(data => {
-        if (heading) heading.textContent = `Job details: ${jobId}`;
-        if (jsonBox) jsonBox.textContent = JSON.stringify(data.job || data, null, 2);
-        if (panel) {
-          panel.style.display = "block";
-          panel.scrollIntoView({ behavior: "smooth" });
-        }
-      })
-      .catch(e => alert("Could not fetch job details: " + e.message));
+    apiFetch(`/api/jobs/${jobId}`)
+      .then(d => renderJobInfo(d.job || d))
+      .catch(e => alert("Failed to fetch job details: " + e.message));
   }
 };
 
@@ -397,7 +448,7 @@ window.closeJobDetail = function() {
   if (panel) panel.style.display = "none";
 };
 
-// Submit job form
+// Dispatch job
 document.getElementById("job-submit-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const type = document.getElementById("job-type").value;
@@ -416,29 +467,14 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
   }
 
   try {
-    const res = await fetch("/api/jobs", {
+    await apiFetch("/api/jobs", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...getHeaders()
-      },
-      body: JSON.stringify({
-        type: type,
-        target: target,
-        timeout: timeout,
-        parameters: params
-      })
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, target, timeout, parameters: params })
     });
-
-    const result = await res.json();
-    if (!res.ok) {
-      alert("Submission error: " + (result.error || res.statusText));
-      return;
-    }
-
     loadJobs();
   } catch (err) {
-    alert("Error submitting job: " + err.message);
+    alert("Job submission failed: " + err.message);
   }
 });
 
@@ -448,57 +484,64 @@ async function loadStorage(path = "") {
   currentPath = path;
   renderBreadcrumbs(path);
   const tbody = document.getElementById("storage-tbody");
+  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Loading storage items...</td></tr>`;
 
   try {
-    const res = await fetch(`/storage/list?path=${encodeURIComponent(path)}`, { headers: getHeaders() });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || ("HTTP " + res.status));
-    }
-    const data = await res.json();
+    const data = await apiFetch(`/storage/list?path=${encodeURIComponent(path)}`);
     const items = data.items || [];
 
     if (items.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="4" class="muted">Folder is empty.</td></tr>`;
-      return;
+      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Folder is empty.</td></tr>`;
+    } else {
+      tbody.innerHTML = items.map(item => {
+        const itemRelPath = path ? `${path}/${item.name}` : item.name;
+        const isDir = item.is_dir;
+        const typeCategory = getFileTypeCategory(item.name, isDir);
+        const icon = getFileIcon(typeCategory);
+        const modStr = item.modified ? new Date(item.modified * 1000).toLocaleDateString() : "-";
+        const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
+
+        return `
+          <tr>
+            <td>
+              ${isDir 
+                ? `<a href="javascript:void(0)" onclick="loadStorage('${itemRelPath}')" style="font-weight: 500;">${icon} ${item.name}</a>`
+                : `<span class="mono">${icon} ${item.name}</span>`
+              }
+            </td>
+            <td class="cell-muted">${typeCategory}</td>
+            <td class="mono cell-muted">${sizeStr}</td>
+            <td class="mono cell-muted">${modStr}</td>
+            <td style="text-align: right;">
+              <div style="display: inline-flex; gap: 4px;">
+                ${!isDir ? `<a href="/storage/download?path=${encodeURIComponent(itemRelPath)}" class="btn btn-sm btn-primary" download>Download</a>` : ''}
+                <button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join("");
     }
 
-    tbody.innerHTML = items.map(item => {
-      const itemRelPath = path ? `${path}/${item.name}` : item.name;
-      const isDir = item.is_dir;
-      const modStr = item.modified ? new Date(item.modified * 1000).toLocaleDateString() : "-";
-      const sizeStr = isDir ? "-" : formatBytes(item.size_bytes);
-
-      return `
-        <tr>
-          <td>
-            ${isDir 
-              ? `<a href="javascript:void(0)" onclick="loadStorage('${itemRelPath}')"><strong>📁 ${item.name}</strong></a>`
-              : `<span class="mono">📄 ${item.name}</span>`
-            }
-          </td>
-          <td class="mono muted">${sizeStr}</td>
-          <td class="mono muted">${modStr}</td>
-          <td style="text-align:right">
-            <div style="display:inline-flex; gap:4px">
-              ${!isDir ? `<a href="/storage/download?path=${encodeURIComponent(itemRelPath)}" class="btn btn-sm btn-primary" download>Download</a>` : ''}
-              <button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>
-              <button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>
-            </div>
-          </td>
-        </tr>
-      `;
-    }).join("");
-
-    // Update footer stats
-    const usageRes = await fetch("/storage/usage", { headers: getHeaders() }).then(r => r.json()).catch(() => ({}));
-    const freeStr = usageRes.disk?.available || "-";
-    const usedPct = usageRes.disk?.used_percent || "-";
-    document.getElementById("storage-footer-stats").textContent = 
-      `${usageRes.storage_root || '~/PersonalServer/storage'} · ${freeStr} free (${usedPct} used) · ${usageRes.files_count || 0} files`;
+    // Load usage stats
+    const usage = await apiFetch("/storage/usage").catch(() => null);
+    if (usage) {
+      const freeStr = usage.disk?.available ? `${usage.disk.available} free` : "Available";
+      const usedPct = usage.disk?.used_percent ? `${usage.disk.used_percent} used` : "-";
+      document.getElementById("storage-footer-stats").textContent = 
+        `${freeStr} · ${usedPct} · ${usage.files_count || 0} files · ${usage.folders_count || 0} folders`;
+    }
 
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="4" class="tag-failed">Error listing folder: ${err.message}</td></tr>`;
+    tbody.innerHTML = `
+      <tr>
+        <td colspan="5" class="pill-failed">
+          Unable to load storage: ${err.message}
+          <button class="btn btn-sm" style="margin-left: 10px;" onclick="loadStorage('${path}')">Retry</button>
+        </td>
+      </tr>
+    `;
   }
 }
 
@@ -507,14 +550,14 @@ function renderBreadcrumbs(path) {
   if (!container) return;
 
   const parts = path ? path.split("/").filter(Boolean) : [];
-  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('')">~/PersonalServer/storage</span>`;
+  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('')">Home / storage</span>`;
 
   let accumulated = "";
   parts.forEach((p, index) => {
     accumulated += (accumulated ? "/" : "") + p;
     const isLast = index === parts.length - 1;
     const clickPath = accumulated;
-    html += ` <span class="muted">/</span> <span class="crumb ${isLast ? 'current' : ''}" ${!isLast ? `onclick="loadStorage('${clickPath}')"` : ''}>${p}</span>`;
+    html += ` <span class="cell-muted">/</span> <span class="crumb ${isLast ? 'current' : ''}" ${!isLast ? `onclick="loadStorage('${clickPath}')"` : ''}>${p}</span>`;
   });
 
   container.innerHTML = html;
@@ -536,47 +579,33 @@ document.getElementById("file-upload-input")?.addEventListener("change", async (
   try {
     const res = await fetch(`/storage/upload?path=${encodeURIComponent(currentPath)}`, {
       method: "POST",
-      headers: getHeaders(),
       body: formData
     });
-
-    const result = await res.json().catch(() => ({}));
     if (!res.ok) {
-      alert("Upload failed: " + (result.error || res.statusText));
-      return;
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || res.statusText);
     }
-
     e.target.value = "";
     loadStorage(currentPath);
   } catch (err) {
-    alert("Upload error: " + err.message);
+    alert("Upload failed: " + err.message);
   }
 });
 
 // Create folder
 document.getElementById("create-folder-btn")?.addEventListener("click", async () => {
   const name = prompt("Folder name:");
-  if (!name) return;
+  if (!name || !name.trim()) return;
 
   try {
-    const res = await fetch(`/storage/mkdir?path=${encodeURIComponent(currentPath)}`, {
+    await apiFetch(`/storage/mkdir?path=${encodeURIComponent(currentPath)}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...getHeaders()
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name.trim() })
     });
-
-    const result = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      alert("Folder creation failed: " + (result.error || res.statusText));
-      return;
-    }
-
     loadStorage(currentPath);
   } catch (err) {
-    alert("Error: " + err.message);
+    alert("Failed to create folder: " + err.message);
   }
 });
 
@@ -587,52 +616,34 @@ window.renameItem = async function(itemRelPath) {
   if (!newName || newName.trim() === oldName) return;
 
   try {
-    const res = await fetch(`/storage/rename`, {
+    await apiFetch(`/storage/rename`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...getHeaders()
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         path: itemRelPath,
         new_name: newName.trim()
       })
     });
-
-    const result = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      alert("Rename failed: " + (result.error || res.statusText));
-      return;
-    }
-
     loadStorage(currentPath);
   } catch (err) {
-    alert("Rename error: " + err.message);
+    alert("Rename failed: " + err.message);
   }
 };
 
 // Delete item
 window.deleteItem = async function(itemRelPath, isDir) {
   const itemName = itemRelPath.split("/").pop();
-  if (!confirm(`Delete ${isDir ? 'folder' : 'file'} "${itemName}"?`)) return;
+  if (!confirm(`Are you sure you want to delete ${isDir ? 'folder' : 'file'} "${itemName}"?`)) return;
 
   try {
-    const res = await fetch(`/storage?path=${encodeURIComponent(itemRelPath)}`, {
-      method: "DELETE",
-      headers: getHeaders()
+    await apiFetch(`/storage?path=${encodeURIComponent(itemRelPath)}`, {
+      method: "DELETE"
     });
-
-    const result = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      alert("Delete failed: " + (result.error || res.statusText));
-      return;
-    }
-
     loadStorage(currentPath);
   } catch (err) {
-    alert("Delete error: " + err.message);
+    alert("Delete failed: " + err.message);
   }
 };
 
-// Init
+// Initialize
 navigate();

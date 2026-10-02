@@ -18,7 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CONTROLLER_URL = "http://127.0.0.1:8000"
 PHONE_SSH = "ssh -p 8022 -o StrictHostKeyChecking=no u0_a244@100.85.108.5"
 PHONE_NODE_API = "http://127.0.0.1:8080"
-PUBLIC_WEB_URL = "https://api.akshatsahay.space"
+PUBLIC_WEB_URL = "https://server.akshatsahay.space"
 
 
 def run_ssh(cmd):
@@ -111,7 +111,7 @@ def main():
 
     # Check static CSS and JS over public web
     status_css, pub_css, _ = http_req(f"{PUBLIC_WEB_URL}/static/style.css")
-    assert status_css == 200 and "--bg-primary" in pub_css, "Public CSS asset loading failed"
+    assert status_css == 200 and "--bg-app" in pub_css, "Public CSS asset loading failed"
     print("Public CSS Asset: OK")
 
     status_js, pub_js, _ = http_req(f"{PUBLIC_WEB_URL}/static/app.js")
