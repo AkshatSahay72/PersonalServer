@@ -34,13 +34,13 @@ function navigate() {
   if (targetNav) targetNav.classList.add("active");
 
   const titles = {
-    dashboard: { main: "PersonalServer", sub: "Cluster overview" },
+    dashboard: { main: "Dashboard", sub: "Cluster overview" },
     nodes: { main: "Nodes", sub: "Cluster inventory & telemetry" },
     jobs: { main: "Jobs", sub: "Workload execution & lifecycle" },
     storage: { main: "Storage", sub: "Personal file manager" }
   };
 
-  const meta = titles[hash] || { main: "PersonalServer", sub: "Administration" };
+  const meta = titles[hash] || { main: "Dashboard", sub: "Cluster overview" };
   if (heading) heading.textContent = meta.main;
   if (subHeading) subHeading.textContent = meta.sub;
 
@@ -90,25 +90,25 @@ function timeAgo(isoStr) {
 }
 
 function getFileTypeCategory(filename, isDir) {
-  if (isDir) return "folder";
+  if (isDir) return "Folder";
   const ext = (filename.split('.').pop() || "").toLowerCase();
-  if (["zip", "tar", "gz", "tgz", "bz2", "7z", "rar"].includes(ext)) return "archive";
-  if (["jpg", "jpeg", "png", "gif", "svg", "webp", "ico"].includes(ext)) return "image";
-  if (["mp4", "mkv", "webm", "mov", "avi"].includes(ext)) return "video";
-  if (["mp3", "wav", "flac", "ogg"].includes(ext)) return "audio";
-  if (["pdf", "doc", "docx", "txt", "md", "csv", "json", "yml", "yaml", "xml"].includes(ext)) return "document";
-  if (["py", "sh", "js", "ts", "html", "css", "c", "cpp", "go", "rs"].includes(ext)) return "code";
-  return "file";
+  if (["zip", "tar", "gz", "tgz", "bz2", "7z", "rar"].includes(ext)) return "Archive";
+  if (["jpg", "jpeg", "png", "gif", "svg", "webp", "ico"].includes(ext)) return "Image";
+  if (["mp4", "mkv", "webm", "mov", "avi"].includes(ext)) return "Video";
+  if (["mp3", "wav", "flac", "ogg"].includes(ext)) return "Audio";
+  if (["pdf", "doc", "docx", "txt", "md", "csv", "json", "yml", "yaml", "xml"].includes(ext)) return "Document";
+  if (["py", "sh", "js", "ts", "html", "css", "c", "cpp", "go", "rs"].includes(ext)) return "Code";
+  return "File";
 }
 
 function getFileIcon(typeCategory) {
   switch (typeCategory) {
-    case "folder": return "📁";
-    case "archive": return "📦";
-    case "image": return "🖼️";
-    case "video": return "🎬";
-    case "audio": return "🎵";
-    case "code": return "📜";
+    case "Folder": return "📁";
+    case "Archive": return "📦";
+    case "Image": return "🖼️";
+    case "Video": return "🎬";
+    case "Audio": return "🎵";
+    case "Code": return "📜";
     default: return "📄";
   }
 }
@@ -141,14 +141,20 @@ async function loadSession() {
   try {
     const session = await apiFetch("/api/session").catch(() => null);
     const userEl = document.getElementById("side-session-user");
+    const topUserEl = document.getElementById("topbar-user-email");
     if (session && session.authenticated) {
-      if (userEl) userEl.textContent = session.user || "Signed in";
+      const userText = session.user || "Signed in";
+      if (userEl) userEl.textContent = userText;
+      if (topUserEl) topUserEl.textContent = userText;
     } else {
       if (userEl) userEl.textContent = "Signed in";
+      if (topUserEl) topUserEl.textContent = "Signed in";
     }
   } catch {
     const userEl = document.getElementById("side-session-user");
+    const topUserEl = document.getElementById("topbar-user-email");
     if (userEl) userEl.textContent = "Signed in";
+    if (topUserEl) topUserEl.textContent = "Signed in";
   }
 }
 
@@ -173,7 +179,8 @@ async function loadDashboard() {
       const onlineCount = nodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
       const offlineCount = nodes.length - onlineCount;
 
-      document.getElementById("sum-cluster-val").textContent = `${onlineCount} online · ${offlineCount} offline`;
+      document.getElementById("sum-card-cluster-main").textContent = `${onlineCount} online`;
+      document.getElementById("sum-card-cluster-sub").textContent = `${offlineCount} offline`;
       document.getElementById("side-cluster-online").textContent = `${onlineCount} online`;
 
       const tbody = document.getElementById("dash-nodes-tbody");
@@ -197,6 +204,17 @@ async function loadDashboard() {
             </tr>
           `;
         }).join("");
+
+        // Populate System Panel with Primary Node details
+        const primary = nodes[0];
+        if (primary) {
+          const sys = primary.last_heartbeat?.system || {};
+          document.getElementById("dash-sys-node-id").textContent = primary.node_id.slice(0, 16);
+          document.getElementById("sys-metric-host").textContent = primary.name || primary.node_id;
+          document.getElementById("sys-metric-arch").textContent = `${primary.platform || 'Termux'} · ${primary.architecture || 'aarch64'}`;
+          document.getElementById("sys-metric-cpu").textContent = `${sys.cpu_cores || primary.resources?.cpu_cores || '8'} cores`;
+          document.getElementById("sys-metric-mem").textContent = sys.memory || (primary.resources?.ram_mb ? `${primary.resources.ram_mb} MB` : '5.6 GB');
+        }
       }
     }
 
@@ -209,14 +227,14 @@ async function loadDashboard() {
       const runningCount = allJobs.filter(j => j.status === "RUNNING" || j.status === "CLAIMED").length;
       const queuedCount = allJobs.filter(j => j.status === "QUEUED" || j.status === "RECOVERING").length;
 
-      document.getElementById("sum-jobs-val").textContent = 
-        `${allJobs.length} total · ${runningCount} running · ${queuedCount} queued`;
+      document.getElementById("sum-card-jobs-main").textContent = `${runningCount} running`;
+      document.getElementById("sum-card-jobs-sub").textContent = `${queuedCount} queued · ${allJobs.length} total`;
 
       const jobsTbody = document.getElementById("dash-jobs-tbody");
       if (allJobs.length === 0) {
         jobsTbody.innerHTML = `<tr><td colspan="6" class="cell-muted">No workload jobs executed yet.</td></tr>`;
       } else {
-        const recent = [...allJobs].reverse().slice(0, 5);
+        const recent = [...allJobs].reverse().slice(0, 6);
         jobsTbody.innerHTML = recent.map(j => {
           const jobId = j.job_id || j.id || "";
           const target = j.assigned_node || j.target_node || j.target || "auto";
@@ -225,7 +243,7 @@ async function loadDashboard() {
 
           return `
             <tr>
-              <td class="mono"><a href="#jobs" onclick="setTimeout(() => viewJobById('${jobId}'), 50)">${jobId.slice(0, 12)}</a></td>
+              <td class="mono"><a href="#jobs" onclick="setTimeout(() => viewJobById('${jobId}'), 50)"><strong>${jobId}</strong></a></td>
               <td>${j.type}</td>
               <td class="mono">${target}</td>
               <td>${renderStatusPill(j.status || j.state)}</td>
@@ -242,26 +260,24 @@ async function loadDashboard() {
       const s = storageData.value;
       const freeStr = s.disk?.available ? `${s.disk.available} free` : "Available";
       const usedPct = s.disk?.used_percent ? `${s.disk.used_percent} used` : "-";
-      document.getElementById("sum-storage-val").textContent = `${freeStr} · ${usedPct}`;
-      document.getElementById("dash-storage-root").textContent = s.storage_root || "~/PersonalServer/storage";
-      document.getElementById("dash-storage-stats").textContent = 
-        `${freeStr} · ${usedPct} · ${s.files_count || 0} files · ${s.folders_count || 0} folders`;
+      document.getElementById("sum-card-storage-main").textContent = freeStr;
+      document.getElementById("sum-card-storage-sub").textContent = `${usedPct} · ${s.files_count || 0} files`;
+      document.getElementById("sys-metric-storage").textContent = s.storage_root || "~/PersonalServer/storage";
     }
 
     // Services Status
     if (srvData.status === "fulfilled") {
       const srv = srvData.value;
-      const setSrv = (id, label, isOk) => {
-        const el = document.getElementById(id);
-        if (el) {
-          el.innerHTML = isOk 
-            ? `<span class="status-dot dot-online">●</span> ${label}`
-            : `<span class="status-dot dot-error">●</span> Disconnected`;
-        }
-      };
-      setSrv("srv-node-api", "Running", srv.node_api === "running");
-      setSrv("srv-cloudflare", "Connected", srv.cloudflare === "connected");
-      setSrv("srv-controller", "Connected", srv.controller === "connected");
+      let activeCount = 0;
+      if (srv.node_api === "running") activeCount++;
+      if (srv.cloudflare === "connected") activeCount++;
+      if (srv.controller === "connected") activeCount++;
+
+      document.getElementById("sum-card-services-main").textContent = `${activeCount} active`;
+      document.getElementById("sum-card-services-sub").textContent = `Node API, Tunnel, Controller`;
+      document.getElementById("sys-metric-services").innerHTML = `
+        <span class="status-dot dot-online">●</span> ${activeCount} connected
+      `;
     }
 
   } catch (err) {
@@ -278,6 +294,10 @@ async function loadNodes() {
   try {
     const data = await apiFetch("/api/cluster");
     cachedNodes = (data.nodes || []).filter(n => n.status !== "REMOVED");
+
+    const onlineCount = cachedNodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
+    const countHdr = document.getElementById("nodes-count-header");
+    if (countHdr) countHdr.textContent = `${onlineCount} online · ${cachedNodes.length} total`;
 
     if (targetSelect) {
       const cur = targetSelect.value;
@@ -307,7 +327,7 @@ async function loadNodes() {
           <td class="mono">${cores} cores</td>
           <td class="mono">${memStr}</td>
           <td class="mono cell-muted">${lastSeen}</td>
-          <td>
+          <td style="text-align: right;">
             <button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button>
           </td>
         </tr>
@@ -367,6 +387,9 @@ async function loadJobs() {
     const data = await apiFetch("/api/jobs");
     cachedJobs = data.jobs || [];
 
+    const countHdr = document.getElementById("jobs-count-header");
+    if (countHdr) countHdr.textContent = `${cachedJobs.length} total jobs`;
+
     if (cachedJobs.length === 0) {
       tbody.innerHTML = `<tr><td colspan="8" class="cell-muted">No workload jobs recorded.</td></tr>`;
       return;
@@ -389,7 +412,7 @@ async function loadJobs() {
           <td class="mono">${attemptStr}</td>
           <td class="mono cell-muted">${duration}</td>
           <td class="mono cell-muted">${createdStr}</td>
-          <td>
+          <td style="text-align: right;">
             <button class="btn btn-sm" onclick="viewJobById('${jobId}')">Details</button>
           </td>
         </tr>
@@ -513,7 +536,7 @@ async function loadStorage(path = "") {
             <td class="mono cell-muted">${sizeStr}</td>
             <td class="mono cell-muted">${modStr}</td>
             <td style="text-align: right;">
-              <div style="display: inline-flex; gap: 4px;">
+              <div style="display: inline-flex; gap: 6px;">
                 ${!isDir ? `<a href="/storage/download?path=${encodeURIComponent(itemRelPath)}" class="btn btn-sm btn-primary" download>Download</a>` : ''}
                 <button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>
                 <button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>
@@ -550,7 +573,7 @@ function renderBreadcrumbs(path) {
   if (!container) return;
 
   const parts = path ? path.split("/").filter(Boolean) : [];
-  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('')">Home / storage</span>`;
+  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('')">[ / ] Home / storage</span>`;
 
   let accumulated = "";
   parts.forEach((p, index) => {

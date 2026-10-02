@@ -16,88 +16,173 @@
       </div>
       
       <nav class="sidebar-nav">
-        <a href="#dashboard" class="nav-link active" data-page="dashboard">Dashboard</a>
-        <a href="#nodes" class="nav-link" data-page="nodes">Nodes</a>
-        <a href="#jobs" class="nav-link" data-page="jobs">Jobs</a>
-        <a href="#storage" class="nav-link" data-page="storage">Storage</a>
+        <a href="#dashboard" class="nav-link active" data-page="dashboard">
+          <span class="nav-icon">📊</span>
+          <span>Dashboard</span>
+        </a>
+        <a href="#nodes" class="nav-link" data-page="nodes">
+          <span class="nav-icon">🖥️</span>
+          <span>Nodes</span>
+        </a>
+        <a href="#jobs" class="nav-link" data-page="jobs">
+          <span class="nav-icon">⚡</span>
+          <span>Jobs</span>
+        </a>
+        <a href="#storage" class="nav-link" data-page="storage">
+          <span class="nav-icon">📁</span>
+          <span>Storage</span>
+        </a>
       </nav>
 
       <div class="sidebar-footer">
-        <div class="cluster-summary-side">
+        <div class="sidebar-status-box">
           <div class="side-label">Cluster</div>
           <div class="side-val">
             <span class="status-dot dot-online" id="side-cluster-dot">●</span>
             <span class="mono" id="side-cluster-online">1 online</span>
           </div>
         </div>
-        <div class="session-info">
+        <div class="sidebar-status-box">
           <div class="side-label">Session</div>
-          <div class="side-val mono" id="side-session-user">Signed in</div>
+          <div class="side-val mono">
+            <span class="status-dot dot-online">●</span>
+            <span id="side-session-user">Signed in</span>
+          </div>
         </div>
       </div>
     </aside>
 
-    <!-- Main Content -->
+    <!-- Main Content Area -->
     <main class="main-panel">
       <!-- Top Navigation Header -->
       <header class="topbar">
         <div class="topbar-title-wrap">
-          <h1 class="topbar-heading" id="page-heading">PersonalServer</h1>
+          <h1 class="topbar-heading" id="page-heading">Dashboard</h1>
           <span class="topbar-sub" id="page-subheading">Cluster overview</span>
         </div>
         <div class="topbar-actions">
-          <span class="updated-label">Updated:</span>
-          <span class="mono updated-time" id="last-updated-text">-</span>
+          <div class="topbar-badge" id="topbar-cluster-badge">
+            <span class="status-dot dot-online">●</span>
+            <span id="topbar-cluster-status">System healthy</span>
+          </div>
+          <div class="updated-time-wrap">
+            <span class="cell-muted">Updated:</span>
+            <span class="mono" id="last-updated-text">-</span>
+          </div>
           <button id="refresh-btn" class="btn btn-sm">Refresh</button>
+          <div class="topbar-session-badge mono" id="topbar-session-badge">
+            <span class="status-dot dot-online">●</span>
+            <span id="topbar-user-email">Signed in</span>
+          </div>
         </div>
       </header>
 
       <!-- 1. DASHBOARD VIEW -->
       <section id="view-dashboard" class="page-view active">
-        <!-- Summary Strip -->
-        <div class="summary-strip">
-          <div class="summary-block">
-            <div class="summary-label">Cluster</div>
-            <div class="summary-value mono" id="sum-cluster-val">1 online · 0 offline</div>
+        <!-- Row 1: 4 Summary Cards -->
+        <div class="summary-grid">
+          <div class="summary-card">
+            <div class="summary-card-head">
+              <span class="summary-card-label">Cluster</span>
+              <span class="status-dot dot-online">●</span>
+            </div>
+            <div class="summary-card-main mono" id="sum-card-cluster-main">1 online</div>
+            <div class="summary-card-sub mono" id="sum-card-cluster-sub">0 offline</div>
           </div>
-          <div class="summary-divider"></div>
-          <div class="summary-block">
-            <div class="summary-label">Jobs</div>
-            <div class="summary-value mono" id="sum-jobs-val">0 total · 0 running · 0 queued</div>
+
+          <div class="summary-card">
+            <div class="summary-card-head">
+              <span class="summary-card-label">Jobs</span>
+              <span class="status-dot dot-online">●</span>
+            </div>
+            <div class="summary-card-main mono" id="sum-card-jobs-main">0 running</div>
+            <div class="summary-card-sub mono" id="sum-card-jobs-sub">0 queued · 0 total</div>
           </div>
-          <div class="summary-divider"></div>
-          <div class="summary-block">
-            <div class="summary-label">Storage</div>
-            <div class="summary-value mono" id="sum-storage-val">97 GB free · 10% used</div>
+
+          <div class="summary-card">
+            <div class="summary-card-head">
+              <span class="summary-card-label">Storage</span>
+              <span class="status-dot dot-online">●</span>
+            </div>
+            <div class="summary-card-main mono" id="sum-card-storage-main">97 GB free</div>
+            <div class="summary-card-sub mono" id="sum-card-storage-sub">10% used</div>
+          </div>
+
+          <div class="summary-card">
+            <div class="summary-card-head">
+              <span class="summary-card-label">Services</span>
+              <span class="status-dot dot-online">●</span>
+            </div>
+            <div class="summary-card-main mono" id="sum-card-services-main">3 active</div>
+            <div class="summary-card-sub mono" id="sum-card-services-sub">API, Tunnel, Controller</div>
           </div>
         </div>
 
-        <!-- Nodes Section -->
-        <div class="section-card">
-          <div class="section-header">
-            <h2 class="section-title">Nodes</h2>
-            <a href="#nodes" class="section-link">All nodes →</a>
+        <!-- Row 2: 2-Column Grid (Nodes Table + System Summary) -->
+        <div class="dash-grid-row">
+          <!-- Left: Nodes Section -->
+          <div class="section-card">
+            <div class="section-header">
+              <h2 class="section-title">Nodes</h2>
+              <a href="#nodes" class="section-link">All nodes →</a>
+            </div>
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width: 90px;">Status</th>
+                    <th>Node</th>
+                    <th>Role</th>
+                    <th>CPU</th>
+                    <th>Memory</th>
+                    <th>Last seen</th>
+                  </tr>
+                </thead>
+                <tbody id="dash-nodes-tbody">
+                  <tr><td colspan="6" class="cell-muted">Loading nodes...</td></tr>
+                </tbody>
+              </table>
+            </div>
           </div>
-          <div class="table-container">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th style="width: 100px;">Status</th>
-                  <th>Name</th>
-                  <th>Role</th>
-                  <th>CPU</th>
-                  <th>Memory</th>
-                  <th>Last seen</th>
-                </tr>
-              </thead>
-              <tbody id="dash-nodes-tbody">
-                <tr><td colspan="6" class="cell-muted">Loading nodes...</td></tr>
-              </tbody>
-            </table>
+
+          <!-- Right: System Overview Widget -->
+          <div class="section-card">
+            <div class="section-header">
+              <h2 class="section-title">System</h2>
+              <span class="mono cell-muted" id="dash-sys-node-id">server-5387a86b</span>
+            </div>
+            <div class="sys-metric-list">
+              <div class="sys-metric-item">
+                <span class="sys-metric-label">Primary Node</span>
+                <span class="sys-metric-val mono" id="sys-metric-host">vivo-y31</span>
+              </div>
+              <div class="sys-metric-item">
+                <span class="sys-metric-label">Platform / Arch</span>
+                <span class="sys-metric-val mono" id="sys-metric-arch">Termux · aarch64</span>
+              </div>
+              <div class="sys-metric-item">
+                <span class="sys-metric-label">CPU Cores</span>
+                <span class="sys-metric-val mono" id="sys-metric-cpu">8 cores</span>
+              </div>
+              <div class="sys-metric-item">
+                <span class="sys-metric-label">Memory Usage</span>
+                <span class="sys-metric-val mono" id="sys-metric-mem">2.5 / 5.6 GB</span>
+              </div>
+              <div class="sys-metric-item">
+                <span class="sys-metric-label">Storage Root</span>
+                <span class="sys-metric-val mono" id="sys-metric-storage">~/PersonalServer/storage</span>
+              </div>
+              <div class="sys-metric-item">
+                <span class="sys-metric-label">Services Status</span>
+                <span class="sys-metric-val mono" id="sys-metric-services">
+                  <span class="status-dot dot-online">●</span> 3 connected
+                </span>
+              </div>
+            </div>
           </div>
         </div>
 
-        <!-- Recent Jobs Section -->
+        <!-- Row 3: Recent Jobs Section (Full Width) -->
         <div class="section-card">
           <div class="section-header">
             <h2 class="section-title">Recent jobs</h2>
@@ -107,56 +192,18 @@
             <table class="data-table">
               <thead>
                 <tr>
-                  <th>ID</th>
-                  <th>Type</th>
-                  <th>Node</th>
-                  <th>Status</th>
+                  <th style="width: 140px;">Job ID</th>
+                  <th>Workload</th>
+                  <th>Target node</th>
+                  <th style="width: 110px;">Status</th>
                   <th>Duration</th>
                   <th>Created</th>
                 </tr>
               </thead>
               <tbody id="dash-jobs-tbody">
-                <tr><td colspan="6" class="cell-muted">Loading jobs...</td></tr>
+                <tr><td colspan="6" class="cell-muted">Loading recent jobs...</td></tr>
               </tbody>
             </table>
-          </div>
-        </div>
-
-        <!-- Storage Section -->
-        <div class="section-card">
-          <div class="section-header">
-            <h2 class="section-title">Storage</h2>
-            <a href="#storage" class="section-link">Open storage →</a>
-          </div>
-          <div class="storage-dash-content">
-            <div class="storage-dash-left">
-              <div class="mono storage-dash-path" id="dash-storage-root">~/PersonalServer/storage</div>
-              <div class="mono cell-muted" id="dash-storage-stats">97 GB free · 10% used · 0 files · 0 folders</div>
-            </div>
-            <div class="storage-dash-right">
-              <a href="#storage" class="btn btn-sm">Open storage</a>
-            </div>
-          </div>
-        </div>
-
-        <!-- Services Status Section -->
-        <div class="section-card">
-          <div class="section-header">
-            <h2 class="section-title">Services</h2>
-          </div>
-          <div class="services-list" id="dash-services-list">
-            <div class="service-item">
-              <span class="service-name">Node API</span>
-              <span class="service-status mono" id="srv-node-api"><span class="status-dot dot-online">●</span> Running</span>
-            </div>
-            <div class="service-item">
-              <span class="service-name">Cloudflare Tunnel</span>
-              <span class="service-status mono" id="srv-cloudflare"><span class="status-dot dot-online">●</span> Connected</span>
-            </div>
-            <div class="service-item">
-              <span class="service-name">Controller</span>
-              <span class="service-status mono" id="srv-controller"><span class="status-dot dot-online">●</span> Connected</span>
-            </div>
           </div>
         </div>
       </section>
@@ -165,7 +212,8 @@
       <section id="view-nodes" class="page-view">
         <div class="section-card">
           <div class="section-header">
-            <h2 class="section-title">Cluster nodes</h2>
+            <h2 class="section-title">Cluster resources</h2>
+            <span class="mono cell-muted" id="nodes-count-header">1 node online</span>
           </div>
           <div class="table-container">
             <table class="data-table">
@@ -179,11 +227,11 @@
                   <th>CPU</th>
                   <th>Memory</th>
                   <th>Last seen</th>
-                  <th style="width: 70px;">Action</th>
+                  <th style="width: 80px; text-align: right;">Action</th>
                 </tr>
               </thead>
               <tbody id="nodes-tbody">
-                <tr><td colspan="9" class="cell-muted">Loading nodes...</td></tr>
+                <tr><td colspan="9" class="cell-muted">Loading cluster nodes...</td></tr>
               </tbody>
             </table>
           </div>
@@ -230,16 +278,16 @@
                   <option value="auto">Auto (Scheduler)</option>
                 </select>
               </div>
-              <div class="form-cell" style="max-width: 100px;">
+              <div class="form-cell">
                 <label for="job-timeout">Timeout (s)</label>
                 <input type="number" id="job-timeout" class="form-input mono" value="60" min="5" max="300">
               </div>
-              <div class="form-cell" style="flex: 1; min-width: 180px;">
+              <div class="form-cell">
                 <label for="job-params">Parameters (JSON, optional)</label>
                 <input type="text" id="job-params" class="form-input mono" placeholder='{"message": "ping"}'>
               </div>
-              <div class="form-cell form-btn-cell">
-                <button type="submit" class="btn btn-primary">Submit job</button>
+              <div class="form-cell">
+                <button type="submit" class="btn btn-primary" style="height: 32px;">Submit job</button>
               </div>
             </div>
           </form>
@@ -248,24 +296,25 @@
         <!-- Jobs Table -->
         <div class="section-card">
           <div class="section-header">
-            <h2 class="section-title">Workload jobs</h2>
+            <h2 class="section-title">Execution history</h2>
+            <span class="mono cell-muted" id="jobs-count-header">0 total jobs</span>
           </div>
           <div class="table-container">
             <table class="data-table">
               <thead>
                 <tr>
-                  <th>Job ID</th>
-                  <th>Type</th>
-                  <th>Target node</th>
-                  <th>State</th>
+                  <th style="width: 140px;">Job ID</th>
+                  <th>Workload</th>
+                  <th>Assigned node</th>
+                  <th style="width: 110px;">State</th>
                   <th>Attempt</th>
                   <th>Duration</th>
                   <th>Created</th>
-                  <th style="width: 70px;">Action</th>
+                  <th style="width: 80px; text-align: right;">Action</th>
                 </tr>
               </thead>
               <tbody id="jobs-tbody">
-                <tr><td colspan="8" class="cell-muted">Loading jobs...</td></tr>
+                <tr><td colspan="8" class="cell-muted">Loading execution history...</td></tr>
               </tbody>
             </table>
           </div>
@@ -281,7 +330,7 @@
             <div class="detail-grid" id="job-detail-summary">
               <!-- Dynamically populated summary metadata -->
             </div>
-            <div class="code-header cell-muted">Output / Log:</div>
+            <div class="code-header">Execution Output / Log:</div>
             <pre id="job-detail-stdout" class="log-box mono"></pre>
           </div>
         </div>
@@ -305,7 +354,7 @@
 
           <!-- Breadcrumbs Strip -->
           <div class="storage-breadcrumbs mono" id="storage-breadcrumbs">
-            <span class="crumb" onclick="loadStorage('')">Home / storage</span>
+            <span class="crumb" onclick="loadStorage('')">[ / ] Home / storage</span>
           </div>
 
           <!-- File Manager Table -->
@@ -314,14 +363,14 @@
               <thead>
                 <tr>
                   <th>Name</th>
-                  <th style="width: 100px;">Type</th>
-                  <th style="width: 110px;">Size</th>
-                  <th style="width: 140px;">Modified</th>
-                  <th style="width: 180px; text-align: right;">Actions</th>
+                  <th style="width: 110px;">Type</th>
+                  <th style="width: 120px;">Size</th>
+                  <th style="width: 160px;">Modified</th>
+                  <th style="width: 190px; text-align: right;">Actions</th>
                 </tr>
               </thead>
               <tbody id="storage-tbody">
-                <tr><td colspan="5" class="cell-muted">Loading storage...</td></tr>
+                <tr><td colspan="5" class="cell-muted">Loading storage items...</td></tr>
               </tbody>
             </table>
           </div>
