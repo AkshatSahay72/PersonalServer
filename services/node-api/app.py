@@ -15,6 +15,8 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import subprocess
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from datetime import datetime, timezone
@@ -27,6 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 CONFIG_FILE = BASE_DIR / "config" / "node.conf"
 CONFIG_JSON = BASE_DIR / "config" / "node.json"
 SECRETS_DIR = BASE_DIR / "config" / "secrets"
+RUNTIME_DIR = BASE_DIR / "runtime"
 AUTH_TOKEN_FILE = SECRETS_DIR / "auth.token"
 STORAGE_ROOT = (BASE_DIR / "storage").resolve()
 STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
@@ -755,9 +758,80 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         print(f"[NODE-API] {args[0]}")
 
 
+def is_service_running(pattern):
+    try:
+        out = subprocess.check_output(f"pgrep -f '{pattern}'", shell=True, text=True, stderr=subprocess.DEVNULL)
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+def start_heartbeat_reporter(interval_seconds=15):
+    """Background daemon thread to report authenticated node heartbeats to the controller periodically."""
+    def _reporter():
+        while True:
+            try:
+                reg_file = RUNTIME_DIR / "registration.json"
+                if reg_file.exists():
+                    with open(reg_file, "r", encoding="utf-8") as f:
+                        reg_state = json.load(f)
+                    
+                    if reg_state.get("registered") and reg_state.get("auth_token"):
+                        controller_url = (reg_state.get("controller_url") or load_config().get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+                        auth_token = reg_state.get("auth_token")
+                        node_id = reg_state.get("node_id")
+
+                        now = datetime.now(timezone.utc).isoformat()
+                        sys_info = get_system_info()
+                        services_info = {
+                            "node_api": "running",
+                            "cloudflare": "running" if is_service_running("cloudflared") else "stopped"
+                        }
+
+                        payload = {
+                            "node_id": node_id,
+                            "status": "online",
+                            "timestamp": now,
+                            "services": services_info,
+                            "system": {
+                                "cpu_cores": sys_info.get("cpu_cores", 8),
+                                "load_average": sys_info.get("load_average", []),
+                                "memory": f"{sys_info.get('memory', {}).get('used', '0')}/{sys_info.get('memory', {}).get('total', '0')}",
+                                "storage": f"{sys_info.get('storage', {}).get('used', '0')}/{sys_info.get('storage', {}).get('total', '0')} ({sys_info.get('storage', {}).get('used_percent', '0%')})"
+                            }
+                        }
+
+                        req = urllib.request.Request(
+                            f"{controller_url}/heartbeat",
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {auth_token}",
+                                "User-Agent": "PersonalServer-NodeAgent/1.0"
+                            },
+                            method="POST"
+                        )
+                        try:
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                if resp.status == 200:
+                                    reg_state["last_heartbeat"] = now
+                                    with open(reg_file, "w", encoding="utf-8") as f_out:
+                                        json.dump(reg_state, f_out, indent=2)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            time.sleep(interval_seconds)
+
+    t = threading.Thread(target=_reporter, daemon=True, name="HeartbeatReporterDaemon")
+    t.start()
+
+
 if __name__ == "__main__":
     ensure_storage_root()
+    start_heartbeat_reporter(interval_seconds=15)
     server = HTTPServer((HOST, PORT), NodeAPIHandler)
     print(f"PersonalServer Node API & Web Operations running on {HOST}:{PORT}")
     print(f"Storage Root initialized at: {STORAGE_ROOT}")
     server.serve_forever()
+
