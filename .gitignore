@@ -1,0 +1,20 @@
+# Local node configuration
+config/node.json
+config/network.json
+config/services.json
+
+# Secrets
+config/secrets/
+*.key
+*.pem
+*.token
+*.secret
+
+# Runtime
+logs/
+runtime/
+data/
+
+# OS files
+.DS_Store
+Thumbs.db

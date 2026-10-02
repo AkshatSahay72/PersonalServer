@@ -1,0 +1,11 @@
+{
+  "node_id": "server-xxxxxxxxxxxxxxxx",
+  "name": "my-node",
+  "role": "compute",
+  "platform": "termux",
+  "os": "Linux",
+  "architecture": "aarch64",
+  "cpu_cores": 4,
+  "ram_mb": 6000,
+  "storage_gb": 100
+}
