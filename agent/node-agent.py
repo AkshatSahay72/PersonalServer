@@ -54,15 +54,15 @@ def run_cmd(cmd):
 
 def load_node_config():
     """Load node identity from node.json or fallback to node.conf."""
+    config = {}
     if NODE_JSON.exists():
         try:
             with open(NODE_JSON, "r", encoding="utf-8") as f:
-                return json.load(f)
+                config = json.load(f)
         except Exception as e:
             print(f"Warning: Failed to parse {NODE_JSON}: {e}", file=sys.stderr)
 
-    config = {}
-    if NODE_CONF.exists():
+    if not config and NODE_CONF.exists():
         try:
             with open(NODE_CONF, "r", encoding="utf-8") as f:
                 for line in f:
@@ -75,16 +75,22 @@ def load_node_config():
         except Exception as e:
             print(f"Warning: Failed to read {NODE_CONF}: {e}", file=sys.stderr)
 
+    # Defaults and capabilities
     return {
         "node_id": config.get("node_id", "unknown"),
-        "name": config.get("node_name", run_cmd("hostname") or "localhost"),
-        "role": config.get("node_role", "compute"),
+        "name": config.get("name", config.get("node_name", run_cmd("hostname") or "localhost")),
+        "role": config.get("role", config.get("node_role", "compute")),
         "platform": config.get("platform", "termux" if "com.termux" in os.environ.get("PREFIX", "") else sys.platform),
         "os": config.get("os", run_cmd("uname -s") or "Linux"),
         "architecture": config.get("architecture", run_cmd("uname -m") or "unknown"),
         "cpu_cores": int(config.get("cpu_cores", run_cmd("nproc") or 1)),
         "ram_mb": int(config.get("ram_mb", 0)),
-        "storage_gb": int(config.get("storage_gb", 0))
+        "storage_gb": int(config.get("storage_gb", 0)),
+        "capabilities": config.get("capabilities", {
+            "compute": True,
+            "storage": True,
+            "network": True
+        })
     }
 
 
