@@ -3,7 +3,8 @@
 PersonalServer Controller
 =========================
 Cluster controller for multi-node inventory, authenticated registration,
-heartbeat liveness monitoring, node removal, and safe workload/job execution.
+heartbeat liveness monitoring, node removal, resource-aware workload scheduling,
+and safe workload execution.
 """
 
 import sys
@@ -18,6 +19,11 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+# Import ResourceScheduler
+from scheduler.scheduler import ResourceScheduler, compute_node_liveness
+
 CONFIG_DIR = BASE_DIR / "config"
 SECRETS_DIR = CONFIG_DIR / "secrets"
 CONTROLLER_DIR = BASE_DIR / "controller"
@@ -74,7 +80,6 @@ def ensure_directories():
 
 
 def get_or_create_enrollment_token():
-    """Retrieve existing enrollment token or generate a secure new one."""
     ensure_directories()
     if ENROLLMENT_TOKEN_FILE.exists():
         try:
@@ -94,7 +99,7 @@ def get_or_create_enrollment_token():
 
 
 # ------------------------------------------------------------------------------
-# Node Database Storage & Safeguards
+# Storage Helpers
 # ------------------------------------------------------------------------------
 
 def load_nodes_db():
@@ -129,10 +134,6 @@ def save_nodes_db(db):
     temp_file.replace(NODES_FILE)
 
 
-# ------------------------------------------------------------------------------
-# Jobs Database Storage & Safeguards
-# ------------------------------------------------------------------------------
-
 def load_jobs_db():
     ensure_directories()
     if JOBS_FILE.exists():
@@ -163,37 +164,6 @@ def save_jobs_db(db):
             pass
 
     temp_file.replace(JOBS_FILE)
-
-
-# ------------------------------------------------------------------------------
-# Liveness & Node Status Helpers
-# ------------------------------------------------------------------------------
-
-def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
-    raw_status = node.get("status", STATE_UNKNOWN)
-    if raw_status == STATE_REMOVED:
-        return STATE_REMOVED
-
-    last_seen_str = node.get("last_seen")
-    if not last_seen_str:
-        return STATE_UNKNOWN
-
-    try:
-        last_seen_dt = datetime.fromisoformat(last_seen_str)
-        now = datetime.now(timezone.utc)
-        delta_seconds = (now - last_seen_dt).total_seconds()
-
-        if delta_seconds > timeout_seconds:
-            return STATE_OFFLINE
-
-        last_hb = node.get("last_heartbeat", {})
-        services = last_hb.get("services", {})
-        if services and any(v in ("unresponsive", "degraded", "stopped") for v in services.values()):
-            return STATE_UNHEALTHY
-
-        return STATE_ONLINE
-    except Exception:
-        return STATE_UNKNOWN
 
 
 def sanitize_node_record(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
@@ -538,7 +508,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return
 
         # ----------------------------------------------------------------------
-        # 3. Submit Workload / Job: POST /jobs
+        # 3. Submit Workload / Job: POST /jobs (with Scheduler support)
         # ----------------------------------------------------------------------
         if path == "/jobs":
             enrollment_token = get_or_create_enrollment_token()
@@ -546,49 +516,14 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to submit jobs"})
                 return
 
-            target_node = body.get("target_node")
+            target = body.get("target") or body.get("target_node") or "auto"
             job_type = body.get("type")
             job_name = body.get("name", job_type or "job")
             timeout_sec = int(body.get("timeout", 60))
             parameters = body.get("parameters", {}) or {}
+            requirements = body.get("requirements", {}) or {}
 
-            # Validation 1: Target node must be specified
-            if not target_node:
-                self.send_json(400, {
-                    "error": "Missing required field 'target_node'",
-                    "status": JOB_STATE_REJECTED
-                })
-                return
-
-            nodes_db = load_nodes_db()
-            node_entry = nodes_db.get("nodes", {}).get(target_node)
-
-            # Validation 2: Unknown node rejection
-            if not node_entry:
-                self.send_json(400, {
-                    "error": f"Target node '{target_node}' does not exist in cluster.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return
-
-            # Validation 3: Removed node rejection
-            if node_entry.get("status") == STATE_REMOVED:
-                self.send_json(400, {
-                    "error": f"Target node '{target_node}' was removed from the cluster.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return
-
-            # Validation 4: Offline node rejection
-            live_status = compute_node_liveness(node_entry, self.heartbeat_timeout)
-            if live_status == STATE_OFFLINE:
-                self.send_json(400, {
-                    "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return
-
-            # Validation 5: Safe allowlisted workload type rejection
+            # Validation: Safe allowlisted workload type rejection
             if job_type not in ALLOWLISTED_WORKLOADS:
                 self.send_json(400, {
                     "error": f"Job type '{job_type}' is not in the safe allowlist. Allowed: {list(ALLOWLISTED_WORKLOADS.keys())}",
@@ -596,9 +531,64 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # Enforce reasonable timeout constraints
-            timeout_sec = max(5, min(timeout_sec, 300))
+            nodes_db = load_nodes_db()
+            target_node = None
+            scheduler_info = None
 
+            # Path A: Automatic Resource-Aware Scheduling
+            if target.lower() == "auto":
+                decision = ResourceScheduler.select_node(requirements, nodes_db, self.heartbeat_timeout)
+                if not decision["selected_node"]:
+                    self.send_json(400, {
+                        "error": f"Scheduling Failed: {decision['reason']}",
+                        "status": JOB_STATE_REJECTED,
+                        "scheduler": decision
+                    })
+                    return
+                target_node = decision["selected_node"]
+                scheduler_info = {
+                    "mode": "resource-aware",
+                    "selected_node": target_node,
+                    "score": decision["score"],
+                    "reason": decision["reason"],
+                    "candidates_count": len(decision["candidates"])
+                }
+                print(f"[CONTROLLER-SCHEDULER] Auto-selected node '{target_node}': {decision['reason']}")
+
+            # Path B: Explicit Target Node (Preserves V0.8 behavior)
+            else:
+                target_node = target
+                node_entry = nodes_db.get("nodes", {}).get(target_node)
+
+                if not node_entry:
+                    self.send_json(400, {
+                        "error": f"Target node '{target_node}' does not exist in cluster.",
+                        "status": JOB_STATE_REJECTED
+                    })
+                    return
+
+                if node_entry.get("status") == STATE_REMOVED:
+                    self.send_json(400, {
+                        "error": f"Target node '{target_node}' was removed from the cluster.",
+                        "status": JOB_STATE_REJECTED
+                    })
+                    return
+
+                live_status = compute_node_liveness(node_entry, self.heartbeat_timeout)
+                if live_status == STATE_OFFLINE:
+                    self.send_json(400, {
+                        "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
+                        "status": JOB_STATE_REJECTED
+                    })
+                    return
+
+                scheduler_info = {
+                    "mode": "explicit",
+                    "target_node": target_node,
+                    "reason": "Explicit node specified by client"
+                }
+
+            timeout_sec = max(5, min(timeout_sec, 300))
             job_id = f"job-{secrets.token_hex(6)}"
             now = get_current_iso_timestamp()
 
@@ -607,7 +597,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "name": job_name,
                 "type": job_type,
                 "parameters": parameters,
+                "requirements": requirements,
                 "target_node": target_node,
+                "scheduler": scheduler_info,
                 "timeout": timeout_sec,
                 "created_at": now,
                 "started_at": None,
@@ -624,6 +616,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.send_json(200, {
                 "status": JOB_STATE_QUEUED,
                 "job_id": job_id,
+                "target_node": target_node,
+                "scheduler": scheduler_info,
                 "job": job_record
             })
             return
@@ -644,7 +638,6 @@ class ControllerHandler(BaseHTTPRequestHandler):
             nodes_db = load_nodes_db()
             node_entry = nodes_db.get("nodes", {}).get(target_node, {})
 
-            # Authenticate reporting node
             expected_auth = node_entry.get("auth_token")
             enrollment_token = get_or_create_enrollment_token()
             if not token or (token != expected_auth and token != enrollment_token):
@@ -789,7 +782,7 @@ def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT
     ControllerHandler.heartbeat_timeout = timeout
 
     print("==========================================")
-    print(" PersonalServer Cluster Controller")
+    print(" PersonalServer Cluster Controller & Scheduler")
     print("==========================================")
     print(f"Controller listening on http://{host}:{port}")
     print(f"Heartbeat timeout:     {timeout} seconds")
@@ -806,23 +799,47 @@ def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT
         server.server_close()
 
 
-def submit_job(node_id, job_type, name=None, timeout=60, params_json=None):
-    token = get_or_create_enrollment_token()
+def schedule_test(requirements_json=None):
     nodes_db = load_nodes_db()
-    node = nodes_db.get("nodes", {}).get(node_id)
+    reqs = {}
+    if requirements_json:
+        try:
+            reqs = json.loads(requirements_json)
+        except Exception as e:
+            print(f"Error parsing requirements JSON: {e}", file=sys.stderr)
+            return 1
 
-    if not node:
-        print(f"Error: Node '{node_id}' not found in cluster.", file=sys.stderr)
-        return 1
+    print("==========================================")
+    print(" PersonalServer Scheduler Evaluation")
+    print("==========================================")
+    print(f"Requirements: {json.dumps(reqs, indent=2) if reqs else 'None (Default Resource-Aware)'}")
+    print()
 
-    if node.get("status") == STATE_REMOVED:
-        print(f"Error: Node '{node_id}' is removed from cluster.", file=sys.stderr)
-        return 1
+    decision = ResourceScheduler.select_node(reqs, nodes_db)
 
-    live_status = compute_node_liveness(node)
-    if live_status == STATE_OFFLINE:
-        print(f"Error: Node '{node_id}' is OFFLINE. Cannot submit job.", file=sys.stderr)
-        return 1
+    print(f"Selected Node: {decision['selected_node'] or 'NONE'}")
+    print(f"Score:         {decision['score']}/100")
+    print(f"Reason:        {decision['reason']}")
+    print()
+
+    print("Candidates:")
+    for c in decision["candidates"]:
+        print(f"  * {c['node_id']} ({c['name']}) -> Score: {c['score']}/100 [{c['reason']}]")
+    if not decision["candidates"]:
+        print("  (None)")
+    print()
+
+    print("Rejected Nodes:")
+    for nid, r in decision["rejected"].items():
+        print(f"  * {nid}: {r}")
+    if not decision["rejected"]:
+        print("  (None)")
+    print("==========================================")
+    return 0
+
+
+def submit_job(target_or_auto, job_type, name=None, timeout=60, params_json=None, reqs_json=None):
+    nodes_db = load_nodes_db()
 
     if job_type not in ALLOWLISTED_WORKLOADS:
         print(f"Error: Job type '{job_type}' is not allowlisted.", file=sys.stderr)
@@ -837,6 +854,44 @@ def submit_job(node_id, job_type, name=None, timeout=60, params_json=None):
             print(f"Error parsing params JSON: {e}", file=sys.stderr)
             return 1
 
+    reqs = {}
+    if reqs_json:
+        try:
+            reqs = json.loads(reqs_json)
+        except Exception as e:
+            print(f"Error parsing requirements JSON: {e}", file=sys.stderr)
+            return 1
+
+    target_node = None
+    scheduler_info = None
+
+    if not target_or_auto or target_or_auto.lower() == "auto":
+        decision = ResourceScheduler.select_node(reqs, nodes_db)
+        if not decision["selected_node"]:
+            print(f"Scheduling Error: {decision['reason']}", file=sys.stderr)
+            return 1
+        target_node = decision["selected_node"]
+        scheduler_info = {
+            "mode": "resource-aware",
+            "selected_node": target_node,
+            "score": decision["score"],
+            "reason": decision["reason"]
+        }
+    else:
+        target_node = target_or_auto
+        node = nodes_db.get("nodes", {}).get(target_node)
+        if not node:
+            print(f"Error: Node '{target_node}' not found in cluster.", file=sys.stderr)
+            return 1
+        if node.get("status") == STATE_REMOVED:
+            print(f"Error: Node '{target_node}' is removed from cluster.", file=sys.stderr)
+            return 1
+        live_status = compute_node_liveness(node)
+        if live_status == STATE_OFFLINE:
+            print(f"Error: Node '{target_node}' is OFFLINE. Cannot submit job.", file=sys.stderr)
+            return 1
+        scheduler_info = {"mode": "explicit", "target_node": target_node, "reason": "Explicit node"}
+
     job_id = f"job-{secrets.token_hex(6)}"
     now = get_current_iso_timestamp()
 
@@ -845,7 +900,9 @@ def submit_job(node_id, job_type, name=None, timeout=60, params_json=None):
         "name": name or job_type,
         "type": job_type,
         "parameters": params,
-        "target_node": node_id,
+        "requirements": reqs,
+        "target_node": target_node,
+        "scheduler": scheduler_info,
         "timeout": int(timeout),
         "created_at": now,
         "started_at": None,
@@ -861,11 +918,13 @@ def submit_job(node_id, job_type, name=None, timeout=60, params_json=None):
     print("==========================================")
     print(" PersonalServer Job Submitted")
     print("==========================================")
-    print(f"Job ID:      {job_id}")
-    print(f"Type:        {job_type}")
-    print(f"Target Node: {node_id} ({node.get('name')})")
-    print(f"Status:      {JOB_STATE_QUEUED}")
-    print(f"Timeout:     {timeout}s")
+    print(f"Job ID:          {job_id}")
+    print(f"Type:            {job_type}")
+    print(f"Selected Target: {target_node}")
+    print(f"Schedule Mode:   {scheduler_info['mode']}")
+    print(f"Reason:          {scheduler_info['reason']}")
+    print(f"Status:          {JOB_STATE_QUEUED}")
+    print(f"Timeout:         {timeout}s")
     print("==========================================")
     return 0
 
@@ -889,9 +948,10 @@ def list_jobs(filter_node=None, filter_status=None):
             res_summary = ""
             if j.get("result"):
                 res_summary = f"| Exit: {j['result'].get('exit_code')} | Duration: {j['result'].get('duration_ms')}ms"
+            mode = j.get("scheduler", {}).get("mode", "explicit")
             print(f"Job ID:      {j.get('job_id')}")
             print(f"  Type:      {j.get('type')}")
-            print(f"  Target:    {j.get('target_node')}")
+            print(f"  Target:    {j.get('target_node')} ({mode})")
             print(f"  Status:    {j.get('status')} {res_summary}")
             print(f"  Created:   {j.get('created_at')}")
             print()
@@ -956,13 +1016,15 @@ def list_nodes(filter_status=None):
             last_seen = node.get("last_seen")
             caps = ", ".join([k for k, v in node.get("capabilities", {}).items() if v]) or "none"
             res = node.get("resources", {})
+            last_hb = node.get("last_heartbeat", {}).get("system", {})
+            mem_info = last_hb.get("memory", f"{res.get('ram_mb', 'N/A')} MB")
 
             print(f"Node ID:      {nid}")
             print(f"  Name:       {name}")
             print(f"  Role:       {role}")
             print(f"  Status:     {status}")
             print(f"  Platform:   {platform}")
-            print(f"  CPU / RAM:  {res.get('cpu_cores', 'N/A')} cores | {res.get('ram_mb', 'N/A')} MB")
+            print(f"  Resources:  {res.get('cpu_cores', 'N/A')} cores | RAM: {mem_info}")
             print(f"  Caps:       {caps}")
             print(f"  Last Seen:  {last_seen}")
             print()
@@ -1020,7 +1082,7 @@ def remove_node(node_id):
 def main():
     parser = argparse.ArgumentParser(
         prog="controller",
-        description="PersonalServer Cluster Controller & Workload Manager"
+        description="PersonalServer Cluster Controller & Resource Scheduler"
     )
     subparsers = parser.add_subparsers(dest="command", help="Controller commands")
 
@@ -1046,12 +1108,17 @@ def main():
     p_remove.add_argument("node_id", help="ID of node to remove")
 
     # submit command
-    p_submit = subparsers.add_parser("submit", help="Submit a workload job to a target node")
-    p_submit.add_argument("--node", required=True, help="Target Node ID")
+    p_submit = subparsers.add_parser("submit", help="Submit a workload job to an explicit node or 'auto'")
+    p_submit.add_argument("--node", default="auto", help="Target Node ID or 'auto' for scheduler (default: auto)")
     p_submit.add_argument("--type", required=True, choices=list(ALLOWLISTED_WORKLOADS.keys()), help="Allowlisted workload type")
     p_submit.add_argument("--name", help="Optional friendly name for the job")
     p_submit.add_argument("--timeout", type=int, default=60, help="Timeout in seconds (default 60)")
     p_submit.add_argument("--params", help="JSON string of parameters")
+    p_submit.add_argument("--requirements", help="JSON string of scheduler requirements")
+
+    # schedule-test command
+    p_sched = subparsers.add_parser("schedule-test", help="Test scheduler evaluation against current cluster")
+    p_sched.add_argument("--requirements", help="JSON string of scheduler requirements")
 
     # jobs command
     p_jobs = subparsers.add_parser("jobs", help="List jobs")
@@ -1084,8 +1151,10 @@ def main():
         show_cluster()
     elif args.command == "remove":
         sys.exit(remove_node(args.node_id))
+    elif args.command == "schedule-test":
+        sys.exit(schedule_test(args.requirements))
     elif args.command == "submit":
-        sys.exit(submit_job(args.node, args.type, args.name, args.timeout, args.params))
+        sys.exit(submit_job(args.node, args.type, args.name, args.timeout, args.params, args.requirements))
     elif args.command == "jobs":
         list_jobs(getattr(args, "node", None), getattr(args, "status", None))
     elif args.command == "job":
