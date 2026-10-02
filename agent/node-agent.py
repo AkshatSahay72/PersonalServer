@@ -3,7 +3,7 @@
 PersonalServer Node Agent
 =========================
 Local control layer for node identity, health, status, service orchestration,
-and controller communication (registration and heartbeat).
+controller registration, heartbeat reporting, and workload job execution.
 """
 
 import sys
@@ -17,6 +17,9 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Import local JobExecutor
+from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+
 # Paths relative to agent directory
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = BASE_DIR / "config"
@@ -24,6 +27,7 @@ SECRETS_DIR = CONFIG_DIR / "secrets"
 SCRIPTS_DIR = BASE_DIR / "scripts"
 RUNTIME_DIR = BASE_DIR / "runtime"
 LOGS_DIR = BASE_DIR / "logs"
+JOBS_DIR = RUNTIME_DIR / "jobs"
 
 NODE_JSON = CONFIG_DIR / "node.json"
 NODE_CONF = CONFIG_DIR / "node.conf"
@@ -75,7 +79,6 @@ def load_node_config():
         except Exception as e:
             print(f"Warning: Failed to read {NODE_CONF}: {e}", file=sys.stderr)
 
-    # Defaults and capabilities
     return {
         "node_id": config.get("node_id", "unknown"),
         "name": config.get("name", config.get("node_name", run_cmd("hostname") or "localhost")),
@@ -96,18 +99,15 @@ def load_node_config():
 
 def get_system_metrics():
     """Collect lightweight system metrics."""
-    # CPU
     try:
         cpu_cores = int(run_cmd("nproc") or 1)
     except Exception:
         cpu_cores = 1
 
-    # Uptime & Load Average
     uptime_raw = run_cmd("uptime")
     load_match = re.search(r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)", uptime_raw)
     load_average = [float(load_match.group(i)) for i in range(1, 4)] if load_match else []
 
-    # Memory
     memory = {"total": "N/A", "used": "N/A", "available": "N/A"}
     mem_raw = run_cmd("free -h")
     for line in mem_raw.splitlines():
@@ -118,7 +118,6 @@ def get_system_metrics():
             elif len(parts) >= 4:
                 memory = {"total": parts[1], "used": parts[2], "available": parts[3]}
 
-    # Storage
     storage = {"total": "N/A", "used": "N/A", "available": "N/A", "used_percent": "N/A"}
     df_raw = run_cmd("df -h ~")
     df_lines = df_raw.splitlines()
@@ -142,7 +141,6 @@ def get_system_metrics():
 
 
 def is_pid_alive(pid_str, pattern=None):
-    """Check if a PID string is numeric, alive, and optionally matches command pattern."""
     if not pid_str or not str(pid_str).strip().isdigit():
         return False
     pid = int(pid_str)
@@ -157,10 +155,8 @@ def is_pid_alive(pid_str, pattern=None):
 
 
 def get_service_states():
-    """Inspect status of managed services (Node API and Cloudflare)."""
     services = {}
 
-    # 1. Node API
     api_pid = ""
     api_pid_file = RUNTIME_DIR / "node-api.pid"
     if api_pid_file.exists():
@@ -185,7 +181,6 @@ def get_service_states():
     else:
         services["node_api"] = "stopped"
 
-    # 2. Cloudflare Tunnel
     cf_pid = ""
     cf_pid_file = RUNTIME_DIR / "cloudflared.pid"
     if cf_pid_file.exists():
@@ -206,7 +201,7 @@ def get_service_states():
 
 
 # ------------------------------------------------------------------------------
-# Registration & Controller Communication Helpers
+# Registration & Controller Communication
 # ------------------------------------------------------------------------------
 
 def get_default_controller_url():
@@ -253,11 +248,10 @@ def get_enrollment_token(arg_token=None):
 
 
 # ------------------------------------------------------------------------------
-# CLI Command Handlers
+# CLI Commands
 # ------------------------------------------------------------------------------
 
 def cmd_info(args):
-    """Output node identity."""
     node_info = load_node_config()
     if getattr(args, "json", False):
         print(json.dumps(node_info, indent=2))
@@ -273,7 +267,6 @@ def cmd_info(args):
 
 
 def cmd_health(args):
-    """Output node health overview."""
     node_info = load_node_config()
     system_metrics = get_system_metrics()
     services = get_service_states()
@@ -315,7 +308,6 @@ def cmd_health(args):
 
 
 def cmd_status(args):
-    """Output unified node and service status."""
     node_info = load_node_config()
     system_metrics = get_system_metrics()
     services = get_service_states()
@@ -358,7 +350,6 @@ def cmd_status(args):
 
 
 def execute_script(script_path):
-    """Run an existing service manager script."""
     if not script_path.exists():
         print(f"Error: Script not found: {script_path}", file=sys.stderr)
         return 1
@@ -379,7 +370,6 @@ def cmd_restart(args):
 
 
 def cmd_register(args):
-    """Register node with the Controller."""
     controller_url = (args.controller or get_default_controller_url()).rstrip("/")
     enrollment_token = get_enrollment_token(args.token)
 
@@ -453,7 +443,6 @@ def cmd_register(args):
 
 
 def cmd_heartbeat(args):
-    """Send heartbeat to the registered Controller."""
     reg_state = load_registration_state()
     if not reg_state or not reg_state.get("registered"):
         print("Error: Node is not registered. Run 'python agent/node-agent.py register' first.", file=sys.stderr)
@@ -527,12 +516,10 @@ def cmd_heartbeat(args):
 
 
 def cmd_registration_status(args):
-    """Check and display local registration status."""
     reg_state = load_registration_state()
 
     if getattr(args, "json", False):
         if reg_state:
-            # Mask auth token in JSON output for safety
             safe_state = dict(reg_state)
             if "auth_token" in safe_state:
                 safe_state["auth_token"] = safe_state["auth_token"][:6] + "..." if safe_state["auth_token"] else ""
@@ -558,10 +545,89 @@ def cmd_registration_status(args):
     return 0
 
 
+def cmd_work(args):
+    """Fetch and execute pending jobs assigned to this node by the controller."""
+    reg_state = load_registration_state()
+    if not reg_state or not reg_state.get("registered"):
+        print("Error: Node is not registered. Run 'python agent/node-agent.py register' first.", file=sys.stderr)
+        return 1
+
+    controller_url = (args.controller or reg_state.get("controller_url") or get_default_controller_url()).rstrip("/")
+    auth_token = reg_state.get("auth_token", "")
+    node_id = reg_state.get("node_id", "")
+
+    fetch_url = f"{controller_url}/nodes/{node_id}/jobs/next"
+    req = urllib.request.Request(
+        fetch_url,
+        headers={
+            "Authorization": f"Bearer {auth_token}",
+            "User-Agent": "PersonalServer-NodeAgent/1.0"
+        }
+    )
+
+    print(f"Checking for pending jobs at {controller_url}...")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            job = data.get("job")
+
+            if not job:
+                print("No pending jobs assigned to this node.")
+                return 0
+
+            print(f"-> Assigned Job: {job.get('job_id')} ({job.get('type')})")
+            print(f"-> Executing workload under user permissions...")
+
+            # Execute via JobExecutor
+            result = JobExecutor.execute(job)
+
+            print(f"-> Execution completed with status: {result.get('status')} (Exit: {result.get('exit_code')})")
+
+            # Post result back to controller
+            result_url = f"{controller_url}/jobs/{job.get('job_id')}/result"
+            res_req = urllib.request.Request(
+                result_url,
+                data=json.dumps(result).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {auth_token}",
+                    "User-Agent": "PersonalServer-NodeAgent/1.0"
+                },
+                method="POST"
+            )
+
+            with urllib.request.urlopen(res_req, timeout=5) as res_resp:
+                ack_data = json.loads(res_resp.read().decode("utf-8"))
+                print(f"-> Result reported to controller: {ack_data.get('job_status')}")
+
+            return 0
+
+    except urllib.error.HTTPError as e:
+        print(f"HTTP Error (HTTP {e.code}): {e.reason}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Work Execution Error: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_exec_local(args):
+    """Directly test executing a safe workload locally."""
+    job_payload = {
+        "job_id": f"local-{int(datetime.now().timestamp())}",
+        "type": args.type,
+        "timeout": args.timeout,
+        "parameters": json.loads(args.params) if args.params else {}
+    }
+    print(f"Executing local workload '{args.type}'...")
+    res = JobExecutor.execute(job_payload)
+    print(json.dumps(res, indent=2))
+    return 0 if res.get("status") == "SUCCEEDED" else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="node-agent",
-        description="PersonalServer Node Agent - Local Node Control & Controller Interface"
+        description="PersonalServer Node Agent - Local Node Control & Workload Execution"
     )
     subparsers = parser.add_subparsers(dest="command", help="Agent commands")
 
@@ -594,6 +660,15 @@ def main():
     p_reg_stat = subparsers.add_parser("registration-status", help="Display node registration status")
     p_reg_stat.add_argument("--json", action="store_true", help="Output in JSON format")
 
+    # Workload execution commands
+    p_work = subparsers.add_parser("work", help="Poll and execute pending assigned jobs from controller")
+    p_work.add_argument("--controller", help="Override controller URL")
+
+    p_exec_local = subparsers.add_parser("exec-local", help="Directly test safe workload execution locally")
+    p_exec_local.add_argument("--type", required=True, choices=list(ALLOWLISTED_WORKLOADS.keys()), help="Workload type")
+    p_exec_local.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
+    p_exec_local.add_argument("--params", help="JSON parameters")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -610,6 +685,8 @@ def main():
         "register": cmd_register,
         "heartbeat": cmd_heartbeat,
         "registration-status": cmd_registration_status,
+        "work": cmd_work,
+        "exec-local": cmd_exec_local,
     }
 
     handler = command_handlers.get(args.command)

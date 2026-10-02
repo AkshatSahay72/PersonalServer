@@ -3,7 +3,7 @@
 PersonalServer Controller
 =========================
 Cluster controller for multi-node inventory, authenticated registration,
-heartbeat liveness monitoring, node removal, and cluster state management.
+heartbeat liveness monitoring, node removal, and safe workload/job execution.
 """
 
 import sys
@@ -25,6 +25,8 @@ DATA_DIR = CONTROLLER_DIR / "data"
 
 NODES_FILE = DATA_DIR / "nodes.json"
 BACKUP_NODES_FILE = DATA_DIR / "nodes.json.bak"
+JOBS_FILE = DATA_DIR / "jobs.json"
+BACKUP_JOBS_FILE = DATA_DIR / "jobs.json.bak"
 ENROLLMENT_TOKEN_FILE = SECRETS_DIR / "enrollment.token"
 
 DEFAULT_HOST = "0.0.0.0"
@@ -40,6 +42,26 @@ STATE_UNKNOWN = "UNKNOWN"
 STATE_REMOVED = "REMOVED"
 
 VALID_ROLES = ["compute", "storage", "gateway", "controller", "hybrid"]
+
+# Centralized Job States
+JOB_STATE_QUEUED = "QUEUED"
+JOB_STATE_RUNNING = "RUNNING"
+JOB_STATE_SUCCEEDED = "SUCCEEDED"
+JOB_STATE_FAILED = "FAILED"
+JOB_STATE_TIMEOUT = "TIMEOUT"
+JOB_STATE_CANCELLED = "CANCELLED"
+JOB_STATE_REJECTED = "REJECTED"
+
+# Allowlisted Workload Types
+ALLOWLISTED_WORKLOADS = {
+    "system-info": "Gather system hardware and OS metrics",
+    "health-check": "Run node health check script",
+    "node-status": "Run node status check script",
+    "python-script": "Execute safe inline python script",
+    "echo": "Echo back test message",
+    "failing-test": "Controlled error-handling test workload",
+    "timeout-test": "Controlled timeout test workload"
+}
 
 
 def get_current_iso_timestamp():
@@ -71,8 +93,11 @@ def get_or_create_enrollment_token():
     return token
 
 
+# ------------------------------------------------------------------------------
+# Node Database Storage & Safeguards
+# ------------------------------------------------------------------------------
+
 def load_nodes_db():
-    """Load the registered nodes database with backup rollback fallback."""
     ensure_directories()
     if NODES_FILE.exists():
         try:
@@ -90,13 +115,11 @@ def load_nodes_db():
 
 
 def save_nodes_db(db):
-    """Save the registered nodes database atomically with automatic backup safeguard."""
     ensure_directories()
     temp_file = NODES_FILE.with_suffix(".tmp")
     with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(db, f, indent=2)
 
-    # Maintain a backup of the current database before replacing
     if NODES_FILE.exists():
         try:
             shutil.copy2(NODES_FILE, BACKUP_NODES_FILE)
@@ -106,8 +129,47 @@ def save_nodes_db(db):
     temp_file.replace(NODES_FILE)
 
 
+# ------------------------------------------------------------------------------
+# Jobs Database Storage & Safeguards
+# ------------------------------------------------------------------------------
+
+def load_jobs_db():
+    ensure_directories()
+    if JOBS_FILE.exists():
+        try:
+            with open(JOBS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Corrupt {JOBS_FILE} ({e}). Rolling back to backup...", file=sys.stderr)
+            if BACKUP_JOBS_FILE.exists():
+                try:
+                    with open(BACKUP_JOBS_FILE, "r", encoding="utf-8") as bf:
+                        return json.load(bf)
+                except Exception:
+                    pass
+    return {"jobs": {}}
+
+
+def save_jobs_db(db):
+    ensure_directories()
+    temp_file = JOBS_FILE.with_suffix(".tmp")
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2)
+
+    if JOBS_FILE.exists():
+        try:
+            shutil.copy2(JOBS_FILE, BACKUP_JOBS_FILE)
+        except Exception:
+            pass
+
+    temp_file.replace(JOBS_FILE)
+
+
+# ------------------------------------------------------------------------------
+# Liveness & Node Status Helpers
+# ------------------------------------------------------------------------------
+
 def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
-    """Evaluate live status based on heartbeat timestamp and service state."""
     raw_status = node.get("status", STATE_UNKNOWN)
     if raw_status == STATE_REMOVED:
         return STATE_REMOVED
@@ -124,7 +186,6 @@ def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
         if delta_seconds > timeout_seconds:
             return STATE_OFFLINE
 
-        # Check services state in last heartbeat
         last_hb = node.get("last_heartbeat", {})
         services = last_hb.get("services", {})
         if services and any(v in ("unresponsive", "degraded", "stopped") for v in services.values()):
@@ -136,7 +197,6 @@ def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
 
 
 def sanitize_node_record(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
-    """Create a sanitized copy of node record without credentials, with computed live status."""
     node_copy = dict(node)
     node_copy.pop("auth_token", None)
     node_copy["status"] = compute_node_liveness(node, timeout_seconds)
@@ -144,7 +204,6 @@ def sanitize_node_record(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
 
 
 def get_cluster_summary(db, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
-    """Aggregate cluster statistics."""
     nodes = db.get("nodes", {})
     online_count = 0
     offline_count = 0
@@ -185,6 +244,10 @@ def get_cluster_summary(db, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
     }
 
 
+# ------------------------------------------------------------------------------
+# HTTP Request Handler
+# ------------------------------------------------------------------------------
+
 class ControllerHandler(BaseHTTPRequestHandler):
     heartbeat_timeout = DEFAULT_HEARTBEAT_TIMEOUT
 
@@ -197,7 +260,6 @@ class ControllerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def parse_auth_token(self):
-        """Extract Bearer token from Authorization header."""
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             return auth_header[7:].strip()
@@ -218,35 +280,31 @@ class ControllerHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # ----------------------------------------------------------------------
         # GET /health or GET /status
-        # ----------------------------------------------------------------------
         if path in ("/health", "/status"):
-            db = load_nodes_db()
-            summary = get_cluster_summary(db, self.heartbeat_timeout)
+            nodes_db = load_nodes_db()
+            jobs_db = load_jobs_db()
+            summary = get_cluster_summary(nodes_db, self.heartbeat_timeout)
             self.send_json(200, {
                 "status": "online",
                 "service": "PersonalServer Controller",
                 "cluster": summary["cluster"],
+                "total_jobs": len(jobs_db.get("jobs", {})),
                 "timestamp": get_current_iso_timestamp()
             })
             return
 
-        # ----------------------------------------------------------------------
         # GET /cluster
-        # ----------------------------------------------------------------------
         if path == "/cluster":
-            db = load_nodes_db()
-            summary = get_cluster_summary(db, self.heartbeat_timeout)
+            nodes_db = load_nodes_db()
+            summary = get_cluster_summary(nodes_db, self.heartbeat_timeout)
             self.send_json(200, summary)
             return
 
-        # ----------------------------------------------------------------------
-        # GET /nodes (supports ?status=online, ?role=compute, etc.)
-        # ----------------------------------------------------------------------
+        # GET /nodes
         if path == "/nodes":
-            db = load_nodes_db()
-            summary = get_cluster_summary(db, self.heartbeat_timeout)
+            nodes_db = load_nodes_db()
+            summary = get_cluster_summary(nodes_db, self.heartbeat_timeout)
             nodes_list = summary["nodes"]
 
             filter_status = query.get("status", [None])[0]
@@ -256,7 +314,6 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 filter_status = filter_status.upper()
                 nodes_list = [n for n in nodes_list if n["status"] == filter_status]
             else:
-                # By default, exclude removed nodes from generic list unless requested
                 nodes_list = [n for n in nodes_list if n["status"] != STATE_REMOVED]
 
             if filter_role:
@@ -268,18 +325,82 @@ class ControllerHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # ----------------------------------------------------------------------
+        # GET /nodes/<node_id>/jobs/next (Node Agent fetching its assigned job)
+        if path.startswith("/nodes/") and path.endswith("/jobs/next"):
+            node_id = path[7:-10].strip()
+            token = self.parse_auth_token()
+            nodes_db = load_nodes_db()
+            node = nodes_db.get("nodes", {}).get(node_id)
+
+            if not node:
+                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return
+
+            expected_auth = node.get("auth_token")
+            enrollment_token = get_or_create_enrollment_token()
+            if not token or (token != expected_auth and token != enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Invalid node authentication token"})
+                return
+
+            jobs_db = load_jobs_db()
+            queued_jobs = [
+                j for j in jobs_db.get("jobs", {}).values()
+                if j.get("target_node") == node_id and j.get("status") == JOB_STATE_QUEUED
+            ]
+
+            if not queued_jobs:
+                self.send_json(200, {"job": None, "message": "No pending jobs for this node."})
+                return
+
+            # Pick oldest queued job and transition to RUNNING
+            next_job = queued_jobs[0]
+            next_job["status"] = JOB_STATE_RUNNING
+            next_job["started_at"] = get_current_iso_timestamp()
+            save_jobs_db(jobs_db)
+
+            print(f"[CONTROLLER] Dispatched job {next_job['job_id']} ({next_job['type']}) to node {node_id}")
+            self.send_json(200, {"job": next_job})
+            return
+
         # GET /nodes/<node_id>
-        # ----------------------------------------------------------------------
         if path.startswith("/nodes/"):
             node_id = path[7:].strip()
-            db = load_nodes_db()
-            node = db.get("nodes", {}).get(node_id)
+            nodes_db = load_nodes_db()
+            node = nodes_db.get("nodes", {}).get(node_id)
             if not node:
                 self.send_json(404, {"error": f"Node '{node_id}' not found"})
                 return
             s_node = sanitize_node_record(node, self.heartbeat_timeout)
             self.send_json(200, {"node": s_node})
+            return
+
+        # GET /jobs
+        if path == "/jobs":
+            jobs_db = load_jobs_db()
+            all_jobs = list(jobs_db.get("jobs", {}).values())
+            filter_node = query.get("node", [None])[0]
+            filter_status = query.get("status", [None])[0]
+
+            if filter_node:
+                all_jobs = [j for j in all_jobs if j.get("target_node") == filter_node]
+            if filter_status:
+                all_jobs = [j for j in all_jobs if j.get("status") == filter_status.upper()]
+
+            self.send_json(200, {
+                "jobs": all_jobs,
+                "count": len(all_jobs)
+            })
+            return
+
+        # GET /jobs/<job_id>
+        if path.startswith("/jobs/"):
+            job_id = path[6:].strip()
+            jobs_db = load_jobs_db()
+            job = jobs_db.get("jobs", {}).get(job_id)
+            if not job:
+                self.send_json(404, {"error": f"Job '{job_id}' not found"})
+                return
+            self.send_json(200, {"job": job})
             return
 
         self.send_json(404, {"error": "Endpoint not found"})
@@ -289,7 +410,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         path = parsed.path
         body = self.read_json_body()
 
-        if body is None and path not in ("/nodes/"):
+        if body is None and not (path.startswith("/nodes/") and path.endswith("/remove")) and not (path.startswith("/jobs/") and path.endswith("/cancel")):
             self.send_json(400, {"error": "Invalid or missing JSON payload"})
             return
 
@@ -298,7 +419,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             token = body.get("enrollment_token") or body.get("auth_token") or ""
 
         # ----------------------------------------------------------------------
-        # 1. Node Registration / Re-registration: POST /register
+        # 1. Node Registration: POST /register
         # ----------------------------------------------------------------------
         if path == "/register":
             enrollment_token = get_or_create_enrollment_token()
@@ -332,10 +453,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "network": True
             })
 
-            db = load_nodes_db()
+            nodes_db = load_nodes_db()
             now = get_current_iso_timestamp()
 
-            # Generate a fresh dedicated per-node auth token
             node_auth_token = secrets.token_hex(20)
 
             node_record = {
@@ -358,8 +478,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 }
             }
 
-            db.setdefault("nodes", {})[node_id] = node_record
-            save_nodes_db(db)
+            nodes_db.setdefault("nodes", {})[node_id] = node_record
+            save_nodes_db(nodes_db)
 
             print(f"[CONTROLLER] Registered node: {node_id} ({node_name}, role: {node_role})")
 
@@ -368,7 +488,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "node_id": node_id,
                 "auth_token": node_auth_token,
                 "registered_at": now,
-                "message": f"Node '{node_id}' successfully registered in cluster '{db.get('cluster_name')}'."
+                "message": f"Node '{node_id}' successfully registered in cluster '{nodes_db.get('cluster_name')}'."
             })
             return
 
@@ -381,15 +501,14 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Missing required field 'node_id'"})
                 return
 
-            db = load_nodes_db()
-            node_entry = db.get("nodes", {}).get(node_id)
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(node_id)
             if not node_entry:
                 self.send_json(404, {"error": f"Node '{node_id}' is not registered. Please register first."})
                 return
 
-            # Reject if node was removed
             if node_entry.get("status") == STATE_REMOVED or not node_entry.get("auth_token"):
-                self.send_json(403, {"error": f"Node '{node_id}' was removed from the cluster. Re-registration required."})
+                self.send_json(403, {"error": f"Node '{node_id}' was removed from cluster. Re-registration required."})
                 return
 
             expected_auth_token = node_entry.get("auth_token")
@@ -408,8 +527,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "system": body.get("system", {})
             }
 
-            save_nodes_db(db)
-            print(f"[CONTROLLER] Heartbeat received from {node_id} at {now}")
+            save_nodes_db(nodes_db)
 
             self.send_json(200, {
                 "status": "ok",
@@ -420,7 +538,181 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return
 
         # ----------------------------------------------------------------------
-        # 3. Node Removal: POST /nodes/<node_id>/remove
+        # 3. Submit Workload / Job: POST /jobs
+        # ----------------------------------------------------------------------
+        if path == "/jobs":
+            enrollment_token = get_or_create_enrollment_token()
+            if token != enrollment_token:
+                self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to submit jobs"})
+                return
+
+            target_node = body.get("target_node")
+            job_type = body.get("type")
+            job_name = body.get("name", job_type or "job")
+            timeout_sec = int(body.get("timeout", 60))
+            parameters = body.get("parameters", {}) or {}
+
+            # Validation 1: Target node must be specified
+            if not target_node:
+                self.send_json(400, {
+                    "error": "Missing required field 'target_node'",
+                    "status": JOB_STATE_REJECTED
+                })
+                return
+
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(target_node)
+
+            # Validation 2: Unknown node rejection
+            if not node_entry:
+                self.send_json(400, {
+                    "error": f"Target node '{target_node}' does not exist in cluster.",
+                    "status": JOB_STATE_REJECTED
+                })
+                return
+
+            # Validation 3: Removed node rejection
+            if node_entry.get("status") == STATE_REMOVED:
+                self.send_json(400, {
+                    "error": f"Target node '{target_node}' was removed from the cluster.",
+                    "status": JOB_STATE_REJECTED
+                })
+                return
+
+            # Validation 4: Offline node rejection
+            live_status = compute_node_liveness(node_entry, self.heartbeat_timeout)
+            if live_status == STATE_OFFLINE:
+                self.send_json(400, {
+                    "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
+                    "status": JOB_STATE_REJECTED
+                })
+                return
+
+            # Validation 5: Safe allowlisted workload type rejection
+            if job_type not in ALLOWLISTED_WORKLOADS:
+                self.send_json(400, {
+                    "error": f"Job type '{job_type}' is not in the safe allowlist. Allowed: {list(ALLOWLISTED_WORKLOADS.keys())}",
+                    "status": JOB_STATE_REJECTED
+                })
+                return
+
+            # Enforce reasonable timeout constraints
+            timeout_sec = max(5, min(timeout_sec, 300))
+
+            job_id = f"job-{secrets.token_hex(6)}"
+            now = get_current_iso_timestamp()
+
+            job_record = {
+                "job_id": job_id,
+                "name": job_name,
+                "type": job_type,
+                "parameters": parameters,
+                "target_node": target_node,
+                "timeout": timeout_sec,
+                "created_at": now,
+                "started_at": None,
+                "finished_at": None,
+                "status": JOB_STATE_QUEUED,
+                "result": None
+            }
+
+            jobs_db = load_jobs_db()
+            jobs_db.setdefault("jobs", {})[job_id] = job_record
+            save_jobs_db(jobs_db)
+
+            print(f"[CONTROLLER] Queued job {job_id} ({job_type}) for target node {target_node}")
+            self.send_json(200, {
+                "status": JOB_STATE_QUEUED,
+                "job_id": job_id,
+                "job": job_record
+            })
+            return
+
+        # ----------------------------------------------------------------------
+        # 4. Job Result Submission: POST /jobs/<job_id>/result
+        # ----------------------------------------------------------------------
+        if path.startswith("/jobs/") and path.endswith("/result"):
+            job_id = path[6:-7].strip()
+            jobs_db = load_jobs_db()
+            job = jobs_db.get("jobs", {}).get(job_id)
+
+            if not job:
+                self.send_json(404, {"error": f"Job '{job_id}' not found"})
+                return
+
+            target_node = job.get("target_node")
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(target_node, {})
+
+            # Authenticate reporting node
+            expected_auth = node_entry.get("auth_token")
+            enrollment_token = get_or_create_enrollment_token()
+            if not token or (token != expected_auth and token != enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
+                return
+
+            job_status = body.get("status", JOB_STATE_FAILED)
+            now = get_current_iso_timestamp()
+
+            job["status"] = job_status
+            job["finished_at"] = now
+            job["result"] = {
+                "status": job_status,
+                "exit_code": body.get("exit_code", 0),
+                "stdout": body.get("stdout", ""),
+                "stderr": body.get("stderr", ""),
+                "duration_ms": body.get("duration_ms", 0),
+                "started_at": body.get("started_at"),
+                "finished_at": now
+            }
+
+            save_jobs_db(jobs_db)
+            print(f"[CONTROLLER] Job {job_id} on node {target_node} completed with status: {job_status}")
+
+            self.send_json(200, {
+                "status": "ok",
+                "ack": True,
+                "job_id": job_id,
+                "job_status": job_status
+            })
+            return
+
+        # ----------------------------------------------------------------------
+        # 5. Cancel Job: POST /jobs/<job_id>/cancel
+        # ----------------------------------------------------------------------
+        if path.startswith("/jobs/") and path.endswith("/cancel"):
+            job_id = path[6:-7].strip()
+            enrollment_token = get_or_create_enrollment_token()
+            if token != enrollment_token:
+                self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to cancel jobs"})
+                return
+
+            jobs_db = load_jobs_db()
+            job = jobs_db.get("jobs", {}).get(job_id)
+            if not job:
+                self.send_json(404, {"error": f"Job '{job_id}' not found"})
+                return
+
+            if job.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED):
+                self.send_json(400, {
+                    "error": f"Cannot cancel job '{job_id}' in terminal state '{job.get('status')}'."
+                })
+                return
+
+            job["status"] = JOB_STATE_CANCELLED
+            job["finished_at"] = get_current_iso_timestamp()
+            save_jobs_db(jobs_db)
+
+            print(f"[CONTROLLER] Job {job_id} cancelled by admin.")
+            self.send_json(200, {
+                "status": "cancelled",
+                "job_id": job_id,
+                "job": job
+            })
+            return
+
+        # ----------------------------------------------------------------------
+        # 6. Node Removal: POST /nodes/<node_id>/remove
         # ----------------------------------------------------------------------
         if path.startswith("/nodes/") and path.endswith("/remove"):
             node_id = path[7:-7].strip()
@@ -429,17 +721,16 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to remove a node"})
                 return
 
-            db = load_nodes_db()
-            node_entry = db.get("nodes", {}).get(node_id)
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(node_id)
             if not node_entry:
                 self.send_json(404, {"error": f"Node '{node_id}' not found"})
                 return
 
-            # Invalidate auth token and mark REMOVED (preserving historical metadata)
             node_entry["status"] = STATE_REMOVED
             node_entry["auth_token"] = None
             node_entry["removed_at"] = get_current_iso_timestamp()
-            save_nodes_db(db)
+            save_nodes_db(nodes_db)
 
             print(f"[CONTROLLER] Removed node: {node_id}")
             self.send_json(200, {
@@ -463,8 +754,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required"})
                 return
 
-            db = load_nodes_db()
-            node_entry = db.get("nodes", {}).get(node_id)
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(node_id)
             if not node_entry:
                 self.send_json(404, {"error": f"Node '{node_id}' not found"})
                 return
@@ -472,7 +763,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             node_entry["status"] = STATE_REMOVED
             node_entry["auth_token"] = None
             node_entry["removed_at"] = get_current_iso_timestamp()
-            save_nodes_db(db)
+            save_nodes_db(nodes_db)
 
             print(f"[CONTROLLER] Removed node via DELETE: {node_id}")
             self.send_json(200, {
@@ -488,6 +779,10 @@ class ControllerHandler(BaseHTTPRequestHandler):
         print(f"[HTTP {self.command}] {self.path} - {args[0] if args else ''}")
 
 
+# ------------------------------------------------------------------------------
+# CLI Actions
+# ------------------------------------------------------------------------------
+
 def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT_TIMEOUT):
     ensure_directories()
     token = get_or_create_enrollment_token()
@@ -500,6 +795,7 @@ def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT
     print(f"Heartbeat timeout:     {timeout} seconds")
     print(f"Enrollment token file: {ENROLLMENT_TOKEN_FILE}")
     print(f"Cluster database:      {NODES_FILE}")
+    print(f"Jobs database:         {JOBS_FILE}")
     print("==========================================")
 
     server = HTTPServer((host, port), ControllerHandler)
@@ -510,9 +806,134 @@ def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT
         server.server_close()
 
 
+def submit_job(node_id, job_type, name=None, timeout=60, params_json=None):
+    token = get_or_create_enrollment_token()
+    nodes_db = load_nodes_db()
+    node = nodes_db.get("nodes", {}).get(node_id)
+
+    if not node:
+        print(f"Error: Node '{node_id}' not found in cluster.", file=sys.stderr)
+        return 1
+
+    if node.get("status") == STATE_REMOVED:
+        print(f"Error: Node '{node_id}' is removed from cluster.", file=sys.stderr)
+        return 1
+
+    live_status = compute_node_liveness(node)
+    if live_status == STATE_OFFLINE:
+        print(f"Error: Node '{node_id}' is OFFLINE. Cannot submit job.", file=sys.stderr)
+        return 1
+
+    if job_type not in ALLOWLISTED_WORKLOADS:
+        print(f"Error: Job type '{job_type}' is not allowlisted.", file=sys.stderr)
+        print(f"Allowed types: {list(ALLOWLISTED_WORKLOADS.keys())}")
+        return 1
+
+    params = {}
+    if params_json:
+        try:
+            params = json.loads(params_json)
+        except Exception as e:
+            print(f"Error parsing params JSON: {e}", file=sys.stderr)
+            return 1
+
+    job_id = f"job-{secrets.token_hex(6)}"
+    now = get_current_iso_timestamp()
+
+    job_record = {
+        "job_id": job_id,
+        "name": name or job_type,
+        "type": job_type,
+        "parameters": params,
+        "target_node": node_id,
+        "timeout": int(timeout),
+        "created_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "status": JOB_STATE_QUEUED,
+        "result": None
+    }
+
+    jobs_db = load_jobs_db()
+    jobs_db.setdefault("jobs", {})[job_id] = job_record
+    save_jobs_db(jobs_db)
+
+    print("==========================================")
+    print(" PersonalServer Job Submitted")
+    print("==========================================")
+    print(f"Job ID:      {job_id}")
+    print(f"Type:        {job_type}")
+    print(f"Target Node: {node_id} ({node.get('name')})")
+    print(f"Status:      {JOB_STATE_QUEUED}")
+    print(f"Timeout:     {timeout}s")
+    print("==========================================")
+    return 0
+
+
+def list_jobs(filter_node=None, filter_status=None):
+    jobs_db = load_jobs_db()
+    jobs = list(jobs_db.get("jobs", {}).values())
+
+    if filter_node:
+        jobs = [j for j in jobs if j.get("target_node") == filter_node]
+    if filter_status:
+        jobs = [j for j in jobs if j.get("status") == filter_status.upper()]
+
+    print("==========================================")
+    print(f" PersonalServer Jobs ({len(jobs)})")
+    print("==========================================")
+    if not jobs:
+        print("No jobs found.")
+    else:
+        for j in reversed(jobs):
+            res_summary = ""
+            if j.get("result"):
+                res_summary = f"| Exit: {j['result'].get('exit_code')} | Duration: {j['result'].get('duration_ms')}ms"
+            print(f"Job ID:      {j.get('job_id')}")
+            print(f"  Type:      {j.get('type')}")
+            print(f"  Target:    {j.get('target_node')}")
+            print(f"  Status:    {j.get('status')} {res_summary}")
+            print(f"  Created:   {j.get('created_at')}")
+            print()
+    print("==========================================")
+
+
+def show_job_details(job_id):
+    jobs_db = load_jobs_db()
+    job = jobs_db.get("jobs", {}).get(job_id)
+    if not job:
+        print(f"Error: Job '{job_id}' not found.", file=sys.stderr)
+        return 1
+
+    print("==========================================")
+    print(f" Job Details: {job_id}")
+    print("==========================================")
+    print(json.dumps(job, indent=2))
+    print("==========================================")
+    return 0
+
+
+def cancel_job(job_id):
+    jobs_db = load_jobs_db()
+    job = jobs_db.get("jobs", {}).get(job_id)
+    if not job:
+        print(f"Error: Job '{job_id}' not found.", file=sys.stderr)
+        return 1
+
+    if job.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED):
+        print(f"Error: Job '{job_id}' is already in finished state '{job.get('status')}'.", file=sys.stderr)
+        return 1
+
+    job["status"] = JOB_STATE_CANCELLED
+    job["finished_at"] = get_current_iso_timestamp()
+    save_jobs_db(jobs_db)
+    print(f"Job '{job_id}' has been marked as CANCELLED.")
+    return 0
+
+
 def list_nodes(filter_status=None):
-    db = load_nodes_db()
-    summary = get_cluster_summary(db)
+    nodes_db = load_nodes_db()
+    summary = get_cluster_summary(nodes_db)
     nodes = summary["nodes"]
 
     if filter_status and filter_status.lower() != "all":
@@ -549,8 +970,8 @@ def list_nodes(filter_status=None):
 
 
 def show_node_details(node_id):
-    db = load_nodes_db()
-    node = db.get("nodes", {}).get(node_id)
+    nodes_db = load_nodes_db()
+    node = nodes_db.get("nodes", {}).get(node_id)
     if not node:
         print(f"Error: Node '{node_id}' not found.", file=sys.stderr)
         return 1
@@ -565,8 +986,8 @@ def show_node_details(node_id):
 
 
 def show_cluster():
-    db = load_nodes_db()
-    summary = get_cluster_summary(db)
+    nodes_db = load_nodes_db()
+    summary = get_cluster_summary(nodes_db)
     print("==========================================")
     print(" PersonalServer Cluster Summary")
     print("==========================================")
@@ -582,8 +1003,8 @@ def show_cluster():
 
 
 def remove_node(node_id):
-    db = load_nodes_db()
-    node = db.get("nodes", {}).get(node_id)
+    nodes_db = load_nodes_db()
+    node = nodes_db.get("nodes", {}).get(node_id)
     if not node:
         print(f"Error: Node '{node_id}' not found.", file=sys.stderr)
         return 1
@@ -591,7 +1012,7 @@ def remove_node(node_id):
     node["status"] = STATE_REMOVED
     node["auth_token"] = None
     node["removed_at"] = get_current_iso_timestamp()
-    save_nodes_db(db)
+    save_nodes_db(nodes_db)
     print(f"Node '{node_id}' has been removed from active cluster membership.")
     return 0
 
@@ -599,7 +1020,7 @@ def remove_node(node_id):
 def main():
     parser = argparse.ArgumentParser(
         prog="controller",
-        description="PersonalServer Cluster Controller"
+        description="PersonalServer Cluster Controller & Workload Manager"
     )
     subparsers = parser.add_subparsers(dest="command", help="Controller commands")
 
@@ -624,6 +1045,27 @@ def main():
     p_remove = subparsers.add_parser("remove", help="Remove a node from active cluster")
     p_remove.add_argument("node_id", help="ID of node to remove")
 
+    # submit command
+    p_submit = subparsers.add_parser("submit", help="Submit a workload job to a target node")
+    p_submit.add_argument("--node", required=True, help="Target Node ID")
+    p_submit.add_argument("--type", required=True, choices=list(ALLOWLISTED_WORKLOADS.keys()), help="Allowlisted workload type")
+    p_submit.add_argument("--name", help="Optional friendly name for the job")
+    p_submit.add_argument("--timeout", type=int, default=60, help="Timeout in seconds (default 60)")
+    p_submit.add_argument("--params", help="JSON string of parameters")
+
+    # jobs command
+    p_jobs = subparsers.add_parser("jobs", help="List jobs")
+    p_jobs.add_argument("--node", help="Filter jobs by target node ID")
+    p_jobs.add_argument("--status", choices=[JOB_STATE_QUEUED, JOB_STATE_RUNNING, JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED, JOB_STATE_REJECTED], help="Filter jobs by status")
+
+    # job command
+    p_job = subparsers.add_parser("job", help="Inspect single job details")
+    p_job.add_argument("job_id", help="Job ID to inspect")
+
+    # cancel command
+    p_cancel = subparsers.add_parser("cancel", help="Cancel a queued or running job")
+    p_cancel.add_argument("job_id", help="Job ID to cancel")
+
     # token command
     subparsers.add_parser("token", help="Display enrollment token file path")
 
@@ -642,6 +1084,14 @@ def main():
         show_cluster()
     elif args.command == "remove":
         sys.exit(remove_node(args.node_id))
+    elif args.command == "submit":
+        sys.exit(submit_job(args.node, args.type, args.name, args.timeout, args.params))
+    elif args.command == "jobs":
+        list_jobs(getattr(args, "node", None), getattr(args, "status", None))
+    elif args.command == "job":
+        sys.exit(show_job_details(args.job_id))
+    elif args.command == "cancel":
+        sys.exit(cancel_job(args.job_id))
     elif args.command == "token":
         get_or_create_enrollment_token()
         print(f"Enrollment token stored at: {ENROLLMENT_TOKEN_FILE}")
