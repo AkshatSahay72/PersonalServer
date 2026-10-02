@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PersonalServer - Administration Panel</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-title">PersonalServer</div>
+        <div class="brand-subtitle">v1.0 Operations</div>
+      </div>
+      <nav class="nav-menu">
+        <a href="#dashboard" class="nav-item active" data-page="dashboard">
+          <span class="nav-icon">◈</span> Dashboard
+        </a>
+        <a href="#nodes" class="nav-item" data-page="nodes">
+          <span class="nav-icon">▤</span> Cluster Nodes
+        </a>
+        <a href="#jobs" class="nav-item" data-page="jobs">
+          <span class="nav-icon">⚙</span> Workload Jobs
+        </a>
+        <a href="#storage" class="nav-item" data-page="storage">
+          <span class="nav-icon">📁</span> Personal Storage
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="node-badge">
+          <span class="status-indicator online"></span>
+          <span id="local-node-name">vivo-y31</span>
+        </div>
+        <div class="auth-bar">
+          <button id="auth-btn" class="btn-sm">Auth Key</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="top-bar">
+        <h1 class="page-title" id="page-heading">Dashboard</h1>
+        <div class="top-actions">
+          <button id="refresh-btn" class="btn btn-secondary">Refresh</button>
+        </div>
+      </header>
+
+      <!-- Dashboard View -->
+      <section id="view-dashboard" class="page-view active">
+        <div class="metrics-grid">
+          <div class="card metric-card">
+            <div class="metric-label">Cluster Status</div>
+            <div class="metric-value text-success" id="dash-cluster-status">ONLINE</div>
+            <div class="metric-desc" id="dash-cluster-sub">PersonalServer Private Cluster</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-label">Online Nodes</div>
+            <div class="metric-value" id="dash-nodes-online">1 / 1</div>
+            <div class="metric-desc" id="dash-nodes-sub">All systems operational</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-label">Total Jobs Executed</div>
+            <div class="metric-value" id="dash-jobs-count">0</div>
+            <div class="metric-desc" id="dash-jobs-sub">0 running</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-label">Storage Usage</div>
+            <div class="metric-value" id="dash-storage-usage">0 MB</div>
+            <div class="metric-desc" id="dash-storage-sub">Root: ~/PersonalServer/storage</div>
+          </div>
+        </div>
+
+        <div class="grid-2col">
+          <div class="card">
+            <div class="card-header">
+              <h2>Recent Workloads</h2>
+              <a href="#jobs" class="link-sm">View all →</a>
+            </div>
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Job ID</th>
+                    <th>Type</th>
+                    <th>Node</th>
+                    <th>Status</th>
+                    <th>Duration</th>
+                  </tr>
+                </thead>
+                <tbody id="dash-jobs-table">
+                  <tr><td colspan="5" class="text-muted">Loading jobs...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>Node Subsystem Health</h2>
+              <a href="#nodes" class="link-sm">Details →</a>
+            </div>
+            <div class="system-summary" id="dash-system-health">
+              <div class="info-row"><span>CPU Cores</span><strong id="dash-cpu-cores">-</strong></div>
+              <div class="info-row"><span>Memory Usage</span><strong id="dash-mem-usage">-</strong></div>
+              <div class="info-row"><span>Storage Free</span><strong id="dash-disk-free">-</strong></div>
+              <div class="info-row"><span>Uptime</span><strong id="dash-uptime">-</strong></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Nodes View -->
+      <section id="view-nodes" class="page-view">
+        <div class="card">
+          <div class="card-header">
+            <h2>Registered Cluster Nodes</h2>
+          </div>
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Node ID</th>
+                  <th>Name</th>
+                  <th>Role</th>
+                  <th>Platform</th>
+                  <th>CPU / RAM</th>
+                  <th>Capabilities</th>
+                  <th>Status</th>
+                  <th>Last Seen</th>
+                </tr>
+              </thead>
+              <tbody id="nodes-table-body">
+                <tr><td colspan="8" class="text-muted">Loading nodes...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Jobs View -->
+      <section id="view-jobs" class="page-view">
+        <div class="card submit-job-card">
+          <div class="card-header">
+            <h2>Submit New Workload Job</h2>
+          </div>
+          <form id="job-submit-form" class="form-grid">
+            <div class="form-group">
+              <label for="job-type">Workload Type</label>
+              <select id="job-type" class="form-control" required>
+                <option value="system-info">system-info (Diagnostics)</option>
+                <option value="health-check">health-check (Subsystems)</option>
+                <option value="node-status">node-status (Services)</option>
+                <option value="echo">echo (Test message)</option>
+                <option value="python-script">python-script (Safe Python)</option>
+                <option value="failing-test">failing-test (Failure test)</option>
+                <option value="timeout-test">timeout-test (Timeout test)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="job-target">Target Node</label>
+              <select id="job-target" class="form-control">
+                <option value="auto">auto (Resource-Aware Scheduler)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="job-timeout">Timeout (seconds)</label>
+              <input type="number" id="job-timeout" class="form-control" value="60" min="5" max="300">
+            </div>
+            <div class="form-group full-width">
+              <label for="job-params">Parameters (JSON)</label>
+              <input type="text" id="job-params" class="form-control" placeholder='{"message": "Test ping"}' value=''>
+            </div>
+            <div class="form-group full-width">
+              <button type="submit" class="btn btn-primary">Dispatch Job</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2>Workload Execution Log</h2>
+          </div>
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Job ID</th>
+                  <th>Type</th>
+                  <th>Target Node</th>
+                  <th>Status</th>
+                  <th>Attempt</th>
+                  <th>Exit</th>
+                  <th>Duration</th>
+                  <th>Created</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-table-body">
+                <tr><td colspan="9" class="text-muted">Loading jobs...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Storage View -->
+      <section id="view-storage" class="page-view">
+        <div class="card">
+          <div class="storage-toolbar">
+            <div class="breadcrumbs" id="storage-breadcrumbs">
+              <span class="crumb active" data-path="">/ (storage root)</span>
+            </div>
+            <div class="storage-actions">
+              <input type="file" id="file-upload-input" style="display:none">
+              <button id="upload-file-btn" class="btn btn-primary">Upload File</button>
+              <button id="create-folder-btn" class="btn btn-secondary">New Folder</button>
+            </div>
+          </div>
+
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Size</th>
+                  <th>Modified</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="storage-table-body">
+                <tr><td colspan="5" class="text-muted">Loading storage...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="storage-footer">
+            <span id="storage-summary-text">Storage Root: ~/PersonalServer/storage</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Job Details Modal -->
+  <div id="modal-job-detail" class="modal-backdrop" style="display:none">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-job-title">Job Details</h3>
+        <button class="modal-close" onclick="closeModal('modal-job-detail')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <pre id="modal-job-json" class="code-block"></pre>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
