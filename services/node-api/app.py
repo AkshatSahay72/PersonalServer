@@ -481,13 +481,28 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         # 7. Session Info: GET /api/session
         if path == "/api/session":
             cf_email = self.headers.get("Cf-Access-Authenticated-User-Email") or self.headers.get("cf-access-authenticated-user-email")
+            is_proxied_public = bool(self.headers.get("Cf-Ray") or self.headers.get("Cf-Connecting-Ip"))
             client_ip = self.client_address[0]
-            is_local = client_ip in ("127.0.0.1", "::1", "localhost")
-            self.send_json(200, {
-                "authenticated": bool(cf_email or is_local),
-                "user": cf_email if cf_email else ("admin" if is_local else "anonymous"),
-                "auth_method": "cloudflare-access" if cf_email else ("tailscale-local" if is_local else "none")
-            })
+            is_direct_private = not is_proxied_public and (client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("100."))
+
+            if cf_email:
+                self.send_json(200, {
+                    "authenticated": True,
+                    "user": cf_email,
+                    "auth_method": "cloudflare-access"
+                })
+            elif is_direct_private:
+                self.send_json(200, {
+                    "authenticated": True,
+                    "user": "Local Admin",
+                    "auth_method": "tailscale-private"
+                })
+            else:
+                self.send_json(200, {
+                    "authenticated": False,
+                    "user": "Unauthenticated",
+                    "auth_method": "none"
+                })
             return
 
         # 8. Services Status: GET /api/services
