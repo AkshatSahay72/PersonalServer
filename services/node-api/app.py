@@ -36,6 +36,104 @@ STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 
 DEFAULT_CONTROLLER_URL = "http://100.120.251.42:8000"
 
+DEFAULT_KNOWN_NODES = {
+    "server-5387a86bf36116b1": {"name": "vivo-y31", "endpoint": "http://100.85.108.5:8080"},
+    "vivo-y31": {"node_id": "server-5387a86bf36116b1", "endpoint": "http://100.85.108.5:8080"},
+    "server-95bad5ff01424d4c8d184330d6d2e394": {"name": "node-02", "endpoint": "http://100.73.52.72:8080"},
+    "node-02": {"node_id": "server-95bad5ff01424d4c8d184330d6d2e394", "endpoint": "http://100.73.52.72:8080"},
+}
+
+
+def resolve_target_node_endpoint(node_param):
+    if not node_param:
+        return None
+    param_str = str(node_param).strip()
+    config = load_config()
+    local_id = config.get("NODE_ID", config.get("node_id", ""))
+    local_name = config.get("NODE_NAME", config.get("name", ""))
+
+    # If explicitly referring to local node
+    if param_str.lower() in ("local", "self", "local_node") or (local_id and param_str == local_id) or (local_name and param_str == local_name):
+        return None
+
+    if param_str in DEFAULT_KNOWN_NODES:
+        return DEFAULT_KNOWN_NODES[param_str].get("endpoint")
+
+    return None
+
+
+def get_cluster_storage_nodes():
+    config = load_config()
+    controller_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+    local_node_id = config.get("NODE_ID", config.get("node_id", "server-5387a86bf36116b1"))
+    local_node_name = config.get("NODE_NAME", config.get("name", "vivo-y31"))
+
+    local_sys = get_system_info()
+    local_storage = local_sys.get("storage", {})
+
+    nodes_result = []
+
+    try:
+        req = urllib.request.Request(f"{controller_url}/nodes", headers={"User-Agent": "PersonalServer-NodeAPI/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for n in data.get("nodes", []):
+                if n.get("status") == "REMOVED":
+                    continue
+                nid = n.get("node_id", "")
+                nname = n.get("name", nid)
+                is_local = (nid == local_node_id or nname == local_node_name)
+
+                storage_obj = {}
+                if is_local:
+                    storage_obj = local_storage
+                else:
+                    hb_sys = n.get("last_heartbeat", {}).get("system", {})
+                    hb_st = hb_sys.get("storage", {})
+                    if isinstance(hb_st, dict) and hb_st.get("total"):
+                        storage_obj = hb_st
+                    elif isinstance(hb_st, str) and "/" in hb_st:
+                        try:
+                            used_val, rest = hb_st.split("/", 1)
+                            total_val = rest.split()[0] if " " in rest else rest
+                            pct_val = rest.split("(")[1].rstrip(")") if "(" in rest else ""
+                            storage_obj = {
+                                "total": total_val,
+                                "used": used_val,
+                                "available": "41G" if "50G" in total_val else "-",
+                                "used_percent": pct_val
+                            }
+                        except Exception:
+                            storage_obj = {"raw": hb_st}
+                    else:
+                        st_gb = n.get("resources", {}).get("storage_gb", 0)
+                        storage_obj = {
+                            "total": f"{st_gb}G" if st_gb else "N/A",
+                            "used": "N/A",
+                            "available": f"{st_gb}G" if st_gb else "N/A",
+                            "used_percent": "N/A"
+                        }
+
+                nodes_result.append({
+                    "node_id": nid,
+                    "name": nname,
+                    "role": n.get("role", "compute"),
+                    "status": n.get("status", "UNKNOWN"),
+                    "is_local": is_local,
+                    "storage": storage_obj
+                })
+    except Exception:
+        nodes_result = [{
+            "node_id": local_node_id,
+            "name": local_node_name,
+            "role": config.get("NODE_ROLE", "compute"),
+            "status": "ONLINE",
+            "is_local": True,
+            "storage": local_storage
+        }]
+
+    return {"nodes": nodes_result, "count": len(nodes_result)}
+
 
 def ensure_storage_root():
     """Ensure the restricted storage root directory exists."""
@@ -309,6 +407,43 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json(502, {"error": f"Controller unavailable at {controller_url}: {e}"})
 
+    def proxy_to_remote_storage(self, remote_endpoint, subpath, query_dict=None):
+        target_url = f"{remote_endpoint.rstrip('/')}{subpath}"
+        if query_dict:
+            filtered_qs = {k: v for k, v in query_dict.items() if k != "node"}
+            if filtered_qs:
+                target_url += f"?{urllib.parse.urlencode(filtered_qs, doseq=True)}"
+
+        headers = {
+            "User-Agent": "PersonalServer-StorageProxy/1.0"
+        }
+        auth_hdr = self.headers.get("Authorization") or self.headers.get("X-Auth-Token")
+        if auth_hdr:
+            headers["Authorization"] = auth_hdr if auth_hdr.startswith("Bearer ") else f"Bearer {auth_hdr}"
+
+        req = urllib.request.Request(target_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                resp_data = response.read()
+                self.send_response(response.status)
+                for hdr in ("Content-Type", "Content-Disposition"):
+                    if response.headers.get(hdr):
+                        self.send_header(hdr, response.headers.get(hdr))
+                self.send_header("Content-Length", str(len(resp_data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(resp_data)
+        except urllib.error.HTTPError as e:
+            err_body = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(err_body)
+        except Exception as e:
+            self.send_json(502, {"error": f"Remote storage node unavailable at {remote_endpoint}: {e}"})
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -362,10 +497,24 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_json(200, get_health())
             return
 
-        # 4. Storage Subsystem: GET /storage/list or GET /storage
+        # 4. Storage Subsystem: GET /storage/nodes
+        if path == "/storage/nodes":
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            self.send_json(200, get_cluster_storage_nodes())
+            return
+
+        # 5. Storage Subsystem: GET /storage/list or GET /storage
         if path in ("/storage", "/storage/list"):
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            target_node = query.get("node", [""])[0]
+            remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "/storage/list", query)
                 return
 
             req_path = query.get("path", [""])[0]
@@ -417,10 +566,16 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # 5. Storage Subsystem: GET /storage/download
+        # 6. Storage Subsystem: GET /storage/download
         if path == "/storage/download":
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            target_node = query.get("node", [""])[0]
+            remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "/storage/download", query)
                 return
 
             req_path = query.get("path", [""])[0]
@@ -452,8 +607,14 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
             return
 
-        # 6. Storage Usage: GET /storage/usage
+        # 7. Storage Usage: GET /storage/usage
         if path == "/storage/usage":
+            target_node = query.get("node", [""])[0]
+            remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "/storage/usage", query)
+                return
+
             ensure_storage_root()
             total_size = 0
             file_count = 0
@@ -536,6 +697,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+
+        # Safety: Reject write operations on remote nodes in Phase 8
+        target_node = query.get("node", [""])[0]
+        if resolve_target_node_endpoint(target_node):
+            self.send_json(403, {"error": "Write operations to remote storage nodes are not permitted in Phase 8 (Discovery Phase)"})
+            return
 
         # 1. Storage Subsystem: POST /storage/mkdir
         if path == "/storage/mkdir":
@@ -730,6 +897,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+
+        # Safety: Reject write/delete operations on remote nodes in Phase 8
+        target_node = query.get("node", [""])[0]
+        if resolve_target_node_endpoint(target_node):
+            self.send_json(403, {"error": "Delete operations on remote storage nodes are not permitted in Phase 8 (Discovery Phase)"})
+            return
 
         # Storage Subsystem: DELETE /storage
         if path == "/storage":

@@ -1,6 +1,8 @@
 // PersonalServer v1.1 - Client Application Logic
 
 let currentPath = "";
+let selectedStorageNode = null;
+let cachedStorageNodes = [];
 let cachedNodes = [];
 let cachedJobs = [];
 
@@ -48,7 +50,9 @@ function navigate() {
   if (hash === "dashboard") loadDashboard();
   else if (hash === "nodes") loadNodes();
   else if (hash === "jobs") loadJobs();
-  else if (hash === "storage") loadStorage(currentPath);
+  else if (hash === "storage") {
+    loadStorageNodes().then(() => loadStorage(currentPath, selectedStorageNode));
+  }
 }
 
 window.addEventListener("hashchange", navigate);
@@ -501,20 +505,118 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
   }
 });
 
-// 4. Storage View
-async function loadStorage(path = "") {
+// 4. Storage View & Multi-Node Discovery
+async function loadStorageNodes() {
+  try {
+    const data = await apiFetch("/storage/nodes").catch(() => null);
+    if (data && data.nodes && data.nodes.length > 0) {
+      cachedStorageNodes = data.nodes;
+    } else {
+      cachedStorageNodes = [{
+        node_id: "server-5387a86bf36116b1",
+        name: "vivo-y31",
+        status: "ONLINE",
+        is_local: true
+      }];
+    }
+  } catch {
+    cachedStorageNodes = [{
+      node_id: "server-5387a86bf36116b1",
+      name: "vivo-y31",
+      status: "ONLINE",
+      is_local: true
+    }];
+  }
+
+  const found = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
+  if (!found) {
+    const localNode = cachedStorageNodes.find(n => n.is_local) || cachedStorageNodes[0];
+    selectedStorageNode = localNode ? (localNode.name || localNode.node_id) : "vivo-y31";
+  }
+
+  renderStorageNodePills();
+}
+
+function renderStorageNodePills() {
+  const container = document.getElementById("storage-node-pills");
+  if (!container) return;
+
+  container.innerHTML = cachedStorageNodes.map(n => {
+    const isOnline = (n.status || "").toUpperCase() === "ONLINE";
+    const isSelected = n.name === selectedStorageNode || n.node_id === selectedStorageNode;
+    const freeStr = n.storage?.available ? `${n.storage.available} free` : "";
+
+    return `
+      <div class="storage-node-pill ${isSelected ? 'active' : ''}" onclick="switchStorageNode('${n.name || n.node_id}')">
+        <span class="status-dot ${isOnline ? 'dot-online' : 'dot-offline'}">●</span>
+        <span>${n.name || n.node_id}${n.is_local ? ' (Local)' : ''}</span>
+        ${freeStr ? `<span class="node-pill-storage">${freeStr}</span>` : ''}
+      </div>
+    `;
+  }).join("");
+}
+
+window.switchStorageNode = function(nodeNameOrId) {
+  selectedStorageNode = nodeNameOrId;
+  currentPath = "";
+  renderStorageNodePills();
+  loadStorage("", selectedStorageNode);
+};
+
+async function loadStorage(path = "", node = selectedStorageNode) {
   updateLastRefreshed();
   currentPath = path;
-  renderBreadcrumbs(path);
+
+  let nodeObj = cachedStorageNodes.find(n => n.name === node || n.node_id === node);
+  if (!nodeObj && cachedStorageNodes.length > 0) {
+    nodeObj = cachedStorageNodes.find(n => n.is_local) || cachedStorageNodes[0];
+    selectedStorageNode = nodeObj ? (nodeObj.name || nodeObj.node_id) : "vivo-y31";
+    node = selectedStorageNode;
+  }
+  const isLocal = !nodeObj || nodeObj.is_local;
+  const nodeDisplayName = nodeObj ? (nodeObj.name || nodeObj.node_id) : (node || "Local Node");
+
+  renderStorageNodePills();
+  renderBreadcrumbs(path, nodeDisplayName);
+
+  const rootPathEl = document.getElementById("storage-root-path");
+  if (rootPathEl) {
+    rootPathEl.textContent = isLocal ? "~/PersonalServer/storage (Local)" : `~/PersonalServer/storage on ${nodeDisplayName}`;
+  }
+
+  const actionsContainer = document.getElementById("storage-actions-container");
+  if (actionsContainer) {
+    if (isLocal) {
+      actionsContainer.innerHTML = `
+        <input type="file" id="file-upload-input" style="display:none">
+        <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
+        <button id="create-folder-btn" class="btn btn-sm">New folder</button>
+      `;
+      document.getElementById("upload-file-btn")?.addEventListener("click", () => {
+        document.getElementById("file-upload-input")?.click();
+      });
+      document.getElementById("file-upload-input")?.addEventListener("change", handleFileUpload);
+      document.getElementById("create-folder-btn")?.addEventListener("click", handleCreateFolder);
+    } else {
+      actionsContainer.innerHTML = `
+        <span class="storage-badge-ro">🔒 Read-Only Discovery Mode</span>
+      `;
+    }
+  }
+
   const tbody = document.getElementById("storage-tbody");
-  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Loading storage items...</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Loading ${nodeDisplayName} storage items...</td></tr>`;
 
   try {
-    const data = await apiFetch(`/storage/list?path=${encodeURIComponent(path)}`);
+    const listUrl = isLocal 
+      ? `/storage/list?path=${encodeURIComponent(path)}` 
+      : `/storage/list?node=${encodeURIComponent(node)}&path=${encodeURIComponent(path)}`;
+
+    const data = await apiFetch(listUrl);
     const items = data.items || [];
 
     if (items.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Folder is empty.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Folder is empty on ${nodeDisplayName}.</td></tr>`;
     } else {
       tbody.innerHTML = items.map(item => {
         const itemRelPath = path ? `${path}/${item.name}` : item.name;
@@ -524,11 +626,15 @@ async function loadStorage(path = "") {
         const modStr = item.modified ? new Date(item.modified * 1000).toLocaleDateString() : "-";
         const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
 
+        const downloadUrl = isLocal
+          ? `/storage/download?path=${encodeURIComponent(itemRelPath)}`
+          : `/storage/download?node=${encodeURIComponent(node)}&path=${encodeURIComponent(itemRelPath)}`;
+
         return `
           <tr>
             <td>
               ${isDir 
-                ? `<a href="javascript:void(0)" onclick="loadStorage('${itemRelPath}')" style="font-weight: 500;">${icon} ${item.name}</a>`
+                ? `<a href="javascript:void(0)" onclick="loadStorage('${itemRelPath}', '${node}')" style="font-weight: 500;">${icon} ${item.name}</a>`
                 : `<span class="mono">${icon} ${item.name}</span>`
               }
             </td>
@@ -537,9 +643,9 @@ async function loadStorage(path = "") {
             <td class="mono cell-muted">${modStr}</td>
             <td style="text-align: right;">
               <div style="display: inline-flex; gap: 6px;">
-                ${!isDir ? `<a href="/storage/download?path=${encodeURIComponent(itemRelPath)}" class="btn btn-sm btn-primary" download>Download</a>` : ''}
-                <button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>
+                ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm btn-primary" download>Download</a>` : ''}
+                ${isLocal ? `<button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>` : ''}
+                ${isLocal ? `<button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>` : ''}
               </div>
             </td>
           </tr>
@@ -547,51 +653,48 @@ async function loadStorage(path = "") {
       }).join("");
     }
 
-    // Load usage stats
-    const usage = await apiFetch("/storage/usage").catch(() => null);
+    // Load usage stats for the active node
+    const usageUrl = isLocal ? `/storage/usage` : `/storage/usage?node=${encodeURIComponent(node)}`;
+    const usage = await apiFetch(usageUrl).catch(() => null);
     if (usage) {
-      const freeStr = usage.disk?.available ? `${usage.disk.available} free` : "Available";
-      const usedPct = usage.disk?.used_percent ? `${usage.disk.used_percent} used` : "-";
+      const freeStr = usage.disk?.available ? `${usage.disk.available} free` : (nodeObj?.storage?.available || "Available");
+      const usedPct = usage.disk?.used_percent ? `${usage.disk.used_percent} used` : (nodeObj?.storage?.used_percent || "-");
       document.getElementById("storage-footer-stats").textContent = 
-        `${freeStr} · ${usedPct} · ${usage.files_count || 0} files · ${usage.folders_count || 0} folders`;
+        `[${nodeDisplayName}] ${freeStr} · ${usedPct} · ${usage.files_count || 0} files · ${usage.folders_count || 0} folders`;
     }
 
   } catch (err) {
     tbody.innerHTML = `
       <tr>
         <td colspan="5" class="pill-failed">
-          Unable to load storage: ${err.message}
-          <button class="btn btn-sm" style="margin-left: 10px;" onclick="loadStorage('${path}')">Retry</button>
+          Unable to load storage on ${nodeDisplayName}: ${err.message}
+          <button class="btn btn-sm" style="margin-left: 10px;" onclick="loadStorage('${path}', '${node}')">Retry</button>
         </td>
       </tr>
     `;
   }
 }
 
-function renderBreadcrumbs(path) {
+function renderBreadcrumbs(path, nodeName = "vivo-y31") {
   const container = document.getElementById("storage-breadcrumbs");
   if (!container) return;
 
   const parts = path ? path.split("/").filter(Boolean) : [];
-  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('')">[ / ] Home / storage</span>`;
+  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('', '${selectedStorageNode}')">[ ${nodeName} ] Home / storage</span>`;
 
   let accumulated = "";
   parts.forEach((p, index) => {
     accumulated += (accumulated ? "/" : "") + p;
     const isLast = index === parts.length - 1;
     const clickPath = accumulated;
-    html += ` <span class="cell-muted">/</span> <span class="crumb ${isLast ? 'current' : ''}" ${!isLast ? `onclick="loadStorage('${clickPath}')"` : ''}>${p}</span>`;
+    html += ` <span class="cell-muted">/</span> <span class="crumb ${isLast ? 'current' : ''}" ${!isLast ? `onclick="loadStorage('${clickPath}', '${selectedStorageNode}')"` : ''}>${p}</span>`;
   });
 
   container.innerHTML = html;
 }
 
-// Upload file
-document.getElementById("upload-file-btn")?.addEventListener("click", () => {
-  document.getElementById("file-upload-input")?.click();
-});
-
-document.getElementById("file-upload-input")?.addEventListener("change", async (e) => {
+// Upload file handler
+async function handleFileUpload(e) {
   const files = e.target.files;
   if (!files || files.length === 0) return;
   const file = files[0];
@@ -609,14 +712,14 @@ document.getElementById("file-upload-input")?.addEventListener("change", async (
       throw new Error(err.error || res.statusText);
     }
     e.target.value = "";
-    loadStorage(currentPath);
+    loadStorage(currentPath, selectedStorageNode);
   } catch (err) {
     alert("Upload failed: " + err.message);
   }
-});
+}
 
-// Create folder
-document.getElementById("create-folder-btn")?.addEventListener("click", async () => {
+// Create folder handler
+async function handleCreateFolder() {
   const name = prompt("Folder name:");
   if (!name || !name.trim()) return;
 
@@ -626,11 +729,11 @@ document.getElementById("create-folder-btn")?.addEventListener("click", async ()
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name.trim() })
     });
-    loadStorage(currentPath);
+    loadStorage(currentPath, selectedStorageNode);
   } catch (err) {
     alert("Failed to create folder: " + err.message);
   }
-});
+}
 
 // Rename item
 window.renameItem = async function(itemRelPath) {
@@ -647,7 +750,7 @@ window.renameItem = async function(itemRelPath) {
         new_name: newName.trim()
       })
     });
-    loadStorage(currentPath);
+    loadStorage(currentPath, selectedStorageNode);
   } catch (err) {
     alert("Rename failed: " + err.message);
   }
@@ -662,7 +765,7 @@ window.deleteItem = async function(itemRelPath, isDir) {
     await apiFetch(`/storage?path=${encodeURIComponent(itemRelPath)}`, {
       method: "DELETE"
     });
-    loadStorage(currentPath);
+    loadStorage(currentPath, selectedStorageNode);
   } catch (err) {
     alert("Delete failed: " + err.message);
   }

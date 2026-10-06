@@ -345,10 +345,19 @@
               <h2 class="storage-title">Storage</h2>
               <div class="storage-root-path mono" id="storage-root-path">~/PersonalServer/storage</div>
             </div>
-            <div class="storage-actions">
+            <div class="storage-actions" id="storage-actions-container">
               <input type="file" id="file-upload-input" style="display:none">
               <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
               <button id="create-folder-btn" class="btn btn-sm">New folder</button>
+            </div>
+          </div>
+
+          <!-- Storage Node Switcher Bar -->
+          <div class="storage-node-bar" id="storage-node-bar">
+            <span class="storage-node-label mono cell-muted">STORAGE NODE:</span>
+            <div class="storage-node-pills" id="storage-node-pills">
+              <span class="storage-node-pill active"><span class="status-dot dot-online">●</span> vivo-y31 (Local)</span>
+              <span class="storage-node-pill"><span class="status-dot dot-online">●</span> node-02</span>
             </div>
           </div>
 

@@ -582,6 +582,70 @@ a:hover {
   display: flex;
   gap: 8px;
 }
+/* Storage Node Switcher */
+.storage-node-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 18px;
+  background-color: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-wrap: wrap;
+}
+.storage-node-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.storage-node-pills {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.storage-node-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  background-color: #21262d;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.storage-node-pill:hover {
+  background-color: #30363d;
+  color: var(--text-main);
+  border-color: var(--border-light);
+}
+.storage-node-pill.active {
+  background-color: rgba(31, 111, 235, 0.15);
+  border-color: #388bfd;
+  color: #58a6ff;
+  font-weight: 600;
+}
+.storage-node-pill .node-pill-storage {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-left: 4px;
+}
+.storage-badge-ro {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  background-color: rgba(210, 153, 34, 0.15);
+  color: #d29922;
+  border: 1px solid rgba(210, 153, 34, 0.4);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+}
 .storage-breadcrumbs {
   padding: 10px 18px;
   border-bottom: 1px solid var(--border-subtle);
