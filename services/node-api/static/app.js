@@ -914,7 +914,7 @@ async function uploadFiles(fileList) {
         throw new Error(err.error || res.statusText);
       }
     } catch (err) {
-      alert(`Upload failed for "${file.name}": ${err.message}`);
+      showCustomAlert({ title: "Upload Failed", message: `Upload failed for "${file.name}": ${err.message}`, isError: true });
       break;
     }
   }
@@ -922,10 +922,20 @@ async function uploadFiles(fileList) {
   loadStorage(currentPath, selectedStorageNode, false);
 }
 
-// Create folder handler
+// Create folder handler (using custom modal)
 async function handleCreateFolder() {
-  const name = prompt("New folder name:");
-  if (!name || !name.trim()) return;
+  const name = await showCustomPrompt({
+    title: "New folder",
+    label: "Folder name",
+    placeholder: "e.g. documents",
+    confirmText: "Create",
+    validate: (val) => {
+      if (!val) return "Folder name cannot be empty.";
+      if (/[\\/:\*\?"<>\|\x00]/.test(val) || val.includes("..")) return "Invalid directory name characters.";
+      return "";
+    }
+  });
+  if (!name) return;
 
   let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
   const isLocal = !nodeObj || nodeObj.is_local;
@@ -937,19 +947,30 @@ async function handleCreateFolder() {
     await apiFetch(mkdirUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name.trim(), path: currentPath })
+      body: JSON.stringify({ name, path: currentPath })
     });
     loadStorage(currentPath, selectedStorageNode, false);
   } catch (err) {
-    alert("Failed to create folder: " + err.message);
+    showCustomAlert({ title: "Folder Creation Failed", message: err.message, isError: true });
   }
 }
 
-// Rename item
+// Rename item (using custom modal)
 window.renameItem = async function(itemRelPath) {
   const oldName = itemRelPath.split("/").pop();
-  const newName = prompt("Rename to:", oldName);
-  if (!newName || newName.trim() === oldName) return;
+  const newName = await showCustomPrompt({
+    title: "Rename item",
+    label: "New name",
+    initialValue: oldName,
+    confirmText: "Rename",
+    validate: (val) => {
+      if (!val) return "Name cannot be empty.";
+      if (val === oldName) return "New name must be different.";
+      if (/[\\/:\*\?"<>\|\x00]/.test(val) || val.includes("..")) return "Invalid filename characters.";
+      return "";
+    }
+  });
+  if (!newName) return;
 
   let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
   const isLocal = !nodeObj || nodeObj.is_local;
@@ -963,19 +984,25 @@ window.renameItem = async function(itemRelPath) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         path: itemRelPath,
-        new_name: newName.trim()
+        new_name: newName
       })
     });
     loadStorage(currentPath, selectedStorageNode, false);
   } catch (err) {
-    alert("Rename failed: " + err.message);
+    showCustomAlert({ title: "Rename Failed", message: err.message, isError: true });
   }
 };
 
-// Delete item
+// Delete item (using custom modal)
 window.deleteItem = async function(itemRelPath, isDir) {
   const itemName = itemRelPath.split("/").pop();
-  if (!confirm(`Are you sure you want to delete ${isDir ? 'folder' : 'file'} "${itemName}"?`)) return;
+  const confirmed = await showCustomConfirm({
+    title: `Delete ${isDir ? 'Folder' : 'File'}`,
+    message: `Delete "${itemName}"?\n\nThis action cannot be undone.`,
+    confirmText: "Delete",
+    isDanger: true
+  });
+  if (!confirmed) return;
 
   let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
   const isLocal = !nodeObj || nodeObj.is_local;
@@ -989,7 +1016,7 @@ window.deleteItem = async function(itemRelPath, isDir) {
     });
     loadStorage(currentPath, selectedStorageNode, false);
   } catch (err) {
-    alert("Delete failed: " + err.message);
+    showCustomAlert({ title: "Delete Failed", message: err.message, isError: true });
   }
 };
 
@@ -1038,6 +1065,9 @@ window.closeStorageProperties = function() {
 
 let cachedApps = [];
 let currentLogAppId = null;
+let currentAppFilesId = null;
+let currentAppFilesPath = "";
+let currentAppFilesItems = [];
 
 async function loadApps() {
   const tbody = document.getElementById("apps-tbody");
@@ -1097,6 +1127,7 @@ async function loadApps() {
               ${canDeploy ? `<button class="btn btn-sm btn-primary" onclick="deployApp('${app.app_id}')">Deploy</button>` : ''}
               ${canStop ? `<button class="btn btn-sm" onclick="stopApp('${app.app_id}')">Stop</button>` : ''}
               ${canRestart ? `<button class="btn btn-sm" onclick="restartApp('${app.app_id}')">Restart</button>` : ''}
+              <button class="btn btn-sm" onclick="viewAppFiles('${app.app_id}')" title="Inspect application project files">Files</button>
               <button class="btn btn-sm" onclick="viewAppLogs('${app.app_id}')">Logs</button>
               <button class="btn btn-sm btn-danger" onclick="deleteApp('${app.app_id}')">Delete</button>
             </div>
@@ -1150,7 +1181,7 @@ document.getElementById("app-create-form")?.addEventListener("submit", async (e)
     portInput.value = "8000";
     loadApps();
   } catch (err) {
-    alert("Failed to create application: " + err.message);
+    showCustomAlert({ title: "Create Application Failed", message: err.message, isError: true });
   }
 });
 
@@ -1158,11 +1189,11 @@ window.deployApp = async function(appId) {
   try {
     const res = await apiFetch(`/api/apps/${appId}/deploy`, { method: "POST" });
     if (res.app && res.app.status === "FAILED") {
-      alert(`Deployment rejected: ${res.app.failure_reason}`);
+      showCustomAlert({ title: "Deployment Rejected", message: res.app.failure_reason, isError: true });
     }
     loadApps();
   } catch (err) {
-    alert("Deploy error: " + err.message);
+    showCustomAlert({ title: "Deploy Error", message: err.message, isError: true });
     loadApps();
   }
 };
@@ -1172,7 +1203,7 @@ window.stopApp = async function(appId) {
     await apiFetch(`/api/apps/${appId}/stop`, { method: "POST" });
     loadApps();
   } catch (err) {
-    alert("Stop error: " + err.message);
+    showCustomAlert({ title: "Stop Error", message: err.message, isError: true });
     loadApps();
   }
 };
@@ -1182,7 +1213,7 @@ window.restartApp = async function(appId) {
     await apiFetch(`/api/apps/${appId}/restart`, { method: "POST" });
     loadApps();
   } catch (err) {
-    alert("Restart error: " + err.message);
+    showCustomAlert({ title: "Restart Error", message: err.message, isError: true });
     loadApps();
   }
 };
@@ -1190,14 +1221,21 @@ window.restartApp = async function(appId) {
 window.deleteApp = async function(appId) {
   const app = cachedApps.find(a => a.app_id === appId);
   const name = app ? app.name : appId;
-  if (!confirm(`Are you sure you want to permanently delete application "${name}"?`)) return;
+  const confirmed = await showCustomConfirm({
+    title: "Delete Application",
+    message: `Permanently delete application "${name}" (${appId})?\n\nThis will remove the container and release host port ${app?.port || ''}.`,
+    confirmText: "Delete",
+    isDanger: true
+  });
+  if (!confirmed) return;
 
   try {
     await apiFetch(`/api/apps/${appId}`, { method: "DELETE" });
     if (currentLogAppId === appId) closeAppLogs();
+    if (currentAppFilesId === appId) closeAppFiles();
     loadApps();
   } catch (err) {
-    alert("Delete error: " + err.message);
+    showCustomAlert({ title: "Delete Error", message: err.message, isError: true });
     loadApps();
   }
 };
@@ -1233,6 +1271,396 @@ window.closeAppLogs = function() {
   const panel = document.getElementById("app-logs-panel");
   if (panel) panel.style.display = "none";
 };
+
+// ==========================================
+// Application Files Explorer View
+// ==========================================
+
+window.viewAppFiles = async function(appId, path = "") {
+  currentAppFilesId = appId;
+  currentAppFilesPath = path;
+
+  const panel = document.getElementById("app-files-panel");
+  const tbody = document.getElementById("app-files-tbody");
+  const rootCrumb = document.getElementById("app-files-root-crumb");
+  const upBtn = document.getElementById("app-files-up-btn");
+
+  const app = cachedApps.find(a => a.app_id === appId);
+  const appName = app ? app.name : appId;
+
+  if (rootCrumb) {
+    rootCrumb.textContent = appName;
+    rootCrumb.onclick = () => viewAppFiles(appId, "");
+  }
+
+  if (upBtn) {
+    upBtn.disabled = !path;
+    upBtn.onclick = () => {
+      if (!currentAppFilesPath) return;
+      const parts = currentAppFilesPath.split("/").filter(Boolean);
+      parts.pop();
+      viewAppFiles(currentAppFilesId, parts.join("/"));
+    };
+  }
+
+  renderAppFilesBreadcrumbs(appName, path);
+
+  panel.style.display = "block";
+  panel.scrollIntoView({ behavior: "smooth" });
+  tbody.innerHTML = `<tr><td colspan="4" class="cell-muted" style="text-align: center; padding: 24px;">Loading project files...</td></tr>`;
+
+  try {
+    const res = await apiFetch(`/api/apps/${appId}/files?path=${encodeURIComponent(path)}`);
+    currentAppFilesItems = res.items || [];
+    renderAppFilesTable();
+
+    const leftStats = document.getElementById("app-files-stats-left");
+    const filesCount = currentAppFilesItems.filter(i => !i.is_dir).length;
+    const foldersCount = currentAppFilesItems.filter(i => i.is_dir).length;
+    if (leftStats) {
+      leftStats.textContent = `${filesCount} file${filesCount === 1 ? '' : 's'} · ${foldersCount} folder${foldersCount === 1 ? '' : 's'}`;
+    }
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-offline" style="text-align: center; padding: 20px;">Unable to load files: ${err.message}</td></tr>`;
+  }
+};
+
+function renderAppFilesBreadcrumbs(appName, path) {
+  const container = document.getElementById("app-files-breadcrumbs");
+  if (!container) return;
+
+  const parts = path ? path.split("/").filter(Boolean) : [];
+  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="viewAppFiles('${currentAppFilesId}', '')">${escapeHtml(appName)}</span>`;
+
+  let accumulated = "";
+  parts.forEach((p, index) => {
+    accumulated += (accumulated ? "/" : "") + p;
+    const isLast = index === parts.length - 1;
+    const clickPath = accumulated;
+    html += ` <span class="cell-muted">&gt;</span> <span class="crumb ${isLast ? 'current' : ''}" ${!isLast ? `onclick="viewAppFiles('${currentAppFilesId}', '${clickPath}')"` : ''}>${escapeHtml(p)}</span>`;
+  });
+
+  container.innerHTML = html;
+}
+
+function renderAppFilesTable() {
+  const tbody = document.getElementById("app-files-tbody");
+  if (!tbody) return;
+
+  if (currentAppFilesItems.length === 0) {
+    tbody.innerHTML = `
+      <tr>
+        <td colspan="4" class="cell-muted" style="text-align: center; padding: 28px;">
+          This application directory is empty.
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  tbody.innerHTML = currentAppFilesItems.map(item => {
+    const itemRelPath = currentAppFilesPath ? `${currentAppFilesPath}/${item.name}` : item.name;
+    const isDir = item.is_dir;
+    const typeCategory = getFileTypeCategory(item.name, isDir);
+    const icon = getFileIcon(item.name, isDir);
+    const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
+    const downloadUrl = `/api/apps/${currentAppFilesId}/files/download?path=${encodeURIComponent(itemRelPath)}`;
+    const escapedPath = itemRelPath.replace(/'/g, "\\'");
+
+    return `
+      <tr class="explorer-row" ondblclick="${isDir ? `viewAppFiles('${currentAppFilesId}', '${escapedPath}')` : ''}">
+        <td>
+          <div class="file-name-cell">
+            <span class="file-icon">${icon}</span>
+            ${isDir 
+              ? `<a href="javascript:void(0)" class="mono" style="font-weight: 500;" onclick="viewAppFiles('${currentAppFilesId}', '${escapedPath}')">${escapeHtml(item.name)}</a>`
+              : `<span class="mono">${escapeHtml(item.name)}</span>`
+            }
+          </div>
+        </td>
+        <td class="cell-muted">${typeCategory}</td>
+        <td class="mono cell-muted">${sizeStr}</td>
+        <td style="text-align: right;">
+          <div class="explorer-row-actions">
+            ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download title="Download file">Download</a>` : ''}
+            <button class="btn btn-sm btn-danger" onclick="deleteAppFile('${escapedPath}', ${isDir})" title="Delete">Delete</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+window.closeAppFiles = function() {
+  currentAppFilesId = null;
+  const panel = document.getElementById("app-files-panel");
+  if (panel) panel.style.display = "none";
+};
+
+window.handleAppCreateFolder = async function() {
+  if (!currentAppFilesId) return;
+  const name = await showCustomPrompt({
+    title: "New folder",
+    label: "Folder name",
+    placeholder: "e.g. src",
+    confirmText: "Create",
+    validate: (val) => {
+      if (!val) return "Folder name cannot be empty.";
+      if (/[\\/:\*\?"<>\|\x00]/.test(val) || val.includes("..")) return "Invalid directory name characters.";
+      return "";
+    }
+  });
+  if (!name) return;
+
+  try {
+    await apiFetch(`/api/apps/${currentAppFilesId}/files/mkdir`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, path: currentAppFilesPath })
+    });
+    viewAppFiles(currentAppFilesId, currentAppFilesPath);
+  } catch (err) {
+    showCustomAlert({ title: "Folder Creation Failed", message: err.message, isError: true });
+  }
+};
+
+window.handleAppUpload = async function(fileList) {
+  if (!fileList || fileList.length === 0 || !currentAppFilesId) return;
+  const uploadUrl = `/api/apps/${currentAppFilesId}/files/upload?path=${encodeURIComponent(currentAppFilesPath)}`;
+
+  for (let i = 0; i < fileList.length; i++) {
+    const file = fileList[i];
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await fetch(uploadUrl, {
+        method: "POST",
+        body: formData
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || res.statusText);
+      }
+    } catch (err) {
+      showCustomAlert({ title: "Upload Failed", message: `Upload failed for "${file.name}": ${err.message}`, isError: true });
+      break;
+    }
+  }
+
+  viewAppFiles(currentAppFilesId, currentAppFilesPath);
+};
+
+window.deleteAppFile = async function(itemRelPath, isDir) {
+  if (!currentAppFilesId) return;
+  const itemName = itemRelPath.split("/").pop();
+  const confirmed = await showCustomConfirm({
+    title: `Delete ${isDir ? 'Folder' : 'File'}`,
+    message: `Delete "${itemName}" from application storage?\n\nThis action cannot be undone.`,
+    confirmText: "Delete",
+    isDanger: true
+  });
+  if (!confirmed) return;
+
+  try {
+    await apiFetch(`/api/apps/${currentAppFilesId}/files?path=${encodeURIComponent(itemRelPath)}`, {
+      method: "DELETE"
+    });
+    viewAppFiles(currentAppFilesId, currentAppFilesPath);
+  } catch (err) {
+    showCustomAlert({ title: "Delete Failed", message: err.message, isError: true });
+  }
+};
+
+document.getElementById("app-files-refresh-btn")?.addEventListener("click", () => {
+  if (currentAppFilesId) viewAppFiles(currentAppFilesId, currentAppFilesPath);
+});
+
+document.getElementById("app-create-folder-btn")?.addEventListener("click", handleAppCreateFolder);
+
+document.getElementById("app-upload-file-btn")?.addEventListener("click", () => {
+  document.getElementById("app-file-upload-input")?.click();
+});
+
+document.getElementById("app-file-upload-input")?.addEventListener("change", (e) => {
+  if (e.target.files && e.target.files.length > 0) {
+    handleAppUpload(e.target.files);
+    e.target.value = "";
+  }
+});
+
+// ==========================================
+// Custom PersonalServer Modal System
+// ==========================================
+let activeModalResolve = null;
+let activeModalValidate = null;
+
+function closeModal(result = null) {
+  const backdrop = document.getElementById("ps-modal-backdrop");
+  if (backdrop) backdrop.style.display = "none";
+  if (activeModalResolve) {
+    const res = activeModalResolve;
+    activeModalResolve = null;
+    activeModalValidate = null;
+    res(result);
+  }
+}
+
+function showCustomPrompt({ title = "Input", label = "Name", initialValue = "", placeholder = "", confirmText = "Confirm", validate = null }) {
+  return new Promise((resolve) => {
+    activeModalResolve = resolve;
+    activeModalValidate = validate;
+
+    const backdrop = document.getElementById("ps-modal-backdrop");
+    const titleEl = document.getElementById("ps-modal-title");
+    const msgEl = document.getElementById("ps-modal-message");
+    const inputWrap = document.getElementById("ps-modal-input-wrap");
+    const labelEl = document.getElementById("ps-modal-label");
+    const inputEl = document.getElementById("ps-modal-input");
+    const errorEl = document.getElementById("ps-modal-error");
+    const cancelBtn = document.getElementById("ps-modal-cancel-btn");
+    const confirmBtn = document.getElementById("ps-modal-confirm-btn");
+
+    if (titleEl) titleEl.textContent = title;
+    if (msgEl) msgEl.style.display = "none";
+    if (inputWrap) inputWrap.style.display = "flex";
+    if (labelEl) labelEl.textContent = label;
+    if (inputEl) {
+      inputEl.value = initialValue;
+      inputEl.placeholder = placeholder;
+    }
+    if (errorEl) {
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+    }
+
+    if (confirmBtn) {
+      confirmBtn.textContent = confirmText;
+      confirmBtn.className = "btn btn-sm btn-primary";
+    }
+    if (cancelBtn) cancelBtn.style.display = "inline-flex";
+
+    if (backdrop) backdrop.style.display = "flex";
+    setTimeout(() => {
+      inputEl?.focus();
+      inputEl?.select();
+    }, 50);
+  });
+}
+
+function showCustomConfirm({ title = "Confirm", message = "", confirmText = "Confirm", isDanger = false }) {
+  return new Promise((resolve) => {
+    activeModalResolve = resolve;
+    activeModalValidate = null;
+
+    const backdrop = document.getElementById("ps-modal-backdrop");
+    const titleEl = document.getElementById("ps-modal-title");
+    const msgEl = document.getElementById("ps-modal-message");
+    const inputWrap = document.getElementById("ps-modal-input-wrap");
+    const errorEl = document.getElementById("ps-modal-error");
+    const cancelBtn = document.getElementById("ps-modal-cancel-btn");
+    const confirmBtn = document.getElementById("ps-modal-confirm-btn");
+
+    if (titleEl) titleEl.textContent = title;
+    if (msgEl) {
+      msgEl.textContent = message;
+      msgEl.style.display = "block";
+    }
+    if (inputWrap) inputWrap.style.display = "none";
+    if (errorEl) {
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+    }
+
+    if (confirmBtn) {
+      confirmBtn.textContent = confirmText;
+      confirmBtn.className = isDanger ? "btn btn-sm btn-danger" : "btn btn-sm btn-primary";
+    }
+    if (cancelBtn) cancelBtn.style.display = "inline-flex";
+
+    if (backdrop) backdrop.style.display = "flex";
+    setTimeout(() => confirmBtn?.focus(), 50);
+  });
+}
+
+function showCustomAlert({ title = "Notice", message = "", isError = false }) {
+  return new Promise((resolve) => {
+    activeModalResolve = resolve;
+    activeModalValidate = null;
+
+    const backdrop = document.getElementById("ps-modal-backdrop");
+    const titleEl = document.getElementById("ps-modal-title");
+    const msgEl = document.getElementById("ps-modal-message");
+    const inputWrap = document.getElementById("ps-modal-input-wrap");
+    const errorEl = document.getElementById("ps-modal-error");
+    const cancelBtn = document.getElementById("ps-modal-cancel-btn");
+    const confirmBtn = document.getElementById("ps-modal-confirm-btn");
+
+    if (titleEl) titleEl.textContent = title;
+    if (msgEl) {
+      msgEl.textContent = message;
+      msgEl.style.display = "block";
+    }
+    if (inputWrap) inputWrap.style.display = "none";
+    if (errorEl) {
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+    }
+
+    if (confirmBtn) {
+      confirmBtn.textContent = "OK";
+      confirmBtn.className = isError ? "btn btn-sm btn-danger" : "btn btn-sm btn-primary";
+    }
+    if (cancelBtn) cancelBtn.style.display = "none";
+
+    if (backdrop) backdrop.style.display = "flex";
+    setTimeout(() => confirmBtn?.focus(), 50);
+  });
+}
+
+// Modal event listeners setup
+document.getElementById("ps-modal-cancel-btn")?.addEventListener("click", () => closeModal(null));
+document.getElementById("ps-modal-close")?.addEventListener("click", () => closeModal(null));
+document.getElementById("ps-modal-backdrop")?.addEventListener("click", (e) => {
+  if (e.target.id === "ps-modal-backdrop") closeModal(null);
+});
+
+document.getElementById("ps-modal-confirm-btn")?.addEventListener("click", () => {
+  const inputWrap = document.getElementById("ps-modal-input-wrap");
+  const isPrompt = inputWrap && inputWrap.style.display !== "none";
+  if (isPrompt) {
+    const inputEl = document.getElementById("ps-modal-input");
+    const val = inputEl ? inputEl.value.trim() : "";
+    if (activeModalValidate) {
+      const err = activeModalValidate(val);
+      if (err) {
+        const errorEl = document.getElementById("ps-modal-error");
+        if (errorEl) {
+          errorEl.textContent = err;
+          errorEl.style.display = "block";
+        }
+        inputEl?.focus();
+        return;
+      }
+    }
+    closeModal(val);
+  } else {
+    closeModal(true);
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  const backdrop = document.getElementById("ps-modal-backdrop");
+  if (!backdrop || backdrop.style.display === "none") return;
+
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closeModal(null);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    document.getElementById("ps-modal-confirm-btn")?.click();
+  }
+});
 
 // Initialize
 navigate();

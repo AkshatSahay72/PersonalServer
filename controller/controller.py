@@ -55,6 +55,45 @@ PORT_RANGE_END = 18999
 
 ONBOARDING_LOCK = threading.Lock()
 APPS_LOCK = threading.Lock()
+APP_STORAGE_ROOT = (BASE_DIR / "storage" / "applications").resolve()
+
+
+def resolve_safe_app_storage_path(app_id, rel_path=""):
+    """
+    Resolves and sandboxes paths strictly within the application's storage namespace:
+    ~/PersonalServer/storage/applications/<app_id>/
+    """
+    if not app_id or not re.match(r'^[a-zA-Z0-9_-]+$', app_id):
+        raise ValueError("Invalid application ID")
+    
+    app_base = (APP_STORAGE_ROOT / app_id).resolve()
+    
+    # Initialize starter structure if app directory does not exist yet
+    if not app_base.exists():
+        app_base.mkdir(parents=True, exist_ok=True)
+        readme_file = app_base / "README.md"
+        if not readme_file.exists():
+            readme_file.write_text(
+                f"# Application: {app_id}\n\nManaged application storage namespace.\nPlace project files, Dockerfile, configurations, and assets here.\n",
+                encoding="utf-8"
+            )
+        dockerfile = app_base / "Dockerfile"
+        if not dockerfile.exists():
+            dockerfile.write_text(
+                f"# PersonalServer Deployment Dockerfile\nFROM python:3.11-slim\nWORKDIR /app\nCOPY . .\nEXPOSE 8000\nCMD [\"python\", \"-m\", \"http.server\", \"8000\"]\n",
+                encoding="utf-8"
+            )
+
+    rel_clean = (rel_path or "").replace("\\", "/").strip().lstrip("/")
+    target = (app_base / rel_clean).resolve()
+    
+    try:
+        target.relative_to(app_base)
+    except ValueError:
+        raise ValueError("Access Denied: Path escapes application storage sandbox")
+        
+    return target, app_base
+
 
 # Centralized Node State Constants
 STATE_REGISTERING = "REGISTERING"
@@ -782,6 +821,91 @@ class ControllerHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # GET /apps/<app_id>/files or /apps/<app_id>/files/download
+        if path.startswith("/apps/") and "/files" in path:
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            
+            is_download = path.endswith("/files/download")
+            parts = path.split("/")
+            app_id = parts[2] if len(parts) > 2 else ""
+            
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app:
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+
+            req_path = query.get("path", [""])[0]
+            try:
+                target_path, app_base = resolve_safe_app_storage_path(app_id, req_path)
+            except ValueError as e:
+                self.send_json(403, {"error": str(e)})
+                return
+
+            if not target_path.exists():
+                self.send_json(404, {"error": f"Path not found: {req_path}"})
+                return
+
+            if is_download:
+                if not target_path.is_file():
+                    self.send_json(400, {"error": "Target is not a file"})
+                    return
+                file_size = target_path.stat().st_size
+                filename = target_path.name
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(file_size))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.end_headers()
+                with open(target_path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                return
+
+            if not target_path.is_dir():
+                self.send_json(400, {"error": f"Path is a file, not a directory: {req_path}"})
+                return
+
+            items = []
+            try:
+                with os.scandir(target_path) as entries:
+                    for entry in entries:
+                        try:
+                            stat = entry.stat(follow_symlinks=False)
+                            is_dir = entry.is_dir(follow_symlinks=False)
+                            items.append({
+                                "name": entry.name,
+                                "is_dir": is_dir,
+                                "size_bytes": stat.st_size if not is_dir else 0,
+                                "modified": stat.st_mtime,
+                                "extension": Path(entry.name).suffix.lstrip(".") if not is_dir else None
+                            })
+                        except Exception:
+                            continue
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to list directory: {e}"})
+                return
+
+            items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+            rel_display = str(target_path.relative_to(app_base)).replace("\\", "/")
+            if rel_display == ".":
+                rel_display = ""
+
+            self.send_json(200, {
+                "status": "ok",
+                "app_id": app_id,
+                "name": app.get("name"),
+                "path": rel_display,
+                "items": items,
+                "count": len(items)
+            })
+            return
+
         # GET /apps/<app_id>
         if path.startswith("/apps/"):
             if not self.is_authenticated_admin_or_node():
@@ -1444,6 +1568,125 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "RUNNING", "app": app, "job_id": job_id})
             return
 
+        # POST /apps/<app_id>/files/mkdir
+        if path.startswith("/apps/") and path.endswith("/files/mkdir"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            app_id = path.split("/")[2]
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app:
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+
+            folder_name = (body.get("name") or "").strip()
+            parent_rel = body.get("path") or ""
+
+            if not folder_name or re.search(r'[\\/:\*\?"<>\|\x00]', folder_name) or ".." in folder_name:
+                self.send_json(400, {"error": "Invalid folder name"})
+                return
+
+            try:
+                target_dir, app_base = resolve_safe_app_storage_path(app_id, os.path.join(parent_rel, folder_name))
+            except ValueError as e:
+                self.send_json(403, {"error": str(e)})
+                return
+
+            if target_dir.exists():
+                self.send_json(409, {"error": "Directory already exists"})
+                return
+
+            try:
+                target_dir.mkdir(parents=True, exist_ok=False)
+                self.send_json(200, {
+                    "status": "created",
+                    "path": str(target_dir.relative_to(app_base)).replace("\\", "/")
+                })
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to create directory: {e}"})
+            return
+
+        # POST /apps/<app_id>/files/upload
+        if path.startswith("/apps/") and path.endswith("/files/upload"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            app_id = path.split("/")[2]
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app:
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+
+            parsed_q = urllib.parse.parse_qs(parsed.query)
+            target_rel = parsed_q.get("path", [""])[0]
+            try:
+                target_dir, app_base = resolve_safe_app_storage_path(app_id, target_rel)
+            except ValueError as e:
+                self.send_json(403, {"error": str(e)})
+                return
+
+            if not target_dir.exists() or not target_dir.is_dir():
+                self.send_json(400, {"error": "Upload target directory does not exist"})
+                return
+
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 100 * 1024 * 1024:
+                self.send_json(413, {"error": "Upload exceeds 100 MB limit"})
+                return
+
+            content_type = self.headers.get("Content-Type", "")
+            if "multipart/form-data" in content_type:
+                boundary = content_type.split("boundary=")[-1].strip()
+                if boundary.startswith('"') and boundary.endswith('"'):
+                    boundary = boundary[1:-1]
+                raw_data = self.rfile.read(content_len)
+                boundary_bytes = boundary.encode("utf-8")
+                parts = raw_data.split(b"--" + boundary_bytes)
+                saved_files = []
+                for part in parts:
+                    if b"Content-Disposition" in part and b'filename="' in part:
+                        header_part, file_data = part.split(b"\r\n\r\n", 1)
+                        file_data = file_data.rstrip(b"\r\n--")
+                        match = re.search(rb'filename="([^"]+)"', header_part)
+                        if match:
+                            raw_filename = match.group(1).decode("utf-8", errors="ignore")
+                            safe_name = os.path.basename(raw_filename)
+                            safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
+                            if not safe_name or safe_name in (".", ".."):
+                                safe_name = "uploaded_file"
+                            dest_path = target_dir / safe_name
+                            with open(dest_path, "wb") as f:
+                                f.write(file_data)
+                            saved_files.append(safe_name)
+                self.send_json(200, {
+                    "status": "uploaded",
+                    "files": saved_files,
+                    "target_dir": str(target_dir.relative_to(app_base)).replace("\\", "/")
+                })
+                return
+            else:
+                filename = parsed_q.get("filename", ["upload.dat"])[0]
+                safe_name = os.path.basename(filename)
+                safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
+                dest_path = target_dir / safe_name
+                with open(dest_path, "wb") as f:
+                    remaining = content_len
+                    while remaining > 0:
+                        chunk_size = min(remaining, 65536)
+                        chunk = self.rfile.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                self.send_json(200, {
+                    "status": "uploaded",
+                    "file": safe_name,
+                    "bytes": content_len
+                })
+                return
+
         # ----------------------------------------------------------------------
         # 6. Cancel Job: POST /jobs/<job_id>/cancel
         # ----------------------------------------------------------------------
@@ -1522,6 +1765,48 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path.startswith("/apps/"):
             if not self.is_authenticated_admin_or_node():
                 self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+
+            # DELETE /apps/<app_id>/files?path=<rel_path>
+            if "/files" in path:
+                app_id = path.split("/")[2]
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app:
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                parsed_q = urllib.parse.parse_qs(parsed.query)
+                req_path = parsed_q.get("path", [""])[0]
+                if not req_path:
+                    self.send_json(400, {"error": "Missing 'path' parameter"})
+                    return
+
+                try:
+                    target_item, app_base = resolve_safe_app_storage_path(app_id, req_path)
+                except ValueError as e:
+                    self.send_json(403, {"error": str(e)})
+                    return
+
+                if target_item == app_base:
+                    self.send_json(403, {"error": "Cannot delete application storage root"})
+                    return
+
+                if not target_item.exists():
+                    self.send_json(404, {"error": "Item not found"})
+                    return
+
+                try:
+                    if target_item.is_dir():
+                        shutil.rmtree(target_item)
+                    else:
+                        target_item.unlink()
+                    self.send_json(200, {
+                        "status": "deleted",
+                        "path": req_path
+                    })
+                except Exception as e:
+                    self.send_json(500, {"error": f"Failed to delete item: {e}"})
                 return
 
             app_id = path[6:].strip()

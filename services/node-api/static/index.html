@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PersonalServer - Server Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=1.3.0">
+  <link rel="stylesheet" href="/static/style.css?v=1.4.0">
 </head>
 <body>
   <div class="app-layout">
@@ -512,6 +512,59 @@
             <pre id="app-logs-stdout" class="log-box mono" style="max-height: 350px; overflow-y: auto;"></pre>
           </div>
         </div>
+
+        <!-- Application Files Panel (Sandboxed Project File Explorer) -->
+        <div id="app-files-panel" class="section-card explorer-frame" style="display:none; margin-top: 16px;">
+          <!-- Top Ribbon -->
+          <div class="explorer-toolbar">
+            <div class="explorer-nav-group-left">
+              <div class="explorer-nav-buttons">
+                <button id="app-files-up-btn" class="explorer-icon-btn" title="Up one folder" disabled>↑</button>
+              </div>
+              <div class="explorer-address-bar">
+                <span class="explorer-bar-icon mono">/</span>
+                <div class="storage-breadcrumbs mono" id="app-files-breadcrumbs">
+                  <span class="crumb current" id="app-files-root-crumb">Application</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="explorer-nav-group-right">
+              <button id="app-files-refresh-btn" class="explorer-icon-btn" title="Refresh">⟳</button>
+              <div class="storage-actions">
+                <input type="file" id="app-file-upload-input" style="display:none" multiple>
+                <button id="app-upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
+                <button id="app-create-folder-btn" class="btn btn-sm">New Folder</button>
+                <button class="btn btn-sm" onclick="closeAppFiles()">Close</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Files Table -->
+          <div class="explorer-main">
+            <div class="table-container explorer-table-container">
+              <table class="data-table explorer-table">
+                <thead>
+                  <tr>
+                    <th style="width: 50%;">Name</th>
+                    <th style="width: 18%;">Type</th>
+                    <th style="width: 14%;">Size</th>
+                    <th style="width: 18%; text-align: right;">Action</th>
+                  </tr>
+                </thead>
+                <tbody id="app-files-tbody">
+                  <tr><td colspan="4" class="cell-muted" style="text-align: center; padding: 24px;">Loading project files...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Status Bar -->
+          <footer class="explorer-footer mono cell-muted">
+            <div id="app-files-stats-left">0 files · 0 folders</div>
+            <div id="app-files-stats-right">Sandboxed Application Storage</div>
+          </footer>
+        </div>
       </section>
 
       <!-- 6. SETTINGS VIEW -->
@@ -553,6 +606,28 @@
     </main>
   </div>
 
-  <script src="/static/app.js?v=1.3.0"></script>
+  <!-- Custom PersonalServer Modal System -->
+  <div id="ps-modal-backdrop" class="modal-backdrop" style="display:none">
+    <div class="modal-frame" id="ps-modal-frame" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <span class="modal-title mono" id="ps-modal-title">Confirm Action</span>
+        <button type="button" class="modal-close-btn" id="ps-modal-close" title="Close (Esc)">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-message" id="ps-modal-message" style="display:none"></p>
+        <div class="modal-field" id="ps-modal-input-wrap" style="display:none">
+          <label for="ps-modal-input" class="modal-label" id="ps-modal-label">Name</label>
+          <input type="text" id="ps-modal-input" class="form-input mono" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="modal-error mono" id="ps-modal-error" style="display:none"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm" id="ps-modal-cancel-btn">Cancel</button>
+        <button type="button" class="btn btn-sm btn-primary" id="ps-modal-confirm-btn">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=1.4.0"></script>
 </body>
 </html>
