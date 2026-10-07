@@ -185,6 +185,19 @@ def ensure_storage_root():
     return STORAGE_ROOT
 
 
+def get_controller_auth_token():
+    """Load enrollment token or node auth token for controller communication."""
+    enrollment_file = SECRETS_DIR / "enrollment.token"
+    if enrollment_file.exists():
+        try:
+            token = enrollment_file.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+    return get_auth_token()
+
+
 def get_auth_token():
     """Load or generate storage/web authentication token."""
     SECRETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -423,6 +436,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             "User-Agent": "PersonalServer-WebGateway/1.0"
         }
         auth_hdr = self.headers.get("Authorization") or self.headers.get("X-Auth-Token")
+        if not auth_hdr:
+            auth_token = get_controller_auth_token()
+            if auth_token:
+                auth_hdr = f"Bearer {auth_token}"
         if auth_hdr:
             headers["Authorization"] = auth_hdr if auth_hdr.startswith("Bearer ") else f"Bearer {auth_hdr}"
 
