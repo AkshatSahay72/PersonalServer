@@ -46,7 +46,7 @@ DEFAULT_KNOWN_NODES = {
 
 def resolve_target_node_endpoint(node_param):
     if not node_param:
-        return None
+        return True, None
     param_str = str(node_param).strip()
     config = load_config()
     local_id = config.get("NODE_ID", config.get("node_id", ""))
@@ -54,12 +54,34 @@ def resolve_target_node_endpoint(node_param):
 
     # If explicitly referring to local node
     if param_str.lower() in ("local", "self", "local_node") or (local_id and param_str == local_id) or (local_name and param_str == local_name):
-        return None
+        return True, None
 
     if param_str in DEFAULT_KNOWN_NODES:
-        return DEFAULT_KNOWN_NODES[param_str].get("endpoint")
+        return False, DEFAULT_KNOWN_NODES[param_str].get("endpoint")
 
-    return None
+    # Dynamic lookup from controller to prevent arbitrary SSRF
+    try:
+        controller_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+        req = urllib.request.Request(f"{controller_url}/nodes", headers={"User-Agent": "PersonalServer-NodeAPI/1.0"})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for n in data.get("nodes", []):
+                if n.get("status") == "REMOVED":
+                    continue
+                nid = n.get("node_id", "")
+                nname = n.get("name", "")
+                if param_str in (nid, nname):
+                    if nid == local_id or nname == local_name:
+                        return True, None
+                    if nid in DEFAULT_KNOWN_NODES:
+                        return False, DEFAULT_KNOWN_NODES[nid].get("endpoint")
+                    if nname in DEFAULT_KNOWN_NODES:
+                        return False, DEFAULT_KNOWN_NODES[nname].get("endpoint")
+    except Exception:
+        pass
+
+    # Reject unknown or arbitrary target
+    return False, "INVALID"
 
 
 def get_cluster_storage_nodes():
@@ -407,7 +429,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json(502, {"error": f"Controller unavailable at {controller_url}: {e}"})
 
-    def proxy_to_remote_storage(self, remote_endpoint, subpath, query_dict=None):
+    def proxy_to_remote_storage(self, remote_endpoint, method, subpath, query_dict=None, body_bytes=None):
         target_url = f"{remote_endpoint.rstrip('/')}{subpath}"
         if query_dict:
             filtered_qs = {k: v for k, v in query_dict.items() if k != "node"}
@@ -417,13 +439,25 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         headers = {
             "User-Agent": "PersonalServer-StorageProxy/1.0"
         }
+        content_type = self.headers.get("Content-Type")
+        if content_type:
+            headers["Content-Type"] = content_type
+
+        if body_bytes is not None:
+            headers["Content-Length"] = str(len(body_bytes))
+
+        # Forward authorization headers or use local node auth token
         auth_hdr = self.headers.get("Authorization") or self.headers.get("X-Auth-Token")
+        if not auth_hdr:
+            auth_token = get_auth_token()
+            if auth_token:
+                auth_hdr = f"Bearer {auth_token}"
         if auth_hdr:
             headers["Authorization"] = auth_hdr if auth_hdr.startswith("Bearer ") else f"Bearer {auth_hdr}"
 
-        req = urllib.request.Request(target_url, headers=headers, method="GET")
+        req = urllib.request.Request(target_url, data=body_bytes, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 resp_data = response.read()
                 self.send_response(response.status)
                 for hdr in ("Content-Type", "Content-Disposition"):
@@ -436,13 +470,19 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             err_body = e.read()
             self.send_response(e.code)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
             self.send_header("Content-Length", str(len(err_body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(err_body)
+        except urllib.error.URLError as e:
+            err_msg = str(e.reason) if hasattr(e, "reason") else str(e)
+            if "timed out" in err_msg.lower():
+                self.send_json(504, {"error": f"Remote storage node timed out at {remote_endpoint}: {err_msg}"})
+            else:
+                self.send_json(502, {"error": f"Remote storage node unavailable at {remote_endpoint}: {err_msg}"})
         except Exception as e:
-            self.send_json(502, {"error": f"Remote storage node unavailable at {remote_endpoint}: {e}"})
+            self.send_json(502, {"error": f"Remote storage proxy error at {remote_endpoint}: {e}"})
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -512,9 +552,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 return
 
             target_node = query.get("node", [""])[0]
-            remote_endpoint = resolve_target_node_endpoint(target_node)
-            if remote_endpoint:
-                self.proxy_to_remote_storage(remote_endpoint, "/storage/list", query)
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+            if not is_local and remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "GET", "/storage/list", query)
                 return
 
             req_path = query.get("path", [""])[0]
@@ -573,9 +616,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 return
 
             target_node = query.get("node", [""])[0]
-            remote_endpoint = resolve_target_node_endpoint(target_node)
-            if remote_endpoint:
-                self.proxy_to_remote_storage(remote_endpoint, "/storage/download", query)
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+            if not is_local and remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "GET", "/storage/download", query)
                 return
 
             req_path = query.get("path", [""])[0]
@@ -610,9 +656,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         # 7. Storage Usage: GET /storage/usage
         if path == "/storage/usage":
             target_node = query.get("node", [""])[0]
-            remote_endpoint = resolve_target_node_endpoint(target_node)
-            if remote_endpoint:
-                self.proxy_to_remote_storage(remote_endpoint, "/storage/usage", query)
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+            if not is_local and remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "GET", "/storage/usage", query)
                 return
 
             ensure_storage_root()
@@ -698,16 +747,21 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # Safety: Reject write operations on remote nodes in Phase 8
-        target_node = query.get("node", [""])[0]
-        if resolve_target_node_endpoint(target_node):
-            self.send_json(403, {"error": "Write operations to remote storage nodes are not permitted in Phase 8 (Discovery Phase)"})
-            return
-
         # 1. Storage Subsystem: POST /storage/mkdir
         if path == "/storage/mkdir":
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            target_node = query.get("node", [""])[0]
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+            if not is_local and remote_endpoint:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+                self.proxy_to_remote_storage(remote_endpoint, "POST", "/storage/mkdir", query, body_bytes)
                 return
 
             body = self.read_json_body()
@@ -749,9 +803,20 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized"})
                 return
 
+            target_node = query.get("node", [""])[0]
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+
             content_len = int(self.headers.get("Content-Length", 0))
             if content_len > MAX_UPLOAD_BYTES:
                 self.send_json(413, {"error": f"Upload exceeds maximum allowed size ({MAX_UPLOAD_BYTES // (1024*1024)} MB)"})
+                return
+
+            if not is_local and remote_endpoint:
+                body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+                self.proxy_to_remote_storage(remote_endpoint, "POST", "/storage/upload", query, body_bytes)
                 return
 
             target_dir_rel = query.get("path", [""])[0]
@@ -835,6 +900,17 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized"})
                 return
 
+            target_node = query.get("node", [""])[0]
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+            if not is_local and remote_endpoint:
+                content_len = int(self.headers.get("Content-Length", 0))
+                body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+                self.proxy_to_remote_storage(remote_endpoint, "POST", "/storage/rename", query, body_bytes)
+                return
+
             body = self.read_json_body()
             if not body or not body.get("path") or not body.get("new_name"):
                 self.send_json(400, {"error": "Missing 'path' or 'new_name' field"})
@@ -898,16 +974,19 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # Safety: Reject write/delete operations on remote nodes in Phase 8
-        target_node = query.get("node", [""])[0]
-        if resolve_target_node_endpoint(target_node):
-            self.send_json(403, {"error": "Delete operations on remote storage nodes are not permitted in Phase 8 (Discovery Phase)"})
-            return
-
         # Storage Subsystem: DELETE /storage
         if path == "/storage":
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            target_node = query.get("node", [""])[0]
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+            if not is_local and remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "DELETE", "/storage", query)
                 return
 
             req_path = query.get("path", [""])[0]

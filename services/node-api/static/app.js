@@ -584,9 +584,10 @@ async function loadStorage(path = "", node = selectedStorageNode) {
     rootPathEl.textContent = isLocal ? "~/PersonalServer/storage (Local)" : `~/PersonalServer/storage on ${nodeDisplayName}`;
   }
 
+  const isOnline = (nodeObj?.status || "").toUpperCase() === "ONLINE";
   const actionsContainer = document.getElementById("storage-actions-container");
   if (actionsContainer) {
-    if (isLocal) {
+    if (isOnline) {
       actionsContainer.innerHTML = `
         <input type="file" id="file-upload-input" style="display:none">
         <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
@@ -599,7 +600,7 @@ async function loadStorage(path = "", node = selectedStorageNode) {
       document.getElementById("create-folder-btn")?.addEventListener("click", handleCreateFolder);
     } else {
       actionsContainer.innerHTML = `
-        <span class="storage-badge-ro">🔒 Read-Only Discovery Mode</span>
+        <span class="storage-badge-ro">⚠️ Node Offline (Write Disabled)</span>
       `;
     }
   }
@@ -644,8 +645,8 @@ async function loadStorage(path = "", node = selectedStorageNode) {
             <td style="text-align: right;">
               <div style="display: inline-flex; gap: 6px;">
                 ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm btn-primary" download>Download</a>` : ''}
-                ${isLocal ? `<button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>` : ''}
-                ${isLocal ? `<button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>` : ''}
+                ${isOnline ? `<button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>` : ''}
+                ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>` : ''}
               </div>
             </td>
           </tr>
@@ -702,8 +703,14 @@ async function handleFileUpload(e) {
   const formData = new FormData();
   formData.append("file", file);
 
+  let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
+  const isLocal = !nodeObj || nodeObj.is_local;
+  const uploadUrl = isLocal
+    ? `/storage/upload?path=${encodeURIComponent(currentPath)}`
+    : `/storage/upload?node=${encodeURIComponent(selectedStorageNode)}&path=${encodeURIComponent(currentPath)}`;
+
   try {
-    const res = await fetch(`/storage/upload?path=${encodeURIComponent(currentPath)}`, {
+    const res = await fetch(uploadUrl, {
       method: "POST",
       body: formData
     });
@@ -723,11 +730,17 @@ async function handleCreateFolder() {
   const name = prompt("Folder name:");
   if (!name || !name.trim()) return;
 
+  let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
+  const isLocal = !nodeObj || nodeObj.is_local;
+  const mkdirUrl = isLocal
+    ? `/storage/mkdir?path=${encodeURIComponent(currentPath)}`
+    : `/storage/mkdir?node=${encodeURIComponent(selectedStorageNode)}&path=${encodeURIComponent(currentPath)}`;
+
   try {
-    await apiFetch(`/storage/mkdir?path=${encodeURIComponent(currentPath)}`, {
+    await apiFetch(mkdirUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name.trim() })
+      body: JSON.stringify({ name: name.trim(), path: currentPath })
     });
     loadStorage(currentPath, selectedStorageNode);
   } catch (err) {
@@ -741,8 +754,14 @@ window.renameItem = async function(itemRelPath) {
   const newName = prompt("Rename to:", oldName);
   if (!newName || newName.trim() === oldName) return;
 
+  let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
+  const isLocal = !nodeObj || nodeObj.is_local;
+  const renameUrl = isLocal
+    ? `/storage/rename`
+    : `/storage/rename?node=${encodeURIComponent(selectedStorageNode)}`;
+
   try {
-    await apiFetch(`/storage/rename`, {
+    await apiFetch(renameUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -761,8 +780,14 @@ window.deleteItem = async function(itemRelPath, isDir) {
   const itemName = itemRelPath.split("/").pop();
   if (!confirm(`Are you sure you want to delete ${isDir ? 'folder' : 'file'} "${itemName}"?`)) return;
 
+  let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
+  const isLocal = !nodeObj || nodeObj.is_local;
+  const deleteUrl = isLocal
+    ? `/storage?path=${encodeURIComponent(itemRelPath)}`
+    : `/storage?node=${encodeURIComponent(selectedStorageNode)}&path=${encodeURIComponent(itemRelPath)}`;
+
   try {
-    await apiFetch(`/storage?path=${encodeURIComponent(itemRelPath)}`, {
+    await apiFetch(deleteUrl, {
       method: "DELETE"
     });
     loadStorage(currentPath, selectedStorageNode);
