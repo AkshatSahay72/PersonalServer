@@ -31,6 +31,8 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+from config.platform_config import get_platform_config
 CONTROLLER_DATA_DIR = BASE_DIR / "controller" / "data"
 APPS_FILE = CONTROLLER_DATA_DIR / "apps.json"
 NODES_FILE = CONTROLLER_DATA_DIR / "nodes.json"
@@ -327,10 +329,11 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
 
                     # Rewrite Location header for redirects
                     if hdr_lower == "location":
+                        client_proto = self.headers.get("X-Forwarded-Proto") or get_platform_config().app_scheme
                         if hdr_val.startswith("/"):
                             hdr_val = f"{route_prefix}{hdr_val}"
                         elif upstream_base_url in hdr_val:
-                            hdr_val = hdr_val.replace(upstream_base_url, f"http://{client_host}{route_prefix}")
+                            hdr_val = hdr_val.replace(upstream_base_url, f"{client_proto}://{client_host}{route_prefix}")
 
                     # Rewrite Set-Cookie Path
                     elif hdr_lower == "set-cookie":
@@ -349,8 +352,11 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
             self.send_response(e.code)
             for hdr_key, hdr_val in e.headers.items():
                 hdr_lower = hdr_key.lower()
+                client_proto = self.headers.get("X-Forwarded-Proto") or get_platform_config().app_scheme
                 if hdr_lower == "location" and hdr_val.startswith("/"):
                     hdr_val = f"{route_prefix}{hdr_val}"
+                elif hdr_lower == "location" and upstream_base_url in hdr_val:
+                    hdr_val = hdr_val.replace(upstream_base_url, f"{client_proto}://{client_host}{route_prefix}")
                 elif hdr_lower == "set-cookie":
                     hdr_val = re.sub(r'Path=\/([^;]*)', f'Path={route_prefix}\\1', hdr_val, flags=re.IGNORECASE)
                 self.send_header(hdr_key, hdr_val)

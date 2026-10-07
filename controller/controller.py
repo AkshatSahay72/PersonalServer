@@ -28,6 +28,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 # Import ResourceScheduler
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness
+from config.platform_config import get_platform_config
 
 CONFIG_DIR = BASE_DIR / "config"
 SECRETS_DIR = CONFIG_DIR / "secrets"
@@ -341,7 +342,8 @@ def validate_app_route(route_dict, apps_db, current_app_id=None):
         "type": str(route_dict.get("type", "path")).lower(),
         "path": path,
         "strip_prefix": bool(route_dict.get("strip_prefix", True)),
-        "public_access": bool(route_dict.get("public_access", True))
+        "public_access": bool(route_dict.get("public_access", True)),
+        "public_url": get_platform_config().get_app_public_url(path)
     }
 
 
@@ -610,6 +612,13 @@ def mask_app_record(app, reveal_secrets=False):
             is_sec = bool(any(s in k.lower() for s in ("key", "secret", "password", "token", "auth")))
             masked_raw[k] = str(v) if (reveal_secrets or not is_sec) else "********"
         app_copy["env"] = masked_raw
+
+    # Attach dynamic public URL from centralized PlatformConfig
+    route = app_copy.get("route")
+    if route and isinstance(route, dict) and route.get("enabled"):
+        app_copy["public_url"] = get_platform_config().get_app_public_url(route.get("path"))
+    else:
+        app_copy["public_url"] = "-"
 
     return app_copy
 
@@ -968,6 +977,11 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "total_jobs": len(jobs_db.get("jobs", {})),
                 "timestamp": get_current_iso_timestamp()
             })
+            return
+
+        # GET /platform or GET /api/platform
+        if path in ("/platform", "/api/platform"):
+            self.send_json(200, get_platform_config().to_dict())
             return
 
         # GET /cluster

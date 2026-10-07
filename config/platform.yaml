@@ -1,0 +1,19 @@
+# ==============================================================================
+# PersonalServer Platform Domain & Public URL Configuration
+# ==============================================================================
+# Central non-secret source of truth for the platform's public domain,
+# hostnames, and application routing scheme.
+#
+# DO NOT place secrets, tokens, passwords, or credentials in this file.
+# ==============================================================================
+
+platform:
+  domain: akshatsahay.space
+
+  hosts:
+    admin: server.akshatsahay.space
+    api: api.akshatsahay.space
+
+  application:
+    scheme: https
+    path_based: true

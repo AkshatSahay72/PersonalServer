@@ -26,6 +26,8 @@ PORT = 8080
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(BASE_DIR))
+from config.platform_config import get_platform_config
 CONFIG_FILE = BASE_DIR / "config" / "node.conf"
 CONFIG_JSON = BASE_DIR / "config" / "node.json"
 SECRETS_DIR = BASE_DIR / "config" / "secrets"
@@ -481,7 +483,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         remote_ip = cf_ip.split(",")[0].strip() if cf_ip else client_ip
         headers["X-Forwarded-For"] = remote_ip
         headers["X-Forwarded-Proto"] = self.headers.get("X-Forwarded-Proto", "https" if (self.headers.get("Cf-Ray") or self.headers.get("X-Forwarded-Proto") == "https") else "http")
-        headers["X-Forwarded-Host"] = self.headers.get("Host", "akshatsahay.space")
+        headers["X-Forwarded-Host"] = self.headers.get("Host", get_platform_config().primary_domain)
 
         if body_bytes is not None:
             headers["Content-Length"] = str(len(body_bytes))
@@ -820,6 +822,11 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 "cloudflare": "connected",
                 "controller": "connected" if controller_connected else "disconnected"
             })
+            return
+
+        # 8b. Platform Configuration: GET /api/platform or GET /api/config/platform
+        if path in ("/api/platform", "/api/config/platform"):
+            self.send_json(200, get_platform_config().to_dict())
             return
 
         # 9. Proxy to Controller for UI: /api/cluster, /api/jobs, /api/jobs/<job_id>

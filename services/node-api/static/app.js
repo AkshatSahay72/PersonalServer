@@ -5,6 +5,33 @@ let selectedStorageNode = null;
 let cachedStorageNodes = [];
 let cachedNodes = [];
 let cachedJobs = [];
+let cachedPlatformConfig = null;
+
+async function loadPlatformConfig() {
+  if (cachedPlatformConfig) return cachedPlatformConfig;
+  try {
+    cachedPlatformConfig = await apiFetch("/api/platform");
+  } catch (err) {
+    // Non-blocking fallback
+  }
+  return cachedPlatformConfig;
+}
+
+function getPlatformBaseUrl() {
+  if (cachedPlatformConfig?.application?.base_url) {
+    return cachedPlatformConfig.application.base_url;
+  }
+  if (cachedPlatformConfig?.urls?.primary) {
+    return cachedPlatformConfig.urls.primary;
+  }
+  try {
+    const host = window.location.hostname;
+    if (host.startsWith("server.")) {
+      return `${window.location.protocol}//${host.slice(7)}`;
+    }
+  } catch (e) {}
+  return "https://akshatsahay.space";
+}
 
 // API Helper
 async function apiFetch(endpoint, options = {}) {
@@ -49,6 +76,7 @@ function navigate() {
   if (subHeading) subHeading.textContent = meta.sub;
 
   loadSession();
+  loadPlatformConfig();
   if (hash === "dashboard") loadDashboard();
   else if (hash === "nodes") loadNodes();
   else if (hash === "jobs") loadJobs();
@@ -1485,7 +1513,7 @@ function renderAppOverview(app) {
     : `Manual Docker Image (${escapeHtml(app.image)})`;
 
   const routePath = app.route?.path || "-";
-  const publicUrl = routePath !== "-" ? `https://akshatsahay.space${routePath}/` : "-";
+  const publicUrl = app.public_url || (routePath !== "-" ? `${getPlatformBaseUrl()}${routePath}/` : "-");
 
   container.innerHTML = `
     <div class="sys-kv-row"><span class="sys-kv-k">Application ID</span><span class="sys-kv-v">${escapeHtml(app.app_id)}</span></div>

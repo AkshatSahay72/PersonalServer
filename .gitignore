@@ -10,12 +10,30 @@ config/secrets/
 *.token
 *.secret
 
-# Runtime
+# Runtime & Persistence
 logs/
 runtime/
 data/
 controller/data/
+*.pid
+*.bak
 
-# OS files
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Ephemeral application sandboxes
+storage/applications/*/
+!storage/applications/.gitkeep
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+node_modules/
 .DS_Store
 Thumbs.db
