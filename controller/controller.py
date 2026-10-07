@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import shutil
 import threading
+import re
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,8 @@ NODES_FILE = DATA_DIR / "nodes.json"
 BACKUP_NODES_FILE = DATA_DIR / "nodes.json.bak"
 JOBS_FILE = DATA_DIR / "jobs.json"
 BACKUP_JOBS_FILE = DATA_DIR / "jobs.json.bak"
+APPS_FILE = DATA_DIR / "apps.json"
+BACKUP_APPS_FILE = DATA_DIR / "apps.json.bak"
 ONBOARDING_CODES_FILE = DATA_DIR / "onboarding_codes.json"
 BACKUP_ONBOARDING_CODES_FILE = DATA_DIR / "onboarding_codes.json.bak"
 ENROLLMENT_TOKEN_FILE = SECRETS_DIR / "enrollment.token"
@@ -47,7 +50,11 @@ DEFAULT_HEARTBEAT_TIMEOUT = 60  # seconds
 DEFAULT_LEASE_GRACE_SEC = 20    # seconds beyond job timeout
 DEFAULT_ONBOARDING_TTL_SEC = 900 # 15 minutes (seconds)
 
+PORT_RANGE_START = 18000
+PORT_RANGE_END = 18999
+
 ONBOARDING_LOCK = threading.Lock()
+APPS_LOCK = threading.Lock()
 
 # Centralized Node State Constants
 STATE_REGISTERING = "REGISTERING"
@@ -70,6 +77,14 @@ JOB_STATE_CANCELLED = "CANCELLED"
 JOB_STATE_RECOVERING = "RECOVERING"
 JOB_STATE_REJECTED = "REJECTED"
 
+# Centralized Application States (Phase 11B Lifecycle)
+APP_STATE_CREATED = "CREATED"
+APP_STATE_DEPLOYING = "DEPLOYING"
+APP_STATE_RUNNING = "RUNNING"
+APP_STATE_STOPPED = "STOPPED"
+APP_STATE_FAILED = "FAILED"
+APP_STATE_REMOVING = "REMOVING"
+
 # Allowlisted Workload Types
 ALLOWLISTED_WORKLOADS = {
     "system-info": "Gather system hardware and OS metrics",
@@ -78,7 +93,12 @@ ALLOWLISTED_WORKLOADS = {
     "python-script": "Execute safe inline python script",
     "echo": "Echo back test message",
     "failing-test": "Controlled error-handling test workload",
-    "timeout-test": "Controlled timeout test workload"
+    "timeout-test": "Controlled timeout test workload",
+    "docker-deploy": "Pull image and safely launch containerized application",
+    "docker-stop": "Stop running containerized application",
+    "docker-restart": "Restart containerized application",
+    "docker-remove": "Remove containerized application",
+    "docker-logs": "Fetch bounded container logs"
 }
 
 
@@ -176,6 +196,55 @@ def save_jobs_db(db):
             pass
 
     temp_file.replace(JOBS_FILE)
+
+
+def load_apps_db():
+    ensure_directories()
+    if APPS_FILE.exists():
+        try:
+            with open(APPS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Corrupt {APPS_FILE} ({e}). Rolling back to backup...", file=sys.stderr)
+            if BACKUP_APPS_FILE.exists():
+                try:
+                    with open(BACKUP_APPS_FILE, "r", encoding="utf-8") as bf:
+                        return json.load(bf)
+                except Exception:
+                    pass
+    return {"apps": {}}
+
+
+def save_apps_db(db):
+    ensure_directories()
+    temp_file = APPS_FILE.with_suffix(".tmp")
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2)
+
+    if APPS_FILE.exists():
+        try:
+            shutil.copy2(APPS_FILE, BACKUP_APPS_FILE)
+        except Exception:
+            pass
+
+    temp_file.replace(APPS_FILE)
+
+
+def allocate_host_port(apps_db):
+    """
+    Finds the lowest available host port in range PORT_RANGE_START to PORT_RANGE_END.
+    """
+    allocated = set()
+    for app in apps_db.get("apps", {}).values():
+        if app.get("status") != "DELETED" and "host_port" in app:
+            try:
+                allocated.add(int(app["host_port"]))
+            except (ValueError, TypeError):
+                pass
+    for port in range(PORT_RANGE_START, PORT_RANGE_END + 1):
+        if port not in allocated:
+            return port
+    raise RuntimeError(f"Port exhaustion: All host ports in range {PORT_RANGE_START}-{PORT_RANGE_END} are allocated.")
 
 
 # ------------------------------------------------------------------------------
@@ -492,6 +561,19 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return auth_header[7:].strip()
         return self.headers.get("X-Auth-Token", "").strip()
 
+    def is_authenticated_admin_or_node(self):
+        token = self.parse_auth_token()
+        if not token:
+            return False
+        enrollment_token = get_or_create_enrollment_token()
+        if token == enrollment_token:
+            return True
+        nodes_db = load_nodes_db()
+        for node in nodes_db.get("nodes", {}).values():
+            if node.get("auth_token") and node.get("auth_token") == token:
+                return True
+        return False
+
     def read_json_body(self):
         try:
             content_len = int(self.headers.get("Content-Length", 0))
@@ -648,16 +730,89 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"job": job})
             return
 
+        # GET /apps
+        if path == "/apps":
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            apps_db = load_apps_db()
+            apps_list = list(apps_db.get("apps", {}).values())
+            self.send_json(200, {
+                "apps": apps_list,
+                "count": len(apps_list)
+            })
+            return
+
+        # GET /apps/<app_id>/logs
+        if path.startswith("/apps/") and path.endswith("/logs"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            app_id = path[6:-5].strip()
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app:
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+
+            # Check if there's a recent docker-logs or deployment result in jobs_db
+            jobs_db = load_jobs_db()
+            target_node = app.get("selected_node")
+            container_id = app.get("container_id") or f"ps-{app.get('name')}"
+
+            # Look up recent job output for this app
+            app_jobs = [
+                j for j in jobs_db.get("jobs", {}).values()
+                if j.get("parameters", {}).get("app_id") == app_id or j.get("parameters", {}).get("container_name") == container_id
+            ]
+            app_jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+
+            log_output = "No logs recorded yet."
+            if app_jobs:
+                latest_job = app_jobs[0]
+                res = latest_job.get("result", {})
+                log_output = res.get("stdout") or res.get("stderr") or f"Job {latest_job.get('job_id')} status: {latest_job.get('status')}"
+
+            self.send_json(200, {
+                "app_id": app_id,
+                "name": app.get("name"),
+                "status": app.get("status"),
+                "node": app.get("selected_node"),
+                "logs": log_output
+            })
+            return
+
+        # GET /apps/<app_id>
+        if path.startswith("/apps/"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            app_id = path[6:].strip()
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app:
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+            self.send_json(200, {"app": app})
+            return
+
         self.send_json(404, {"error": "Endpoint not found"})
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         body = self.read_json_body()
-
-        if body is None and not (path.startswith("/nodes/") and path.endswith("/remove")) and not (path.startswith("/jobs/") and path.endswith("/cancel")):
-            self.send_json(400, {"error": "Invalid or missing JSON payload"})
-            return
+        if body is None:
+            # Endpoints that do not strictly require a request body
+            no_body_endpoints = (
+                (path.startswith("/nodes/") and path.endswith("/remove")),
+                (path.startswith("/jobs/") and path.endswith("/cancel")),
+                (path.startswith("/apps/") and (path.endswith("/deploy") or path.endswith("/stop") or path.endswith("/restart")))
+            )
+            if not any(no_body_endpoints):
+                self.send_json(400, {"error": "Invalid or missing JSON payload"})
+                return
+            body = {}
 
         token = self.parse_auth_token()
         if not token and body:
@@ -992,10 +1147,30 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     "stdout": body.get("stdout", ""),
                     "stderr": body.get("stderr", ""),
                     "duration_ms": body.get("duration_ms", 0),
-                    "started_at": body.get("started_at"),
-                    "finished_at": now_iso
                 }
-                print(f"[CONTROLLER] Job {job_id} on node {target_node} completed terminal status: {job_status}")
+
+            # Update application state if this was a docker lifecycle job
+            app_id = job.get("parameters", {}).get("app_id")
+            if app_id:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if app:
+                    if job.get("type") == "docker-deploy":
+                        if job_status == JOB_STATE_SUCCEEDED:
+                            app["status"] = APP_STATE_RUNNING
+                            app["error"] = None
+                            app["updated_at"] = now_iso
+                        elif job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
+                            app["status"] = APP_STATE_FAILED
+                            app["error"] = body.get("stderr") or f"Deployment job {job_status}"
+                            app["updated_at"] = now_iso
+                    elif job.get("type") == "docker-stop" and job_status == JOB_STATE_SUCCEEDED:
+                        app["status"] = APP_STATE_STOPPED
+                        app["updated_at"] = now_iso
+                    elif job.get("type") == "docker-restart" and job_status == JOB_STATE_SUCCEEDED:
+                        app["status"] = APP_STATE_RUNNING
+                        app["updated_at"] = now_iso
+                    save_apps_db(apps_db)
 
             save_jobs_db(jobs_db)
 
@@ -1008,7 +1183,269 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return
 
         # ----------------------------------------------------------------------
-        # 5. Cancel Job: POST /jobs/<job_id>/cancel
+        # 5. Application Management: POST /apps and POST /apps/<app_id>/...
+        # ----------------------------------------------------------------------
+        if path == "/apps" or path.startswith("/apps/"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+
+        if path == "/apps":
+            name = (body.get("name") or "").strip()
+            image = (body.get("image") or "").strip()
+            port = int(body.get("container_port") or body.get("port") or 8000)
+            target = (body.get("target") or "auto").strip()
+            env = body.get("env", {})
+            cpu_limit = str(body.get("cpu_limit", "0.5"))
+            memory_limit = str(body.get("memory_limit", "256m"))
+
+            if not name or not re.match(r'^[a-zA-Z0-9_-]+$', name):
+                self.send_json(400, {"error": "Invalid application name. Must contain only alphanumeric characters, dashes, and underscores."})
+                return
+
+            if not image or not re.match(r'^[a-zA-Z0-9_./:-]+$', image):
+                self.send_json(400, {"error": "Invalid Docker image reference."})
+                return
+
+            if not (1 <= port <= 65535):
+                self.send_json(400, {"error": "Invalid container port. Must be between 1 and 65535."})
+                return
+
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                # Check for duplicate name
+                for existing in apps_db.get("apps", {}).values():
+                    if existing.get("name") == name and existing.get("status") != "DELETED":
+                        self.send_json(409, {"error": f"Application with name '{name}' already exists."})
+                        return
+
+                try:
+                    host_port = allocate_host_port(apps_db)
+                except Exception as e:
+                    self.send_json(500, {"error": f"Failed to allocate host port: {e}"})
+                    return
+
+                app_id = f"app-{secrets.token_hex(6)}"
+                now_iso = get_current_iso_timestamp()
+
+                app_record = {
+                    "app_id": app_id,
+                    "id": app_id,
+                    "name": name,
+                    "image": image,
+                    "port": host_port,
+                    "container_port": port,
+                    "host_port": host_port,
+                    "target": target,
+                    "status": APP_STATE_CREATED,
+                    "selected_node": None,
+                    "container_id": f"ps-{name}",
+                    "env": env if isinstance(env, dict) else {},
+                    "cpu_limit": cpu_limit,
+                    "memory_limit": memory_limit,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                    "failure_reason": None,
+                    "error": None
+                }
+
+                apps_db.setdefault("apps", {})[app_id] = app_record
+                save_apps_db(apps_db)
+
+            print(f"[CONTROLLER] Created application '{name}' ({app_id}) on host port {host_port}")
+            self.send_json(201, {
+                "status": "created",
+                "app_id": app_id,
+                "app": app_record
+            })
+            return
+
+        if path.startswith("/apps/") and path.endswith("/deploy"):
+            app_id = path[6:-7].strip()
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app:
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                # Schedule onto Docker-capable node
+                nodes_db = load_nodes_db()
+                reqs = {"capabilities": ["container_runtime:docker"]}
+                decision = ResourceScheduler.select_node(reqs, nodes_db, self.heartbeat_timeout)
+
+                now_iso = get_current_iso_timestamp()
+
+                if not decision.get("selected_node"):
+                    reason = "No Docker-capable node is currently available in the cluster."
+                    app["status"] = APP_STATE_FAILED
+                    app["failure_reason"] = reason
+                    app["error"] = reason
+                    app["updated_at"] = now_iso
+                    save_apps_db(apps_db)
+                    print(f"[CONTROLLER-APP] Deployment of '{app['name']}' ({app_id}) failed: {reason}")
+                    self.send_json(400, {
+                        "error": reason,
+                        "status": APP_STATE_FAILED,
+                        "app": app,
+                        "scheduler": decision
+                    })
+                    return
+
+                selected_node = decision["selected_node"]
+                app["status"] = APP_STATE_DEPLOYING
+                app["selected_node"] = selected_node
+                app["updated_at"] = now_iso
+                app["error"] = None
+                save_apps_db(apps_db)
+
+                # Create docker-deploy job
+                job_id = f"job-{secrets.token_hex(6)}"
+                job_record = {
+                    "id": job_id,
+                    "job_id": job_id,
+                    "name": f"deploy-{app['name']}",
+                    "type": "docker-deploy",
+                    "parameters": {
+                        "app_id": app_id,
+                        "image": app["image"],
+                        "container_name": app.get("container_id") or f"ps-{app['name']}",
+                        "host_port": app["host_port"],
+                        "port": app["port"],
+                        "env": app.get("env", {}),
+                        "cpu_limit": app.get("cpu_limit", "0.5"),
+                        "memory_limit": app.get("memory_limit", "256m")
+                    },
+                    "requirements": reqs,
+                    "target": selected_node,
+                    "target_node": selected_node,
+                    "assigned_node": selected_node,
+                    "scheduler": {
+                        "mode": "resource-aware-docker",
+                        "selected_node": selected_node,
+                        "score": decision["score"],
+                        "reason": decision["reason"]
+                    },
+                    "timeout": 120,
+                    "max_attempts": 2,
+                    "attempt": 1,
+                    "claimed_at": None,
+                    "lease_expires_at": None,
+                    "created_at": now_iso,
+                    "started_at": None,
+                    "finished_at": None,
+                    "status": JOB_STATE_QUEUED,
+                    "state": JOB_STATE_QUEUED,
+                    "retry_reason": None,
+                    "attempts_history": [],
+                    "result": None
+                }
+
+                jobs_db = load_jobs_db()
+                jobs_db.setdefault("jobs", {})[job_id] = job_record
+                save_jobs_db(jobs_db)
+
+            print(f"[CONTROLLER] Queued docker-deploy job {job_id} for app '{app['name']}' to node '{selected_node}'")
+            self.send_json(200, {
+                "status": APP_STATE_DEPLOYING,
+                "app": app,
+                "job_id": job_id
+            })
+            return
+
+        if path.startswith("/apps/") and path.endswith("/stop"):
+            app_id = path[6:-5].strip()
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app:
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                target_node = app.get("selected_node")
+                if not target_node:
+                    app["status"] = APP_STATE_STOPPED
+                    save_apps_db(apps_db)
+                    self.send_json(200, {"status": "STOPPED", "app": app})
+                    return
+
+                app["status"] = APP_STATE_STOPPED
+                app["updated_at"] = get_current_iso_timestamp()
+                save_apps_db(apps_db)
+
+                # Queue docker-stop job
+                job_id = f"job-{secrets.token_hex(6)}"
+                job_record = {
+                    "id": job_id,
+                    "job_id": job_id,
+                    "name": f"stop-{app['name']}",
+                    "type": "docker-stop",
+                    "parameters": {
+                        "app_id": app_id,
+                        "container_name": app.get("container_id") or f"ps-{app['name']}"
+                    },
+                    "target": target_node,
+                    "target_node": target_node,
+                    "assigned_node": target_node,
+                    "timeout": 30,
+                    "max_attempts": 1,
+                    "attempt": 1,
+                    "created_at": get_current_iso_timestamp(),
+                    "status": JOB_STATE_QUEUED
+                }
+                jobs_db = load_jobs_db()
+                jobs_db.setdefault("jobs", {})[job_id] = job_record
+                save_jobs_db(jobs_db)
+
+            self.send_json(200, {"status": "STOPPED", "app": app, "job_id": job_id})
+            return
+
+        if path.startswith("/apps/") and path.endswith("/restart"):
+            app_id = path[6:-8].strip()
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app:
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                target_node = app.get("selected_node")
+                if not target_node:
+                    self.send_json(400, {"error": "Application is not deployed on any node."})
+                    return
+
+                app["status"] = APP_STATE_RUNNING
+                app["updated_at"] = get_current_iso_timestamp()
+                save_apps_db(apps_db)
+
+                job_id = f"job-{secrets.token_hex(6)}"
+                job_record = {
+                    "id": job_id,
+                    "job_id": job_id,
+                    "name": f"restart-{app['name']}",
+                    "type": "docker-restart",
+                    "parameters": {
+                        "app_id": app_id,
+                        "container_name": app.get("container_id") or f"ps-{app['name']}"
+                    },
+                    "target": target_node,
+                    "target_node": target_node,
+                    "assigned_node": target_node,
+                    "timeout": 30,
+                    "max_attempts": 1,
+                    "attempt": 1,
+                    "created_at": get_current_iso_timestamp(),
+                    "status": JOB_STATE_QUEUED
+                }
+                jobs_db = load_jobs_db()
+                jobs_db.setdefault("jobs", {})[job_id] = job_record
+                save_jobs_db(jobs_db)
+
+            self.send_json(200, {"status": "RUNNING", "app": app, "job_id": job_id})
+            return
+
+        # ----------------------------------------------------------------------
+        # 6. Cancel Job: POST /jobs/<job_id>/cancel
         # ----------------------------------------------------------------------
         if path.startswith("/jobs/") and path.endswith("/cancel"):
             job_id = path[6:-7].strip()
@@ -1043,7 +1480,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return
 
         # ----------------------------------------------------------------------
-        # 6. Node Removal: POST /nodes/<node_id>/remove
+        # 7. Node Removal: POST /nodes/<node_id>/remove
         # ----------------------------------------------------------------------
         if path.startswith("/nodes/") and path.endswith("/remove"):
             node_id = path[7:-7].strip()
@@ -1081,6 +1518,54 @@ class ControllerHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         token = self.parse_auth_token()
+
+        if path.startswith("/apps/"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+
+            app_id = path[6:].strip()
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app:
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                target_node = app.get("selected_node")
+                if target_node:
+                    job_id = f"job-{secrets.token_hex(6)}"
+                    job_record = {
+                        "id": job_id,
+                        "job_id": job_id,
+                        "name": f"remove-{app['name']}",
+                        "type": "docker-remove",
+                        "parameters": {
+                            "container_name": app.get("container_id") or f"ps-{app['name']}"
+                        },
+                        "target": target_node,
+                        "target_node": target_node,
+                        "assigned_node": target_node,
+                        "timeout": 30,
+                        "max_attempts": 1,
+                        "attempt": 1,
+                        "created_at": get_current_iso_timestamp(),
+                        "status": JOB_STATE_QUEUED
+                    }
+                    jobs_db = load_jobs_db()
+                    jobs_db.setdefault("jobs", {})[job_id] = job_record
+                    save_jobs_db(jobs_db)
+
+                del apps_db["apps"][app_id]
+                save_apps_db(apps_db)
+
+            print(f"[CONTROLLER] Deleted application '{app['name']}' ({app_id}). Released host port {app.get('host_port')}")
+            self.send_json(200, {
+                "status": "deleted",
+                "app_id": app_id,
+                "message": f"Application '{app['name']}' deleted."
+            })
+            return
 
         if path.startswith("/nodes/"):
             node_id = path[7:].strip()

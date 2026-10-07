@@ -40,6 +40,7 @@ function navigate() {
     nodes: { main: "Nodes", sub: "Cluster inventory & telemetry" },
     jobs: { main: "Jobs", sub: "Workload execution & lifecycle" },
     storage: { main: "Storage", sub: "Personal file manager" },
+    apps: { main: "Applications", sub: "Containerized application manager" },
     settings: { main: "Settings", sub: "Cluster configuration" }
   };
 
@@ -53,6 +54,8 @@ function navigate() {
   else if (hash === "jobs") loadJobs();
   else if (hash === "storage") {
     loadStorageNodes().then(() => loadStorage(currentPath, selectedStorageNode));
+  } else if (hash === "apps") {
+    loadApps();
   }
 }
 
@@ -111,9 +114,11 @@ function renderStatusPill(state) {
   if (s === "ONLINE" || s === "SUCCEEDED") {
     return `<span class="text-online">${s}</span>`;
   } else if (s === "RUNNING") {
-    return `<span class="text-warning">RUNNING</span>`;
-  } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING") {
+    return `<span class="text-online">RUNNING</span>`;
+  } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING" || s === "DEPLOYING" || s === "REMOVING") {
     return `<span class="text-warning">${s}</span>`;
+  } else if (s === "STOPPED" || s === "CREATED") {
+    return `<span class="cell-muted">${s}</span>`;
   } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED") {
     return `<span class="text-offline">${s}</span>`;
   } else if (s === "OFFLINE") {
@@ -492,6 +497,9 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
 });
 
 // 4. Storage View & Multi-Node Discovery
+let cachedStorageItems = [];
+let storageFilterQuery = "";
+
 async function loadStorageNodes() {
   try {
     const data = await apiFetch("/storage/nodes").catch(() => null);
@@ -514,8 +522,8 @@ async function loadStorageNodes() {
     }];
   }
 
-  const found = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
-  if (!found) {
+  // If no node selected, default to auto/local
+  if (!selectedStorageNode) {
     const localNode = cachedStorageNodes.find(n => n.is_local) || cachedStorageNodes[0];
     selectedStorageNode = localNode ? (localNode.name || localNode.node_id) : "vivo-y31";
   }
@@ -549,6 +557,34 @@ window.switchStorageNode = function(nodeNameOrId) {
   loadStorage("", selectedStorageNode);
 };
 
+// Toggle Advanced Location Bar
+document.getElementById("storage-adv-toggle-btn")?.addEventListener("click", () => {
+  const bar = document.getElementById("storage-node-bar");
+  if (bar) {
+    bar.style.display = (bar.style.display === "none" || !bar.style.display) ? "flex" : "none";
+  }
+});
+
+// Up button handler
+document.getElementById("storage-up-btn")?.addEventListener("click", () => {
+  if (!currentPath) return;
+  const parts = currentPath.split("/").filter(Boolean);
+  parts.pop();
+  const parentPath = parts.join("/");
+  loadStorage(parentPath, selectedStorageNode);
+});
+
+// Search / Filter input listener
+document.getElementById("storage-filter-input")?.addEventListener("input", (e) => {
+  storageFilterQuery = (e.target.value || "").trim().toLowerCase();
+  renderStorageTable();
+});
+
+// Refresh button
+document.getElementById("storage-refresh-btn")?.addEventListener("click", () => {
+  loadStorage(currentPath, selectedStorageNode);
+});
+
 async function loadStorage(path = "", node = selectedStorageNode) {
   updateLastRefreshed();
   currentPath = path;
@@ -560,29 +596,35 @@ async function loadStorage(path = "", node = selectedStorageNode) {
     node = selectedStorageNode;
   }
   const isLocal = !nodeObj || nodeObj.is_local;
-  const nodeDisplayName = nodeObj ? (nodeObj.name || nodeObj.node_id) : (node || "Local Node");
+  const nodeDisplayName = nodeObj ? (nodeObj.name || nodeObj.node_id) : (node || "vivo-y31");
+
+  // Update Up Button state
+  const upBtn = document.getElementById("storage-up-btn");
+  if (upBtn) {
+    upBtn.disabled = !currentPath;
+  }
 
   renderStorageNodePills();
-  renderBreadcrumbs(path, nodeDisplayName);
-
-  const rootPathEl = document.getElementById("storage-root-path");
-  if (rootPathEl) {
-    rootPathEl.textContent = isLocal ? "~/PersonalServer/storage (Local)" : `~/PersonalServer/storage on ${nodeDisplayName}`;
-  }
+  renderBreadcrumbs(path);
 
   const isOnline = (nodeObj?.status || "").toUpperCase() === "ONLINE";
   const actionsContainer = document.getElementById("storage-actions-container");
   if (actionsContainer) {
     if (isOnline) {
       actionsContainer.innerHTML = `
-        <input type="file" id="file-upload-input" style="display:none">
+        <input type="file" id="file-upload-input" style="display:none" multiple>
         <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
         <button id="create-folder-btn" class="btn btn-sm">New Folder</button>
       `;
       document.getElementById("upload-file-btn")?.addEventListener("click", () => {
         document.getElementById("file-upload-input")?.click();
       });
-      document.getElementById("file-upload-input")?.addEventListener("change", handleFileUpload);
+      document.getElementById("file-upload-input")?.addEventListener("change", (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          uploadFiles(e.target.files);
+          e.target.value = "";
+        }
+      });
       document.getElementById("create-folder-btn")?.addEventListener("click", handleCreateFolder);
     } else {
       actionsContainer.innerHTML = `
@@ -592,7 +634,7 @@ async function loadStorage(path = "", node = selectedStorageNode) {
   }
 
   const tbody = document.getElementById("storage-tbody");
-  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Loading ${nodeDisplayName} storage items...</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Loading storage items...</td></tr>`;
 
   try {
     const listUrl = isLocal 
@@ -600,60 +642,33 @@ async function loadStorage(path = "", node = selectedStorageNode) {
       : `/storage/list?node=${encodeURIComponent(node)}&path=${encodeURIComponent(path)}`;
 
     const data = await apiFetch(listUrl);
-    const items = data.items || [];
+    cachedStorageItems = data.items || [];
+    renderStorageTable();
 
-    if (items.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Folder is empty on ${nodeDisplayName}.</td></tr>`;
-    } else {
-      tbody.innerHTML = items.map(item => {
-        const itemRelPath = path ? `${path}/${item.name}` : item.name;
-        const isDir = item.is_dir;
-        const typeCategory = getFileTypeCategory(item.name, isDir);
-        const modStr = item.modified ? new Date(item.modified * 1000).toLocaleDateString() : "-";
-        const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
-
-        const downloadUrl = isLocal
-          ? `/storage/download?path=${encodeURIComponent(itemRelPath)}`
-          : `/storage/download?node=${encodeURIComponent(node)}&path=${encodeURIComponent(itemRelPath)}`;
-
-        return `
-          <tr>
-            <td>
-              ${isDir 
-                ? `<a href="javascript:void(0)" onclick="loadStorage('${itemRelPath}', '${node}')" style="font-weight: 600;">📁 ${item.name}</a>`
-                : `<span class="mono">${item.name}</span>`
-              }
-            </td>
-            <td class="cell-muted">${typeCategory}</td>
-            <td class="mono cell-muted">${sizeStr}</td>
-            <td class="mono cell-muted">${modStr}</td>
-            <td style="text-align: right;">
-              <div style="display: inline-flex; gap: 4px;">
-                ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download>Download</a>` : ''}
-                ${isOnline ? `<button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>` : ''}
-                ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>` : ''}
-              </div>
-            </td>
-          </tr>
-        `;
-      }).join("");
-    }
-
-    // Load usage stats for active node
+    // Load usage stats for storage summary
     const usageUrl = isLocal ? `/storage/usage` : `/storage/usage?node=${encodeURIComponent(node)}`;
     const usage = await apiFetch(usageUrl).catch(() => null);
     if (usage) {
       const freeStr = usage.disk?.available ? `${usage.disk.available} free` : (nodeObj?.storage?.available || "Available");
+      const totalStr = usage.disk?.total ? ` / ${usage.disk.total}` : "";
       const usedPct = usage.disk?.used_percent ? `${usage.disk.used_percent} used` : (nodeObj?.storage?.used_percent || "-");
-      document.getElementById("storage-footer-stats").textContent = 
-        `[${nodeDisplayName}] ${freeStr} · ${usedPct} · ${usage.files_count || 0} files · ${usage.folders_count || 0} folders`;
+      
+      const badgeEl = document.getElementById("storage-summary-badge");
+      if (badgeEl) {
+        badgeEl.textContent = `${freeStr}${totalStr}`;
+      }
+      
+      const footerEl = document.getElementById("storage-footer-stats");
+      if (footerEl) {
+        footerEl.textContent = `${freeStr} free · ${usedPct} · ${usage.files_count || 0} files · ${usage.folders_count || 0} folders`;
+      }
     }
 
   } catch (err) {
     tbody.innerHTML = `
       <tr>
         <td colspan="5" class="text-offline">
-          Unable to load storage on ${nodeDisplayName}: ${err.message}
+          Unable to load storage: ${err.message}
           <button class="btn btn-sm" style="margin-left: 10px;" onclick="loadStorage('${path}', '${node}')">Retry</button>
         </td>
       </tr>
@@ -661,12 +676,96 @@ async function loadStorage(path = "", node = selectedStorageNode) {
   }
 }
 
-function renderBreadcrumbs(path, nodeName = "vivo-y31") {
+function renderStorageTable() {
+  const tbody = document.getElementById("storage-tbody");
+  if (!tbody) return;
+
+  let items = cachedStorageItems;
+  if (storageFilterQuery) {
+    items = items.filter(i => (i.name || "").toLowerCase().includes(storageFilterQuery));
+  }
+
+  let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
+  const isLocal = !nodeObj || nodeObj.is_local;
+  const isOnline = (nodeObj?.status || "").toUpperCase() === "ONLINE";
+  const node = selectedStorageNode;
+
+  if (items.length === 0) {
+    if (storageFilterQuery) {
+      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted" style="text-align: center; padding: 24px;">No items match "${storageFilterQuery}".</td></tr>`;
+    } else {
+      tbody.innerHTML = `
+        <tr>
+          <td colspan="5" style="padding: 0;">
+            <div class="storage-empty-state">
+              <span class="storage-empty-title">This folder is empty.</span>
+              <div class="storage-empty-actions">
+                ${isOnline ? `<button class="btn btn-sm btn-primary" onclick="document.getElementById('file-upload-input')?.click()">Upload File</button>` : ''}
+                ${isOnline ? `<button class="btn btn-sm" onclick="handleCreateFolder()">New Folder</button>` : ''}
+              </div>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+    return;
+  }
+
+  // Sort directories first, then alphabetical
+  items.sort((a, b) => {
+    if (a.is_dir && !b.is_dir) return -1;
+    if (!a.is_dir && b.is_dir) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  tbody.innerHTML = items.map(item => {
+    const itemRelPath = currentPath ? `${currentPath}/${item.name}` : item.name;
+    const isDir = item.is_dir;
+    const typeCategory = getFileTypeCategory(item.name, isDir);
+    const modStr = item.modified ? new Date(item.modified * 1000).toLocaleDateString() : "-";
+    const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
+    const icon = isDir ? "📁" : "📄";
+
+    const downloadUrl = isLocal
+      ? `/storage/download?path=${encodeURIComponent(itemRelPath)}`
+      : `/storage/download?node=${encodeURIComponent(node)}&path=${encodeURIComponent(itemRelPath)}`;
+
+    const escapedPath = itemRelPath.replace(/'/g, "\\'");
+    const escapedName = item.name.replace(/'/g, "\\'");
+
+    return `
+      <tr>
+        <td>
+          <div class="file-name-cell">
+            <span class="file-icon">${icon}</span>
+            ${isDir 
+              ? `<a href="javascript:void(0)" onclick="loadStorage('${escapedPath}', '${node}')">${item.name}</a>`
+              : `<span class="mono">${item.name}</span>`
+            }
+          </div>
+        </td>
+        <td class="cell-muted">${typeCategory}</td>
+        <td class="mono cell-muted">${sizeStr}</td>
+        <td class="mono cell-muted">${modStr}</td>
+        <td style="text-align: right;">
+          <div style="display: inline-flex; gap: 4px;">
+            ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download>Download</a>` : ''}
+            ${isOnline ? `<button class="btn btn-sm" onclick="renameItem('${escapedPath}')">Rename</button>` : ''}
+            ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="deleteItem('${escapedPath}', ${isDir})">Delete</button>` : ''}
+            <button class="btn btn-sm" onclick="viewStorageProperties('${escapedPath}', ${isDir})">Properties</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function renderBreadcrumbs(path) {
   const container = document.getElementById("storage-breadcrumbs");
   if (!container) return;
 
   const parts = path ? path.split("/").filter(Boolean) : [];
-  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('', '${selectedStorageNode}')">[ ${nodeName} ] Home / storage</span>`;
+  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('', '${selectedStorageNode}')">Home</span>`;
 
   let accumulated = "";
   parts.forEach((p, index) => {
@@ -679,14 +778,39 @@ function renderBreadcrumbs(path, nodeName = "vivo-y31") {
   container.innerHTML = html;
 }
 
-// Upload file handler
-async function handleFileUpload(e) {
-  const files = e.target.files;
-  if (!files || files.length === 0) return;
-  const file = files[0];
+// Drag and Drop implementation
+const dropzone = document.getElementById("storage-dropzone");
+if (dropzone) {
+  ['dragenter', 'dragover'].forEach(eventName => {
+    dropzone.addEventListener(eventName, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropzone.classList.add('drag-active');
+    }, false);
+  });
 
-  const formData = new FormData();
-  formData.append("file", file);
+  ['dragleave', 'dragend'].forEach(eventName => {
+    dropzone.addEventListener(eventName, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropzone.classList.remove('drag-active');
+    }, false);
+  });
+
+  dropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.remove('drag-active');
+    const dt = e.dataTransfer;
+    if (dt && dt.files && dt.files.length > 0) {
+      uploadFiles(dt.files);
+    }
+  }, false);
+}
+
+// Upload file(s) helper
+async function uploadFiles(fileList) {
+  if (!fileList || fileList.length === 0) return;
 
   let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
   const isLocal = !nodeObj || nodeObj.is_local;
@@ -694,20 +818,27 @@ async function handleFileUpload(e) {
     ? `/storage/upload?path=${encodeURIComponent(currentPath)}`
     : `/storage/upload?node=${encodeURIComponent(selectedStorageNode)}&path=${encodeURIComponent(currentPath)}`;
 
-  try {
-    const res = await fetch(uploadUrl, {
-      method: "POST",
-      body: formData
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || res.statusText);
+  for (let i = 0; i < fileList.length; i++) {
+    const file = fileList[i];
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await fetch(uploadUrl, {
+        method: "POST",
+        body: formData
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || res.statusText);
+      }
+    } catch (err) {
+      alert(`Upload failed for "${file.name}": ${err.message}`);
+      break;
     }
-    e.target.value = "";
-    loadStorage(currentPath, selectedStorageNode);
-  } catch (err) {
-    alert("Upload failed: " + err.message);
   }
+
+  loadStorage(currentPath, selectedStorageNode);
 }
 
 // Create folder handler
@@ -781,5 +912,247 @@ window.deleteItem = async function(itemRelPath, isDir) {
   }
 };
 
+// View Storage Item Properties
+window.viewStorageProperties = function(itemRelPath, isDir) {
+  const itemName = itemRelPath.split("/").pop();
+  const item = cachedStorageItems.find(i => i.name === itemName);
+
+  const panel = document.getElementById("storage-properties-panel");
+  const title = document.getElementById("storage-props-title");
+  const grid = document.getElementById("storage-props-grid");
+
+  if (title) title.textContent = `Properties: ${itemName}`;
+
+  let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
+  const nodeName = nodeObj ? (nodeObj.name || nodeObj.node_id) : (selectedStorageNode || "vivo-y31");
+  const status = (nodeObj?.status || "ONLINE").toUpperCase();
+  const sizeStr = item ? (isDir ? "—" : formatBytes(item.size_bytes)) : "—";
+  const modStr = item?.modified ? new Date(item.modified * 1000).toLocaleString() : "-";
+  const typeStr = isDir ? "Folder" : getFileTypeCategory(itemName, false);
+  const physPath = `~/PersonalServer/storage/${itemRelPath}`;
+
+  grid.innerHTML = `
+    <div class="detail-item"><span class="detail-label">Name</span><span class="detail-value mono">${itemName}</span></div>
+    <div class="detail-item"><span class="detail-label">Type</span><span class="detail-value">${typeStr}</span></div>
+    <div class="detail-item"><span class="detail-label">Logical Path</span><span class="detail-value mono">Home/${itemRelPath}</span></div>
+    <div class="detail-item"><span class="detail-label">Size</span><span class="detail-value mono">${sizeStr}</span></div>
+    <div class="detail-item"><span class="detail-label">Modified</span><span class="detail-value mono">${modStr}</span></div>
+    <div class="detail-item"><span class="detail-label">Storage Node</span><span class="detail-value mono">${nodeName}</span></div>
+    <div class="detail-item"><span class="detail-label">Physical Path</span><span class="detail-value mono">${physPath}</span></div>
+    <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value text-online">${status === 'ONLINE' ? 'Healthy' : status}</span></div>
+  `;
+
+  panel.style.display = "block";
+  panel.scrollIntoView({ behavior: "smooth" });
+};
+
+window.closeStorageProperties = function() {
+  const panel = document.getElementById("storage-properties-panel");
+  if (panel) panel.style.display = "none";
+};
+
+// ==========================================
+// 5. Applications Logic
+// ==========================================
+
+let cachedApps = [];
+let currentLogAppId = null;
+
+async function loadApps() {
+  const tbody = document.getElementById("apps-tbody");
+  const countHeader = document.getElementById("apps-count-header");
+  const targetSelect = document.getElementById("app-target");
+
+  try {
+    const res = await apiFetch("/api/apps");
+    cachedApps = res.apps || [];
+    
+    if (countHeader) {
+      countHeader.textContent = `${cachedApps.length} application${cachedApps.length === 1 ? '' : 's'}`;
+    }
+
+    // Populate node targets in create form
+    if (targetSelect) {
+      const nodesRes = await apiFetch("/api/nodes").catch(() => ({ nodes: [] }));
+      const nodes = nodesRes.nodes || [];
+      const currentVal = targetSelect.value || "auto";
+      targetSelect.innerHTML = `<option value="auto">Auto (Scheduler)</option>` +
+        nodes.map(n => `<option value="${n.name || n.node_id}">${n.name || n.node_id} (${n.status})</option>`).join("");
+      targetSelect.value = currentVal;
+    }
+
+    if (cachedApps.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6" class="cell-muted" style="text-align:center; padding: 20px;">No applications created yet. Use the form above to create one.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = cachedApps.map(app => {
+      const statusPill = renderStatusPill(app.status);
+      const hostPort = app.port || "-";
+      const contPort = app.container_port || "-";
+      const portDisplay = hostPort !== "-" ? `${hostPort}:${contPort}` : `${contPort}`;
+      const nodeDisplay = app.selected_node || app.target || "auto";
+      const failureNote = app.failure_reason ? `<div class="cell-muted mono" style="font-size: 10px; color: var(--status-red);">${escapeHtml(app.failure_reason)}</div>` : '';
+
+      const canDeploy = ["CREATED", "STOPPED", "FAILED"].includes(app.status);
+      const canStop = ["RUNNING"].includes(app.status);
+      const canRestart = ["RUNNING", "STOPPED"].includes(app.status);
+
+      return `
+        <tr>
+          <td>
+            <span class="mono" style="font-weight: 600;">${escapeHtml(app.name)}</span>
+            <div class="cell-muted mono" style="font-size: 10px;">${escapeHtml(app.app_id)}</div>
+          </td>
+          <td>
+            ${statusPill}
+            ${failureNote}
+          </td>
+          <td class="mono">${escapeHtml(nodeDisplay)}</td>
+          <td class="mono cell-muted" title="${escapeHtml(app.image)}">${escapeHtml(app.image)}</td>
+          <td class="mono">${portDisplay}</td>
+          <td style="text-align: right;">
+            <div style="display: inline-flex; gap: 4px;">
+              ${canDeploy ? `<button class="btn btn-sm btn-primary" onclick="deployApp('${app.app_id}')">Deploy</button>` : ''}
+              ${canStop ? `<button class="btn btn-sm" onclick="stopApp('${app.app_id}')">Stop</button>` : ''}
+              ${canRestart ? `<button class="btn btn-sm" onclick="restartApp('${app.app_id}')">Restart</button>` : ''}
+              <button class="btn btn-sm" onclick="viewAppLogs('${app.app_id}')">Logs</button>
+              <button class="btn btn-sm btn-danger" onclick="deleteApp('${app.app_id}')">Delete</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join("");
+
+    updateLastRefreshed();
+  } catch (err) {
+    console.error("Failed to load apps:", err);
+    tbody.innerHTML = `<tr><td colspan="6" class="text-offline">Error loading applications: ${err.message}</td></tr>`;
+  }
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Create Application
+document.getElementById("app-create-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const nameInput = document.getElementById("app-name");
+  const imageInput = document.getElementById("app-image");
+  const portInput = document.getElementById("app-container-port");
+  const targetSelect = document.getElementById("app-target");
+
+  const name = nameInput.value.trim();
+  const image = imageInput.value.trim();
+  const containerPort = parseInt(portInput.value, 10);
+  const target = targetSelect.value || "auto";
+
+  try {
+    await apiFetch("/api/apps", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        image,
+        container_port: containerPort,
+        target
+      })
+    });
+    nameInput.value = "";
+    imageInput.value = "";
+    portInput.value = "8000";
+    loadApps();
+  } catch (err) {
+    alert("Failed to create application: " + err.message);
+  }
+});
+
+window.deployApp = async function(appId) {
+  try {
+    const res = await apiFetch(`/api/apps/${appId}/deploy`, { method: "POST" });
+    if (res.app && res.app.status === "FAILED") {
+      alert(`Deployment rejected: ${res.app.failure_reason}`);
+    }
+    loadApps();
+  } catch (err) {
+    alert("Deploy error: " + err.message);
+    loadApps();
+  }
+};
+
+window.stopApp = async function(appId) {
+  try {
+    await apiFetch(`/api/apps/${appId}/stop`, { method: "POST" });
+    loadApps();
+  } catch (err) {
+    alert("Stop error: " + err.message);
+    loadApps();
+  }
+};
+
+window.restartApp = async function(appId) {
+  try {
+    await apiFetch(`/api/apps/${appId}/restart`, { method: "POST" });
+    loadApps();
+  } catch (err) {
+    alert("Restart error: " + err.message);
+    loadApps();
+  }
+};
+
+window.deleteApp = async function(appId) {
+  const app = cachedApps.find(a => a.app_id === appId);
+  const name = app ? app.name : appId;
+  if (!confirm(`Are you sure you want to permanently delete application "${name}"?`)) return;
+
+  try {
+    await apiFetch(`/api/apps/${appId}`, { method: "DELETE" });
+    if (currentLogAppId === appId) closeAppLogs();
+    loadApps();
+  } catch (err) {
+    alert("Delete error: " + err.message);
+    loadApps();
+  }
+};
+
+window.viewAppLogs = async function(appId) {
+  currentLogAppId = appId;
+  const panel = document.getElementById("app-logs-panel");
+  const title = document.getElementById("app-logs-title");
+  const stdout = document.getElementById("app-logs-stdout");
+
+  const app = cachedApps.find(a => a.app_id === appId);
+  const appName = app ? app.name : appId;
+
+  title.textContent = `Application Logs: ${appName} (${appId})`;
+  stdout.textContent = "Loading logs...";
+  panel.style.display = "block";
+  panel.scrollIntoView({ behavior: "smooth" });
+
+  try {
+    const res = await apiFetch(`/api/apps/${appId}/logs`);
+    stdout.textContent = res.logs || "(No log output recorded)";
+  } catch (err) {
+    stdout.textContent = `Error fetching logs: ${err.message}`;
+  }
+};
+
+document.getElementById("app-logs-refresh-btn")?.addEventListener("click", () => {
+  if (currentLogAppId) viewAppLogs(currentLogAppId);
+});
+
+window.closeAppLogs = function() {
+  currentLogAppId = null;
+  const panel = document.getElementById("app-logs-panel");
+  if (panel) panel.style.display = "none";
+};
+
 // Initialize
 navigate();
+

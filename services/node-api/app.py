@@ -1021,6 +1021,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed to delete item: {e}"})
             return
 
+        # Proxy /api/ DELETE requests (e.g. DELETE /api/apps/<app_id>) to controller
+        if path.startswith("/api/"):
+            subpath = path[4:]
+            self.proxy_to_controller("DELETE", subpath, parsed.query)
+            return
+
         self.send_json(404, {"error": "Endpoint not found"})
 
     def log_message(self, format, *args):

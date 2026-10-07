@@ -444,13 +444,27 @@ a:hover {
   align-items: baseline;
   gap: 10px;
 }
-.storage-root-path {
-  font-size: 12px;
+.storage-summary-badge {
+  font-size: 11px;
   color: var(--text-muted);
+}
+.storage-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .storage-actions {
   display: flex;
   gap: 6px;
+}
+.storage-filter-wrap {
+  width: 160px;
+}
+.form-input-sm {
+  height: 24px;
+  padding: 2px 8px;
+  font-size: 11px;
 }
 
 /* Storage Multi-Node Switcher */
@@ -511,11 +525,22 @@ a:hover {
   font-family: var(--font-mono);
 }
 
-.storage-breadcrumbs {
+/* Breadcrumbs & Navigation Bar */
+.storage-nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 6px 12px;
   border-bottom: 1px solid var(--border-color);
   background-color: rgba(0, 0, 0, 0.25);
+}
+.storage-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   font-size: 12px;
+  overflow-x: auto;
+  white-space: nowrap;
 }
 .crumb {
   color: var(--link-color);
@@ -530,6 +555,52 @@ a:hover {
   cursor: default;
   text-decoration: none;
 }
+
+/* Dropzone & Drag State */
+.storage-dropzone {
+  position: relative;
+  min-height: 180px;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.storage-dropzone.drag-active {
+  background-color: rgba(88, 166, 255, 0.08);
+  outline: 2px dashed var(--border-focus);
+  outline-offset: -2px;
+}
+
+/* Empty Folder State */
+.storage-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 36px 16px;
+  gap: 12px;
+  color: var(--text-muted);
+}
+.storage-empty-title {
+  font-size: 13px;
+}
+.storage-empty-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* File / Folder Row Items */
+.file-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.file-name-cell a {
+  font-weight: 500;
+}
+.file-icon {
+  display: inline-block;
+  font-size: 13px;
+  line-height: 1;
+}
+
 .storage-footer {
   padding: 8px 12px;
   font-size: 11px;

@@ -135,6 +135,15 @@ def discover_hardware(base_dir=BASE_DIR):
     arch = platform.machine() or run_cmd("uname -m") or "unknown"
     hostname = socket.gethostname() or run_cmd("hostname") or "node"
 
+    # Capability probing: Docker is true ONLY if daemon is reachable
+    capabilities = {
+        "compute": True,
+        "storage": True,
+        "network": True
+    }
+    if is_docker_available():
+        capabilities["container_runtime:docker"] = True
+
     return {
         "name": hostname,
         "role": "compute",
@@ -144,12 +153,26 @@ def discover_hardware(base_dir=BASE_DIR):
         "cpu_cores": cpu_cores,
         "ram_mb": ram_mb,
         "storage_gb": storage_gb,
-        "capabilities": {
-            "compute": True,
-            "storage": True,
-            "network": True
-        }
+        "capabilities": capabilities
     }
+
+
+def is_docker_available():
+    """
+    Checks if Docker binary exists AND Docker daemon is actively responding.
+    Returns True only if docker info connects to a running engine.
+    """
+    try:
+        res = subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+            text=True
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
 
 
 def generate_node_id():
@@ -180,6 +203,14 @@ def load_node_config():
         except Exception as e:
             print(f"Warning: Failed to read {NODE_CONF}: {e}", file=sys.stderr)
 
+    default_caps = {
+        "compute": True,
+        "storage": True,
+        "network": True
+    }
+    if is_docker_available():
+        default_caps["container_runtime:docker"] = True
+
     return {
         "node_id": config.get("node_id", "unknown"),
         "name": config.get("name", config.get("node_name", run_cmd("hostname") or "localhost")),
@@ -190,11 +221,7 @@ def load_node_config():
         "cpu_cores": int(config.get("cpu_cores", run_cmd("nproc") or 1)),
         "ram_mb": int(config.get("ram_mb", 0)),
         "storage_gb": int(config.get("storage_gb", 0)),
-        "capabilities": config.get("capabilities", {
-            "compute": True,
-            "storage": True,
-            "network": True
-        })
+        "capabilities": config.get("capabilities", default_caps)
     }
 
 
