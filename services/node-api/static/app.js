@@ -1495,7 +1495,7 @@ function renderAppOverview(app) {
     <div class="sys-kv-row"><span class="sys-kv-k">Assigned Node</span><span class="sys-kv-v">${escapeHtml(app.selected_node || 'Pending scheduler')}</span></div>
     <div class="sys-kv-row"><span class="sys-kv-k">Host / Container Port</span><span class="sys-kv-v">${app.host_port || app.port || '-'}:${app.container_port || 8000}</span></div>
     <div class="sys-kv-row"><span class="sys-kv-k">Public Route</span><span class="sys-kv-v">${routePath !== '-' ? `<a href="${publicUrl}" target="_blank" class="text-online">${publicUrl}</a>` : 'Disabled'}</span></div>
-    <div class="sys-kv-row"><span class="sys-kv-k">Container ID</span><span class="sys-kv-v">${escapeHtml(app.container_id || f"ps-{app.name}")}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Container ID</span><span class="sys-kv-v">${escapeHtml(app.container_id || `ps-${app.name}`)}</span></div>
     <div class="sys-kv-row"><span class="sys-kv-k">Resource Limits</span><span class="sys-kv-v">${escapeHtml(app.cpu_limit || '0.5')} CPU · ${escapeHtml(app.memory_limit || '256m')} RAM</span></div>
     <div class="sys-kv-row"><span class="sys-kv-k">Created At</span><span class="sys-kv-v cell-muted">${escapeHtml(app.created_at || '-')}</span></div>
   `;
