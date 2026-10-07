@@ -712,10 +712,9 @@ async function loadStorage(path = "", node = selectedStorageNode, pushHistory = 
 
     const filesCount = cachedStorageItems.filter(i => !i.is_dir).length;
     const foldersCount = cachedStorageItems.filter(i => i.is_dir).length;
-    const totalCount = cachedStorageItems.length;
 
     if (leftStats) {
-      leftStats.textContent = `${totalCount} item${totalCount === 1 ? '' : 's'} (${filesCount} file${filesCount === 1 ? '' : 's'}, ${foldersCount} folder${foldersCount === 1 ? '' : 's'})`;
+      leftStats.textContent = `${filesCount} file${filesCount === 1 ? '' : 's'} · ${foldersCount} folder${foldersCount === 1 ? '' : 's'}`;
     }
 
     if (usage && usage.disk) {
@@ -747,6 +746,13 @@ function renderStorageTable() {
   let items = cachedStorageItems;
   if (storageFilterQuery) {
     items = items.filter(i => (i.name || "").toLowerCase().includes(storageFilterQuery));
+  }
+
+  const leftStats = document.getElementById("storage-footer-stats-left");
+  if (leftStats) {
+    const filesCount = items.filter(i => !i.is_dir).length;
+    const foldersCount = items.filter(i => i.is_dir).length;
+    leftStats.textContent = `${filesCount} file${filesCount === 1 ? '' : 's'} · ${foldersCount} folder${foldersCount === 1 ? '' : 's'}`;
   }
 
   let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);

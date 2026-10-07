@@ -422,13 +422,12 @@ a:hover {
 .form-input:focus {
   border-color: var(--border-focus);
 }
-.form-btn-cell {
-  justify-content: flex-end;
-}
 .form-btn-cell .btn {
   height: 28px;
+}
+
 /* Windows File Explorer Container & Layout */
-.explorer-container {
+.explorer-frame {
   display: flex;
   flex-direction: column;
   background-color: var(--bg-panel);
@@ -441,19 +440,30 @@ a:hover {
 .explorer-toolbar {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   padding: 6px 10px;
   background-color: var(--bg-panel-header);
   border-bottom: 1px solid var(--border-color);
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+.explorer-nav-group-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
 }
 
 .explorer-nav-buttons {
   display: inline-flex;
   gap: 2px;
+  flex-shrink: 0;
 }
 
-.explorer-btn {
+.explorer-icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -467,14 +477,15 @@ a:hover {
   cursor: pointer;
   padding: 0;
   line-height: 1;
+  flex-shrink: 0;
 }
 
-.explorer-btn:hover:not(:disabled) {
+.explorer-icon-btn:hover:not(:disabled) {
   background-color: var(--bg-active);
   border-color: var(--text-dim);
 }
 
-.explorer-btn:disabled {
+.explorer-icon-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
   color: var(--text-muted);
@@ -483,7 +494,7 @@ a:hover {
 /* 2. Windows Explorer Address Bar */
 .explorer-address-bar {
   flex: 1;
-  min-width: 220px;
+  min-width: 140px;
   height: 26px;
   background-color: var(--bg-input);
   border: 1px solid var(--border-color);
@@ -492,15 +503,17 @@ a:hover {
   align-items: center;
   padding: 0 8px;
   gap: 6px;
+  overflow: hidden;
 }
 
 .explorer-address-bar:focus-within {
   border-color: var(--border-focus);
 }
 
-.explorer-address-icon {
+.explorer-bar-icon {
   font-size: 12px;
-  opacity: 0.85;
+  color: var(--text-dim);
+  flex-shrink: 0;
 }
 
 .storage-breadcrumbs {
@@ -532,76 +545,98 @@ a:hover {
   cursor: default;
 }
 
-.explorer-location-dropdown {
-  margin-left: auto;
-  flex-shrink: 0;
-}
-
-.explorer-node-select {
-  height: 22px;
-  padding: 1px 6px;
-  font-size: 11px;
-  background-color: transparent;
-  border: 1px solid transparent;
-  color: var(--text-muted);
-}
-
-.explorer-node-select:hover, .explorer-node-select:focus {
-  background-color: var(--bg-active);
-  border-color: var(--border-color);
-  color: var(--text-main);
-}
-
 /* 3. Actions & Search Bar */
-.explorer-actions-bar {
+.explorer-nav-group-right {
   display: flex;
   align-items: center;
   gap: 6px;
-}
-
-.explorer-search-wrap {
-  width: 150px;
-}
-
-.explorer-search-wrap input {
-  height: 26px;
-  font-size: 11px;
-}
-
-/* 4. Explorer Workspace: Split Navigation Pane + Main Content */
-.explorer-workspace {
-  display: flex;
-  min-height: 420px;
-}
-
-.explorer-nav-pane {
-  width: 170px;
-  min-width: 170px;
-  background-color: var(--bg-sidebar);
-  border-right: 1px solid var(--border-color);
-  padding: 10px 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
   flex-shrink: 0;
 }
 
-.explorer-nav-group {
+.explorer-search-box {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  position: relative;
+  width: 140px;
 }
 
-.explorer-nav-header {
+.explorer-search-box .search-icon {
+  position: absolute;
+  left: 6px;
+  font-size: 10px;
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.explorer-search-box input {
+  padding-left: 20px;
+  height: 26px;
+  font-size: 11px;
+  width: 100%;
+}
+
+.storage-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.storage-actions .btn {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.explorer-node-picker {
+  display: flex;
+  align-items: center;
+}
+
+.explorer-node-select {
+  height: 26px;
+  padding: 0 6px;
+  font-size: 11px;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  border-radius: var(--radius);
+}
+
+.explorer-node-select:hover, .explorer-node-select:focus {
+  border-color: var(--border-focus);
+}
+
+/* 4. Explorer Workspace: Split Navigation Pane + Main Content */
+.explorer-body {
+  display: flex;
+  min-height: 440px;
+}
+
+.explorer-sidebar {
+  width: 175px;
+  min-width: 175px;
+  max-width: 175px;
+  background-color: var(--bg-sidebar);
+  border-right: 1px solid var(--border-color);
+  padding: 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.explorer-section-title {
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--text-dim);
-  padding: 2px 8px 4px 8px;
+  padding: 4px 6px 2px 6px;
 }
 
-.explorer-shortcuts, .explorer-node-list {
+.explorer-shortcuts, .explorer-node-tree {
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -631,14 +666,19 @@ a:hover {
   font-weight: 600;
 }
 
-.shortcut-icon {
+.shortcut-glyph {
   font-size: 12px;
   width: 14px;
   text-align: center;
+  color: var(--text-dim);
+}
+
+.explorer-shortcut.active .shortcut-glyph {
+  color: var(--text-main);
 }
 
 /* 5. Main Content Pane & Details Table */
-.explorer-content-pane {
+.explorer-main {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -646,7 +686,7 @@ a:hover {
   background-color: var(--bg-panel);
 }
 
-.explorer-table-wrap {
+.explorer-table-container {
   flex: 1;
   max-height: 520px;
   overflow-y: auto;
@@ -657,9 +697,17 @@ a:hover {
   border-collapse: collapse;
 }
 
+.explorer-table th {
+  position: sticky;
+  top: 0;
+  background-color: var(--bg-panel-header);
+  z-index: 1;
+}
+
 .explorer-table tbody tr {
   cursor: pointer;
   user-select: none;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .explorer-table tbody tr:hover {
@@ -684,12 +732,13 @@ a:hover {
   font-size: 13px;
   width: 16px;
   text-align: center;
+  flex-shrink: 0;
 }
 
 .explorer-row-actions {
   display: inline-flex;
   gap: 4px;
-  opacity: 0.35;
+  opacity: 0;
   transition: opacity 0.1s ease;
 }
 
@@ -698,15 +747,31 @@ a:hover {
   opacity: 1;
 }
 
+.explorer-row-actions .btn {
+  padding: 1px 6px;
+  font-size: 11px;
+  height: 20px;
+  line-height: 1;
+}
+
 /* 6. Explorer Status Bar */
-.explorer-status-bar {
+.explorer-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 4px 12px;
+  padding: 5px 12px;
   background-color: var(--bg-panel-header);
   border-top: 1px solid var(--border-color);
   font-size: 11px;
+}
+
+.storage-badge-ro {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: var(--radius);
+  background-color: rgba(248, 81, 73, 0.15);
+  color: #f85149;
+  border: 1px solid rgba(248, 81, 73, 0.4);
 }
 
 /* Dropzone & Drag State */
