@@ -13,6 +13,8 @@ from pathlib import Path
 
 # Centralized Node State Constants
 STATE_ONLINE = "ONLINE"
+STATE_DRAINING = "DRAINING"
+STATE_DEBOARDING = "DEBOARDING"
 STATE_OFFLINE = "OFFLINE"
 STATE_UNHEALTHY = "UNHEALTHY"
 STATE_REMOVED = "REMOVED"
@@ -118,6 +120,10 @@ def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
         services = last_hb.get("services", {})
         if services and any(v in ("unresponsive", "degraded", "stopped") for v in services.values()):
             return STATE_UNHEALTHY
+
+        node_status = node.get("status")
+        if node_status in (STATE_DRAINING, STATE_DEBOARDING):
+            return node_status
 
         return STATE_ONLINE
     except Exception:
@@ -295,8 +301,15 @@ class ResourceScheduler:
             # 1. Eligibility Check (Liveness & Subsystems)
             # ------------------------------------------------------------------
             liveness = compute_node_liveness(node, timeout_seconds)
-            if liveness == STATE_REMOVED:
+            node_status = node.get("status")
+            if liveness == STATE_REMOVED or node_status == STATE_REMOVED:
                 rejected[node_id] = "Node is REMOVED from cluster"
+                continue
+            if liveness == STATE_DRAINING or node_status == STATE_DRAINING:
+                rejected[node_id] = "Node is DRAINING (no new workloads accepted)"
+                continue
+            if liveness == STATE_DEBOARDING or node_status == STATE_DEBOARDING:
+                rejected[node_id] = "Node is DEBOARDING (no new workloads accepted)"
                 continue
             if liveness == STATE_OFFLINE:
                 rejected[node_id] = "Node is OFFLINE (heartbeat timeout exceeded)"

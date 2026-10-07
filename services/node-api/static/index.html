@@ -256,7 +256,10 @@
         <div id="node-detail-panel" class="section-card" style="display:none">
           <div class="section-header">
             <span class="section-title" id="node-detail-title">Node Details</span>
-            <button class="btn btn-sm" onclick="closeNodeDetail()">Close</button>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <span id="node-lifecycle-actions" style="display: inline-flex; gap: 6px;"></span>
+              <button class="btn btn-sm" onclick="closeNodeDetail()">Close</button>
+            </div>
           </div>
           <div class="detail-content">
             <div class="detail-grid mono" id="node-detail-grid">

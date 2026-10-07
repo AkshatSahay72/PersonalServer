@@ -830,7 +830,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             return
 
         # 8c. Cluster Utilization and Cluster Info Proxy
-        if path == "/cluster/utilization" or path == "/cluster" or path.startswith("/cluster/"):
+        if path in ("/cluster/utilization", "/cluster", "/nodes") or path.startswith("/cluster/") or path.startswith("/nodes/"):
             self.proxy_to_controller("GET", path, parsed.query)
             return
 
@@ -1060,9 +1060,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Rename failed: {e}"})
             return
 
-        # 4. Proxy Job Submission to Controller: POST /api/jobs
-        if path.startswith("/api/"):
-            subpath = path[4:]
+        # 4. Proxy Job Submission and Node Lifecycle to Controller: POST /api/* or POST /nodes/*
+        if path.startswith("/api/") or path.startswith("/nodes/"):
+            subpath = path[4:] if path.startswith("/api/") else path
             content_len = int(self.headers.get("Content-Length", 0))
             body_bytes = self.rfile.read(content_len) if content_len > 0 else None
             self.proxy_to_controller("POST", subpath, parsed.query, body_bytes)
@@ -1125,9 +1125,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed to delete item: {e}"})
             return
 
-        # Proxy /api/ DELETE requests (e.g. DELETE /api/apps/<app_id>) to controller
-        if path.startswith("/api/"):
-            subpath = path[4:]
+        # Proxy /api/ DELETE requests (e.g. DELETE /api/apps/<app_id>) and /nodes/ to controller
+        if path.startswith("/api/") or path.startswith("/nodes/"):
+            subpath = path[4:] if path.startswith("/api/") else path
             self.proxy_to_controller("DELETE", subpath, parsed.query)
             return
 

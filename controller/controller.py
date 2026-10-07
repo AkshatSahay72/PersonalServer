@@ -99,6 +99,8 @@ def resolve_safe_app_storage_path(app_id, rel_path=""):
 # Centralized Node State Constants
 STATE_REGISTERING = "REGISTERING"
 STATE_ONLINE = "ONLINE"
+STATE_DRAINING = "DRAINING"
+STATE_DEBOARDING = "DEBOARDING"
 STATE_OFFLINE = "OFFLINE"
 STATE_UNHEALTHY = "UNHEALTHY"
 STATE_UNKNOWN = "UNKNOWN"
@@ -756,9 +758,175 @@ def sanitize_node_record(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
     return node_copy
 
 
+def inspect_node_storage_safety(node_id, node_entry, associated_apps):
+    """
+    Inspects PersonalServer-managed storage for the given node.
+    Returns (used_bytes, files_count).
+    Does NOT scan arbitrary system directories.
+    Only inspects PersonalServer-managed storage roots:
+    - storage/applications/<app_id>
+    - storage/<node_id> or storage/nodes/<node_id>
+    - storage/ (excluding application and system files)
+    """
+    total_bytes = 0
+    total_files = 0
+
+    # Explicit simulation / mock support in tests
+    if "storage_files_count" in node_entry:
+        total_files += int(node_entry.get("storage_files_count", 0))
+    if "storage_used_bytes" in node_entry:
+        total_bytes += int(node_entry.get("storage_used_bytes", 0))
+
+    # 1. Associated application storage
+    for aid, app in associated_apps:
+        app_dir = APP_STORAGE_ROOT / aid
+        if app_dir.exists() and app_dir.is_dir():
+            for root, dirs, files in os.walk(app_dir):
+                for f in files:
+                    if f == ".gitkeep":
+                        continue
+                    fp = os.path.join(root, f)
+                    try:
+                        total_bytes += os.path.getsize(fp)
+                        total_files += 1
+                    except Exception:
+                        pass
+
+    # 2. Node-specific storage folders
+    for folder_name in (node_id, f"nodes/{node_id}"):
+        nd = BASE_DIR / "storage" / folder_name
+        if nd.exists() and nd.is_dir():
+            for root, dirs, files in os.walk(nd):
+                for f in files:
+                    if f == ".gitkeep":
+                        continue
+                    fp = os.path.join(root, f)
+                    try:
+                        total_bytes += os.path.getsize(fp)
+                        total_files += 1
+                    except Exception:
+                        pass
+
+    # 3. Local node check
+    config_file = CONFIG_DIR / "node.conf"
+    local_id = None
+    if config_file.exists():
+        try:
+            for line in config_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith("NODE_ID="):
+                    local_id = line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+    is_local = (local_id and local_id == node_id) or (node_entry.get("is_local") is True)
+    if is_local:
+        gen_storage = BASE_DIR / "storage"
+        if gen_storage.exists() and gen_storage.is_dir():
+            for root, dirs, files in os.walk(gen_storage):
+                rel = os.path.relpath(root, gen_storage)
+                if rel == "applications" or rel.startswith("applications" + os.sep):
+                    continue
+                if rel == "nodes" or rel.startswith("nodes" + os.sep):
+                    continue
+                if rel == node_id or rel.startswith(node_id + os.sep):
+                    continue
+                for f in files:
+                    if f == ".gitkeep":
+                        continue
+                    fp = os.path.join(root, f)
+                    try:
+                        total_bytes += os.path.getsize(fp)
+                        total_files += 1
+                    except Exception:
+                        pass
+
+    return total_bytes, total_files
+
+
+def evaluate_node_deboarding_safety(node_id, nodes_db=None, jobs_db=None, apps_db=None):
+    """
+    Evaluates whether a node can safely be deboarded and removed.
+    Returns dictionary with state, can_remove boolean, blockers list, and workload/storage counts.
+    """
+    if nodes_db is None:
+        nodes_db = load_nodes_db()
+    if jobs_db is None:
+        jobs_db = load_jobs_db()
+    if apps_db is None:
+        apps_db = load_apps_db()
+
+    node_entry = nodes_db.get("nodes", {}).get(node_id)
+    if not node_entry:
+        return {
+            "node_id": node_id,
+            "state": "NOT_FOUND",
+            "can_remove": False,
+            "blockers": [f"Node '{node_id}' does not exist in cluster."],
+            "active_jobs": 0,
+            "applications": 0,
+            "storage_used_gb": 0.0,
+            "storage_used_bytes": 0,
+            "storage_files_count": 0
+        }
+
+    current_state = node_entry.get("status", STATE_UNKNOWN)
+    blockers = []
+
+    # 1. Evaluate Active / In-progress Jobs
+    active_jobs = []
+    for jid, job in jobs_db.get("jobs", {}).items():
+        if job.get("target_node") == node_id:
+            st = job.get("status")
+            if st in (JOB_STATE_CLAIMED, JOB_STATE_RUNNING):
+                active_jobs.append(jid)
+    active_jobs_count = len(active_jobs)
+    if active_jobs_count > 0:
+        blockers.append(f"{active_jobs_count} running/claimed job(s) in progress")
+
+    # 2. Evaluate Associated Applications
+    active_apps = []
+    all_associated_apps = []
+    for aid, app in apps_db.get("apps", {}).items():
+        if app.get("selected_node") == node_id or app.get("target_node") == node_id:
+            all_associated_apps.append((aid, app))
+            if app.get("status") in (APP_STATE_RUNNING, APP_STATE_DEPLOYING, "BUILDING", "STARTING"):
+                active_apps.append(app.get("name") or aid)
+
+    apps_count = len(all_associated_apps)
+    if active_apps:
+        blockers.append(f"Cannot deboard node: active applications depend on this node ({', '.join(active_apps)}).")
+
+    # 3. Evaluate Storage Data
+    storage_used_bytes, storage_files_count = inspect_node_storage_safety(node_id, node_entry, all_associated_apps)
+    storage_used_gb = round(storage_used_bytes / (1024 ** 3), 2)
+    if storage_files_count > 0 or storage_used_bytes > 0:
+        blockers.append(
+            f"Cannot deboard node: storage contains data that has not been migrated ({storage_files_count} file(s), {storage_used_gb} GB in use)."
+        )
+
+    # 4. State requirement: Node must be in DEBOARDING state before final removal
+    if current_state != STATE_DEBOARDING:
+        blockers.append(f"Node must be in DEBOARDING state before final removal (currently {current_state}).")
+
+    can_remove = (len(blockers) == 0)
+
+    return {
+        "node_id": node_id,
+        "state": current_state,
+        "can_remove": can_remove,
+        "blockers": blockers,
+        "active_jobs": active_jobs_count,
+        "applications": apps_count,
+        "storage_used_gb": storage_used_gb,
+        "storage_used_bytes": storage_used_bytes,
+        "storage_files_count": storage_files_count
+    }
+
+
 def get_cluster_summary(db, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
     nodes = db.get("nodes", {})
     online_count = 0
+    draining_count = 0
+    deboarding_count = 0
     offline_count = 0
     unhealthy_count = 0
     removed_count = 0
@@ -770,6 +938,12 @@ def get_cluster_summary(db, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
         st = s_node["status"]
         if st == STATE_ONLINE:
             online_count += 1
+            active_count += 1
+        elif st == STATE_DRAINING:
+            draining_count += 1
+            active_count += 1
+        elif st == STATE_DEBOARDING:
+            deboarding_count += 1
             active_count += 1
         elif st == STATE_OFFLINE:
             offline_count += 1
@@ -788,6 +962,8 @@ def get_cluster_summary(db, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
             "total_nodes": active_count,
             "all_registered": len(nodes),
             "online": online_count,
+            "draining": draining_count,
+            "deboarding": deboarding_count,
             "offline": offline_count,
             "unhealthy": unhealthy_count,
             "removed": removed_count,
@@ -1145,6 +1321,18 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"job": next_job})
             return
 
+        # GET /nodes/<node_id>/deboard
+        if path.startswith("/nodes/") and path.endswith("/deboard"):
+            node_id = path[7:-8].strip()
+            nodes_db = load_nodes_db()
+            node = nodes_db.get("nodes", {}).get(node_id)
+            if not node:
+                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return
+            eval_res = evaluate_node_deboarding_safety(node_id, nodes_db)
+            self.send_json(200, eval_res)
+            return
+
         # GET /nodes/<node_id>
         if path.startswith("/nodes/"):
             node_id = path[7:].strip()
@@ -1154,6 +1342,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(404, {"error": f"Node '{node_id}' not found"})
                 return
             s_node = sanitize_node_record(node, self.heartbeat_timeout)
+            s_node["deboarding"] = evaluate_node_deboarding_safety(node_id, nodes_db)
             self.send_json(200, {"node": s_node})
             return
 
@@ -1407,6 +1596,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
             # Endpoints that do not strictly require a request body
             no_body_endpoints = (
                 (path.startswith("/nodes/") and path.endswith("/remove")),
+                (path.startswith("/nodes/") and path.endswith("/drain")),
+                (path.startswith("/nodes/") and path.endswith("/deboard")),
+                (path.startswith("/nodes/") and path.endswith("/resume")),
                 (path.startswith("/jobs/") and path.endswith("/cancel")),
                 (path.startswith("/apps/") and (path.endswith("/deploy") or path.endswith("/stop") or path.endswith("/restart")))
             )
@@ -1528,7 +1720,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
 
             now = get_current_iso_timestamp()
-            node_entry["status"] = STATE_ONLINE
+            current_st = node_entry.get("status")
+            if current_st not in (STATE_DRAINING, STATE_DEBOARDING):
+                node_entry["status"] = STATE_ONLINE
             node_entry["last_seen"] = now
             node_entry["last_heartbeat"] = {
                 "timestamp": body.get("timestamp", now),
@@ -1619,6 +1813,13 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 if live_status == STATE_OFFLINE:
                     self.send_json(400, {
                         "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
+                        "status": JOB_STATE_REJECTED
+                    })
+                    return
+
+                if live_status in (STATE_DRAINING, STATE_DEBOARDING) or node_entry.get("status") in (STATE_DRAINING, STATE_DEBOARDING):
+                    self.send_json(400, {
+                        "error": f"Target node '{target_node}' is currently {live_status or node_entry.get('status')} (no new workloads accepted). Cannot submit job.",
                         "status": JOB_STATE_REJECTED
                     })
                     return
@@ -2503,8 +2704,134 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return
 
         # ----------------------------------------------------------------------
-        # 7. Node Removal: POST /nodes/<node_id>/remove
+        # 7. Node Lifecycle: Drain, Deboard, Resume, and Safe Remove
         # ----------------------------------------------------------------------
+        # POST /nodes/<node_id>/drain
+        if path.startswith("/nodes/") and path.endswith("/drain"):
+            node_id = path[7:-6].strip()
+            enrollment_token = get_or_create_enrollment_token()
+            if token != enrollment_token:
+                self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to drain a node"})
+                return
+
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(node_id)
+            if not node_entry:
+                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return
+
+            if node_entry.get("status") == STATE_REMOVED:
+                self.send_json(400, {"error": f"Cannot drain node '{node_id}': Node is already REMOVED."})
+                return
+
+            node_entry["status"] = STATE_DRAINING
+            node_entry["draining_since"] = get_current_iso_timestamp()
+            save_nodes_db(nodes_db)
+
+            # Handle queued jobs safely:
+            # - Auto-target jobs must be rescheduled to eligible online nodes
+            # - Explicit-target jobs must NOT silently migrate
+            jobs_db = load_jobs_db()
+            jobs_rescheduled = 0
+            for jid, job in list(jobs_db.get("jobs", {}).items()):
+                if job.get("target_node") == node_id and job.get("status") in (JOB_STATE_QUEUED, JOB_STATE_RECOVERING):
+                    target_mode = job.get("target", "auto")
+                    if target_mode == "auto":
+                        reqs = job.get("requirements", {})
+                        decision = ResourceScheduler.select_node(reqs, nodes_db, self.heartbeat_timeout)
+                        if decision.get("selected_node"):
+                            job["target_node"] = decision["selected_node"]
+                            job["scheduler"] = {
+                                "mode": "drain-reschedule",
+                                "selected_node": decision["selected_node"],
+                                "score": decision["score"],
+                                "reason": f"Rescheduled from draining node '{node_id}'"
+                            }
+                            jobs_rescheduled += 1
+                            print(f"[CONTROLLER-DRAIN] Rescheduled auto-target job {jid} to node '{decision['selected_node']}'")
+            if jobs_rescheduled > 0:
+                save_jobs_db(jobs_db)
+
+            eval_res = evaluate_node_deboarding_safety(node_id, nodes_db, jobs_db)
+            print(f"[CONTROLLER-DRAIN] Node '{node_id}' transitioned to DRAINING (rescheduled {jobs_rescheduled} queued auto job(s))")
+            self.send_json(200, {
+                "status": STATE_DRAINING,
+                "node_id": node_id,
+                "jobs_rescheduled": jobs_rescheduled,
+                "message": f"Node '{node_id}' is now DRAINING. No new workloads will be assigned.",
+                "deboarding": eval_res
+            })
+            return
+
+        # POST /nodes/<node_id>/deboard
+        if path.startswith("/nodes/") and path.endswith("/deboard"):
+            node_id = path[7:-8].strip()
+            enrollment_token = get_or_create_enrollment_token()
+            if token != enrollment_token:
+                self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to deboard a node"})
+                return
+
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(node_id)
+            if not node_entry:
+                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return
+
+            if node_entry.get("status") == STATE_REMOVED:
+                self.send_json(400, {"error": f"Cannot deboard node '{node_id}': Node is already REMOVED."})
+                return
+
+            node_entry["status"] = STATE_DEBOARDING
+            node_entry["deboarding_since"] = get_current_iso_timestamp()
+            save_nodes_db(nodes_db)
+
+            eval_res = evaluate_node_deboarding_safety(node_id, nodes_db)
+            print(f"[CONTROLLER-DEBOARD] Node '{node_id}' transitioned to DEBOARDING. Can remove: {eval_res['can_remove']}")
+            self.send_json(200, {
+                "status": STATE_DEBOARDING,
+                "node_id": node_id,
+                "message": f"Node '{node_id}' is now in DEBOARDING state.",
+                "can_remove": eval_res["can_remove"],
+                "blockers": eval_res["blockers"],
+                "active_jobs": eval_res["active_jobs"],
+                "applications": eval_res["applications"],
+                "storage_used_gb": eval_res["storage_used_gb"],
+                "deboarding": eval_res
+            })
+            return
+
+        # POST /nodes/<node_id>/resume
+        if path.startswith("/nodes/") and path.endswith("/resume"):
+            node_id = path[7:-7].strip()
+            enrollment_token = get_or_create_enrollment_token()
+            if token != enrollment_token:
+                self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to resume a node"})
+                return
+
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(node_id)
+            if not node_entry:
+                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return
+
+            if node_entry.get("status") == STATE_REMOVED:
+                self.send_json(400, {"error": f"Cannot resume node '{node_id}': Node is REMOVED. Re-registration required."})
+                return
+
+            node_entry["status"] = STATE_ONLINE
+            node_entry.pop("draining_since", None)
+            node_entry.pop("deboarding_since", None)
+            save_nodes_db(nodes_db)
+
+            print(f"[CONTROLLER-LIFECYCLE] Resumed node '{node_id}' to ONLINE.")
+            self.send_json(200, {
+                "status": STATE_ONLINE,
+                "node_id": node_id,
+                "message": f"Node '{node_id}' has resumed active ONLINE state."
+            })
+            return
+
+        # Safe Removal: POST /nodes/<node_id>/remove
         if path.startswith("/nodes/") and path.endswith("/remove"):
             node_id = path[7:-7].strip()
             enrollment_token = get_or_create_enrollment_token()
@@ -2518,6 +2845,20 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(404, {"error": f"Node '{node_id}' not found"})
                 return
 
+            eval_res = evaluate_node_deboarding_safety(node_id, nodes_db)
+            if not eval_res["can_remove"]:
+                self.send_json(409, {
+                    "error": f"Cannot deboard node '{node_id}': Safety conditions not satisfied.",
+                    "status": "BLOCKED",
+                    "node_id": node_id,
+                    "blockers": eval_res["blockers"],
+                    "active_jobs": eval_res["active_jobs"],
+                    "applications": eval_res["applications"],
+                    "storage_used_gb": eval_res["storage_used_gb"],
+                    "deboarding": eval_res
+                })
+                return
+
             node_entry["status"] = STATE_REMOVED
             node_entry["auth_token"] = None
             node_entry["removed_at"] = get_current_iso_timestamp()
@@ -2527,11 +2868,11 @@ class ControllerHandler(BaseHTTPRequestHandler):
             jobs_db = load_jobs_db()
             sweep_expired_leases(jobs_db, nodes_db, self.heartbeat_timeout)
 
-            print(f"[CONTROLLER] Removed node: {node_id}")
+            print(f"[CONTROLLER] Safely removed node: {node_id}")
             self.send_json(200, {
-                "status": "removed",
+                "status": STATE_REMOVED,
                 "node_id": node_id,
-                "message": f"Node '{node_id}' has been removed from active cluster membership."
+                "message": f"Node '{node_id}' has been safely removed from active cluster membership."
             })
             return
 
@@ -2672,6 +3013,20 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(404, {"error": f"Node '{node_id}' not found"})
                 return
 
+            eval_res = evaluate_node_deboarding_safety(node_id, nodes_db)
+            if not eval_res["can_remove"]:
+                self.send_json(409, {
+                    "error": f"Cannot deboard node '{node_id}': Safety conditions not satisfied.",
+                    "status": "BLOCKED",
+                    "node_id": node_id,
+                    "blockers": eval_res["blockers"],
+                    "active_jobs": eval_res["active_jobs"],
+                    "applications": eval_res["applications"],
+                    "storage_used_gb": eval_res["storage_used_gb"],
+                    "deboarding": eval_res
+                })
+                return
+
             node_entry["status"] = STATE_REMOVED
             node_entry["auth_token"] = None
             node_entry["removed_at"] = get_current_iso_timestamp()
@@ -2680,11 +3035,11 @@ class ControllerHandler(BaseHTTPRequestHandler):
             jobs_db = load_jobs_db()
             sweep_expired_leases(jobs_db, nodes_db, self.heartbeat_timeout)
 
-            print(f"[CONTROLLER] Removed node via DELETE: {node_id}")
+            print(f"[CONTROLLER] Safely removed node via DELETE: {node_id}")
             self.send_json(200, {
-                "status": "removed",
+                "status": STATE_REMOVED,
                 "node_id": node_id,
-                "message": f"Node '{node_id}' removed."
+                "message": f"Node '{node_id}' removed safely."
             })
             return
 

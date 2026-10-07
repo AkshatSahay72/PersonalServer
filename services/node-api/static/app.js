@@ -153,11 +153,13 @@ function renderStatusPill(state) {
   const s = (state || "").toUpperCase();
   if (s === "ONLINE" || s === "SUCCEEDED") {
     return `<span class="text-online">${s}</span>`;
+  } else if (s === "DRAINING" || s === "DEBOARDING") {
+    return `<span class="text-warning">${s}</span>`;
   } else if (s === "RUNNING") {
     return `<span class="text-online">RUNNING</span>`;
   } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING" || s === "DEPLOYING" || s === "REMOVING") {
     return `<span class="text-warning">${s}</span>`;
-  } else if (s === "STOPPED" || s === "CREATED") {
+  } else if (s === "STOPPED" || s === "CREATED" || s === "REMOVED") {
     return `<span class="cell-muted">${s}</span>`;
   } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED") {
     return `<span class="text-offline">${s}</span>`;
@@ -456,6 +458,18 @@ async function loadNodes() {
       const runningContainers = uNode?.workloads?.running_containers ?? 0;
 
       const lastSeen = isOnline ? timeAgo(n.last_seen) : (n.last_seen ? timeAgo(n.last_seen) : "offline");
+      const st = (n.status || "").toUpperCase();
+
+      let actionBtns = `<button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button>`;
+      if (st === "ONLINE") {
+        actionBtns += ` <button class="btn btn-sm btn-warning" onclick="drainNode('${n.node_id}')" title="Drain node workloads">Drain</button>`;
+      } else if (st === "DRAINING") {
+        actionBtns += ` <button class="btn btn-sm btn-warning" onclick="deboardNode('${n.node_id}')" title="Deboard node safely">Deboard</button>`;
+        actionBtns += ` <button class="btn btn-sm" onclick="resumeNode('${n.node_id}')" title="Resume node to ONLINE">Resume</button>`;
+      } else if (st === "DEBOARDING") {
+        actionBtns += ` <button class="btn btn-sm btn-danger" onclick="removeNodeSafe('${n.node_id}')" title="Remove node after safety checks">Remove</button>`;
+        actionBtns += ` <button class="btn btn-sm" onclick="resumeNode('${n.node_id}')" title="Resume node to ONLINE">Resume</button>`;
+      }
 
       return `
         <tr>
@@ -469,8 +483,8 @@ async function loadNodes() {
           <td class="mono">${activeJobs} active (${runningJobs} run)</td>
           <td class="mono">${runningContainers} running</td>
           <td class="mono cell-muted">${lastSeen}</td>
-          <td style="text-align: right;">
-            <button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button>
+          <td style="text-align: right; white-space: nowrap;">
+            ${actionBtns}
           </td>
         </tr>
       `;
@@ -488,8 +502,22 @@ window.viewNodeById = function(nodeId) {
   const panel = document.getElementById("node-detail-panel");
   const title = document.getElementById("node-detail-title");
   const grid = document.getElementById("node-detail-grid");
+  const actionsEl = document.getElementById("node-lifecycle-actions");
 
   if (title) title.textContent = `Node: ${node.name || node.node_id}`;
+
+  if (actionsEl) {
+    const st = (node.status || "").toUpperCase();
+    let btnsHtml = "";
+    if (st === "ONLINE") {
+      btnsHtml = `<button class="btn btn-sm btn-warning" onclick="drainNode('${node.node_id}')">Drain Node</button>`;
+    } else if (st === "DRAINING") {
+      btnsHtml = `<button class="btn btn-sm btn-warning" onclick="deboardNode('${node.node_id}')">Deboard Node</button> <button class="btn btn-sm" onclick="resumeNode('${node.node_id}')">Resume Node</button>`;
+    } else if (st === "DEBOARDING") {
+      btnsHtml = `<button class="btn btn-sm btn-danger" onclick="removeNodeSafe('${node.node_id}')">Remove Node</button> <button class="btn btn-sm" onclick="resumeNode('${node.node_id}')">Resume Node</button>`;
+    }
+    actionsEl.innerHTML = btnsHtml;
+  }
 
   const hb = node.last_heartbeat || {};
   const sys = hb.system || {};
@@ -522,6 +550,132 @@ window.viewNodeById = function(nodeId) {
 window.closeNodeDetail = function() {
   const panel = document.getElementById("node-detail-panel");
   if (panel) panel.style.display = "none";
+};
+
+window.drainNode = async function(nodeId) {
+  const node = cachedNodes.find(n => n.node_id === nodeId) || { name: nodeId, node_id: nodeId };
+  const confirmed = await showCustomConfirm({
+    title: `Drain Node: ${node.name || nodeId}`,
+    message: `Drain node "${node.name || nodeId}"?\n\n• Scheduler will NOT assign any new workloads to this node\n• Existing jobs and applications will continue running\n• Auto-target queued jobs will be rescheduled to eligible online nodes\n• Heartbeat and status monitoring continue normally`,
+    confirmText: "Start Draining",
+    isDanger: false
+  });
+  if (!confirmed) return;
+
+  try {
+    const res = await apiFetch(`/api/nodes/${nodeId}/drain`, { method: "POST" });
+    const rescheduled = res.jobs_rescheduled != null ? `\n• ${res.jobs_rescheduled} queued auto job(s) rescheduled` : "";
+    await showCustomAlert({
+      title: "Node Draining Started",
+      message: `Node "${node.name || nodeId}" is now in DRAINING state.${rescheduled}\n\nExisting workloads may finish. Use "Deboard" once jobs are completed.`
+    });
+    await loadNodes();
+    if (document.getElementById("node-detail-panel")?.style.display !== "none") {
+      viewNodeById(nodeId);
+    }
+  } catch (err) {
+    await showCustomAlert({
+      title: "Drain Failed",
+      message: err.message || "Failed to drain node.",
+      isError: true
+    });
+  }
+};
+
+window.deboardNode = async function(nodeId) {
+  const node = cachedNodes.find(n => n.node_id === nodeId) || { name: nodeId, node_id: nodeId };
+  try {
+    const res = await apiFetch(`/api/nodes/${nodeId}/deboard`, { method: "POST" });
+    const deb = res.deboarding || res;
+    if (deb.can_remove) {
+      await showCustomAlert({
+        title: "Ready for Deboarding",
+        message: `Node "${node.name || nodeId}" is now in DEBOARDING state.\n\nAll safety checks passed:\n• 0 active applications\n• 0 running/claimed jobs\n• 0 unmigrated storage files\n\nYou can now safely remove this node.`
+      });
+    } else {
+      const blockersText = (deb.blockers || []).map(b => `• ${b}`).join("\n");
+      await showCustomAlert({
+        title: "Deboarding Checks - Action Required",
+        message: `Node "${node.name || nodeId}" transitioned to DEBOARDING, but cannot be removed yet.\n\nBlockers:\n${blockersText || "• Active dependencies exist"}\n\nAction:\nResolve the blockers above before final removal.`,
+        isError: true
+      });
+    }
+    await loadNodes();
+    if (document.getElementById("node-detail-panel")?.style.display !== "none") {
+      viewNodeById(nodeId);
+    }
+  } catch (err) {
+    await showCustomAlert({
+      title: "Deboard Failed",
+      message: err.message || "Failed to deboard node.",
+      isError: true
+    });
+  }
+};
+
+window.resumeNode = async function(nodeId) {
+  const node = cachedNodes.find(n => n.node_id === nodeId) || { name: nodeId, node_id: nodeId };
+  const confirmed = await showCustomConfirm({
+    title: `Resume Node: ${node.name || nodeId}`,
+    message: `Resume node "${node.name || nodeId}" back to ONLINE state?\n\nThe scheduler will resume assigning new workloads to this node.`
+  });
+  if (!confirmed) return;
+
+  try {
+    await apiFetch(`/api/nodes/${nodeId}/resume`, { method: "POST" });
+    await showCustomAlert({
+      title: "Node Resumed",
+      message: `Node "${node.name || nodeId}" has been resumed to active ONLINE state.`
+    });
+    await loadNodes();
+    if (document.getElementById("node-detail-panel")?.style.display !== "none") {
+      viewNodeById(nodeId);
+    }
+  } catch (err) {
+    await showCustomAlert({
+      title: "Resume Failed",
+      message: err.message || "Failed to resume node.",
+      isError: true
+    });
+  }
+};
+
+window.removeNodeSafe = async function(nodeId) {
+  const node = cachedNodes.find(n => n.node_id === nodeId) || { name: nodeId, node_id: nodeId };
+  try {
+    const deb = await apiFetch(`/api/nodes/${nodeId}/deboard`);
+    if (!deb.can_remove) {
+      const blockersText = (deb.blockers || []).map(b => `• ${b}`).join("\n");
+      await showCustomAlert({
+        title: `Cannot Remove Node: ${node.name || nodeId}`,
+        message: `Cannot remove Node "${node.name || nodeId}".\n\nBlockers:\n${blockersText}\n\nAction:\nMigrate/remove workloads and storage before deboarding.`,
+        isError: true
+      });
+      return;
+    }
+
+    const confirmed = await showCustomConfirm({
+      title: "Confirm Safe Node Removal",
+      message: `Permanently remove Node "${node.name || nodeId}" (${nodeId})?\n\nSafety verification passed:\n• 0 active applications\n• 0 running jobs\n• 0 storage data\n\nAuthentication credentials will be invalidated. Node must re-enroll to join.`,
+      confirmText: "Remove Node",
+      isDanger: true
+    });
+    if (!confirmed) return;
+
+    await apiFetch(`/api/nodes/${nodeId}/remove`, { method: "POST" });
+    await showCustomAlert({
+      title: "Node Removed",
+      message: `Node "${node.name || nodeId}" has been safely removed from active cluster membership.`
+    });
+    closeNodeDetail();
+    await loadNodes();
+  } catch (err) {
+    await showCustomAlert({
+      title: "Removal Blocked",
+      message: err.message || "Cannot remove node.",
+      isError: true
+    });
+  }
 };
 
 // 3. Jobs View
