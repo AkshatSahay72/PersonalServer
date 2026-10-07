@@ -10,6 +10,9 @@ import sys
 import os
 import json
 import re
+import secrets
+import socket
+import platform
 import argparse
 import subprocess
 import urllib.request
@@ -54,6 +57,104 @@ def run_cmd(cmd):
         return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return ""
+
+
+def discover_hardware(base_dir=BASE_DIR):
+    """
+    Auto-discovers hardware specifications (CPU, RAM, storage, platform, arch, OS, hostname).
+    """
+    # CPU Cores
+    try:
+        cpu_cores = os.cpu_count() or int(run_cmd("nproc") or 1)
+    except Exception:
+        cpu_cores = 1
+
+    # RAM in MB
+    ram_mb = 0
+    if Path("/proc/meminfo").exists():
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            ram_mb = int(round(int(parts[1]) / 1024))
+                        break
+        except Exception:
+            pass
+
+    if ram_mb <= 0:
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            ram_mb = int(round((pages * page_size) / (1024 * 1024)))
+        except Exception:
+            pass
+
+    if ram_mb <= 0:
+        try:
+            mem_raw = run_cmd("free -m")
+            for line in mem_raw.splitlines():
+                if line.startswith("Mem:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        ram_mb = int(parts[1])
+                        break
+        except Exception:
+            pass
+
+    if ram_mb <= 0:
+        ram_mb = 4096  # safe fallback
+
+    # Total Storage in GB
+    storage_gb = 0
+    try:
+        stat = os.statvfs(str(base_dir))
+        storage_gb = int(round((stat.f_blocks * stat.f_frsize) / (1024 ** 3)))
+    except Exception:
+        pass
+
+    if storage_gb <= 0:
+        try:
+            df_raw = run_cmd("df -k ~")
+            lines = df_raw.splitlines()
+            if len(lines) >= 2:
+                parts = lines[-1].split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    storage_gb = int(round(int(parts[1]) / (1024 * 1024)))
+        except Exception:
+            pass
+
+    if storage_gb <= 0:
+        storage_gb = 32  # safe fallback
+
+    # Platform & OS & Architecture & Hostname
+    is_termux = "com.termux" in os.environ.get("PREFIX", "")
+    platform_name = "termux" if is_termux else sys.platform
+    os_name = platform.system() or run_cmd("uname -s") or "Linux"
+    arch = platform.machine() or run_cmd("uname -m") or "unknown"
+    hostname = socket.gethostname() or run_cmd("hostname") or "node"
+
+    return {
+        "name": hostname,
+        "role": "compute",
+        "platform": platform_name,
+        "os": os_name,
+        "architecture": arch,
+        "cpu_cores": cpu_cores,
+        "ram_mb": ram_mb,
+        "storage_gb": storage_gb,
+        "capabilities": {
+            "compute": True,
+            "storage": True,
+            "network": True
+        }
+    }
+
+
+def generate_node_id():
+    """Generates a secure random node ID in format server-<16 hex chars>."""
+    return f"server-{secrets.token_hex(8)}"
 
 
 def load_node_config():
@@ -442,13 +543,14 @@ def cmd_register(args):
         return 1
 
 
-def cmd_heartbeat(args):
+def cmd_heartbeat(args=None):
     reg_state = load_registration_state()
     if not reg_state or not reg_state.get("registered"):
         print("Error: Node is not registered. Run 'python agent/node-agent.py register' first.", file=sys.stderr)
         return 1
 
-    controller_url = (args.controller or reg_state.get("controller_url") or get_default_controller_url()).rstrip("/")
+    override_url = getattr(args, "controller", None) if args else None
+    controller_url = (override_url or reg_state.get("controller_url") or get_default_controller_url()).rstrip("/")
     auth_token = reg_state.get("auth_token", "")
     node_id = reg_state.get("node_id", "")
 
@@ -492,7 +594,7 @@ def cmd_heartbeat(args):
             reg_state["last_heartbeat"] = now
             save_registration_state(reg_state)
             print("OK")
-            if getattr(args, "json", False):
+            if args and getattr(args, "json", False):
                 print(json.dumps(res_data, indent=2))
             else:
                 print(f"Heartbeat acknowledged at {res_data.get('timestamp', now)}.")
@@ -513,6 +615,126 @@ def cmd_heartbeat(args):
         print("FAILED")
         print(f"Connection Error: {e}", file=sys.stderr)
         return 1
+
+
+def cmd_onboard(args):
+    controller_url = (getattr(args, "controller", None) or get_default_controller_url()).rstrip("/")
+    onboarding_code = (getattr(args, "code", "") or "").strip()
+
+    if not onboarding_code:
+        print("Error: --code is required for onboarding.", file=sys.stderr)
+        return 1
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Hardware discovery & Node config creation
+    node_config = {}
+    if NODE_JSON.exists():
+        try:
+            with open(NODE_JSON, "r", encoding="utf-8") as f:
+                node_config = json.load(f)
+        except Exception:
+            pass
+
+    if not node_config and NODE_CONF.exists():
+        node_config = load_node_config()
+
+    if not node_config:
+        discovered = discover_hardware()
+        node_id = generate_node_id()
+        node_config = {
+            "node_id": node_id,
+            **discovered
+        }
+        try:
+            with open(NODE_JSON, "w", encoding="utf-8") as f:
+                json.dump(node_config, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to write {NODE_JSON}: {e}", file=sys.stderr)
+    else:
+        # If node.json existed but lacked node_id
+        if not node_config.get("node_id") or node_config.get("node_id") == "unknown":
+            node_config["node_id"] = generate_node_id()
+            if not NODE_JSON.exists():
+                try:
+                    with open(NODE_JSON, "w", encoding="utf-8") as f:
+                        json.dump(node_config, f, indent=2)
+                except Exception:
+                    pass
+
+    # 2. Write controller.json if not exists
+    if not CONTROLLER_JSON.exists():
+        try:
+            with open(CONTROLLER_JSON, "w", encoding="utf-8") as f:
+                json.dump({"url": controller_url}, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to write {CONTROLLER_JSON}: {e}", file=sys.stderr)
+
+    node_info = load_node_config()
+    register_endpoint = f"{controller_url}/register"
+    payload = json.dumps(node_info).encode("utf-8")
+
+    req = urllib.request.Request(
+        register_endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Onboarding-Code": onboarding_code,
+            "User-Agent": "PersonalServer-NodeAgent/1.0"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            auth_token = res_data.get("auth_token", "")
+            reg_time = res_data.get("registered_at", get_current_iso_timestamp())
+
+            reg_state = {
+                "registered": True,
+                "controller_url": controller_url,
+                "node_id": node_info.get("node_id"),
+                "node_name": node_info.get("name"),
+                "auth_token": auth_token,
+                "registered_at": reg_time,
+                "last_heartbeat": None
+            }
+            save_registration_state(reg_state)
+
+    except urllib.error.HTTPError as e:
+        err_msg = ""
+        try:
+            err_data = json.loads(e.read().decode("utf-8"))
+            err_msg = err_data.get("error", "")
+        except Exception:
+            pass
+        print(f"Onboarding failed (HTTP {e.code}): {err_msg or e.reason}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Onboarding failed (Connection error): {e}", file=sys.stderr)
+        return 1
+
+    # 3. Startup Safety: Start managed services through existing start.sh
+    if START_SCRIPT.exists():
+        res = execute_script(START_SCRIPT)
+        if res != 0:
+            print("Warning: Service startup returned non-zero exit code. Check logs.", file=sys.stderr)
+
+    # 4. Initial heartbeat
+    try:
+        cmd_heartbeat(None)
+    except Exception:
+        pass
+
+    # 5. Output concise success information
+    print("==========================================")
+    print("Onboarding successful")
+    print(f"Node ID:    {node_info.get('node_id')}")
+    print(f"Controller: {controller_url}")
+    print("Status:     registered")
+    print("==========================================")
+    return 0
 
 
 def cmd_registration_status(args):
@@ -653,6 +875,10 @@ def main():
     p_reg.add_argument("--controller", help="Controller URL (e.g. http://100.120.251.42:8000)")
     p_reg.add_argument("--token", help="Enrollment secret token")
 
+    p_onboard = subparsers.add_parser("onboard", help="Automatically onboard and register this node with a controller")
+    p_onboard.add_argument("--controller", help="Controller URL (e.g. http://100.120.251.42:8000)")
+    p_onboard.add_argument("--code", required=True, help="One-time onboarding code (PS-XXXX-XXXX)")
+
     p_hb = subparsers.add_parser("heartbeat", help="Send heartbeat to registered controller")
     p_hb.add_argument("--controller", help="Override controller URL")
     p_hb.add_argument("--json", action="store_true", help="Output response in JSON")
@@ -683,6 +909,7 @@ def main():
         "stop": cmd_stop,
         "restart": cmd_restart,
         "register": cmd_register,
+        "onboard": cmd_onboard,
         "heartbeat": cmd_heartbeat,
         "registration-status": cmd_registration_status,
         "work": cmd_work,

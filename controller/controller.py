@@ -13,6 +13,8 @@ import json
 import time
 import secrets
 import argparse
+import hashlib
+import hmac
 import shutil
 import threading
 import urllib.parse
@@ -35,12 +37,17 @@ NODES_FILE = DATA_DIR / "nodes.json"
 BACKUP_NODES_FILE = DATA_DIR / "nodes.json.bak"
 JOBS_FILE = DATA_DIR / "jobs.json"
 BACKUP_JOBS_FILE = DATA_DIR / "jobs.json.bak"
+ONBOARDING_CODES_FILE = DATA_DIR / "onboarding_codes.json"
+BACKUP_ONBOARDING_CODES_FILE = DATA_DIR / "onboarding_codes.json.bak"
 ENROLLMENT_TOKEN_FILE = SECRETS_DIR / "enrollment.token"
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 DEFAULT_HEARTBEAT_TIMEOUT = 60  # seconds
 DEFAULT_LEASE_GRACE_SEC = 20    # seconds beyond job timeout
+DEFAULT_ONBOARDING_TTL_SEC = 900 # 15 minutes (seconds)
+
+ONBOARDING_LOCK = threading.Lock()
 
 # Centralized Node State Constants
 STATE_REGISTERING = "REGISTERING"
@@ -169,6 +176,132 @@ def save_jobs_db(db):
             pass
 
     temp_file.replace(JOBS_FILE)
+
+
+# ------------------------------------------------------------------------------
+# Onboarding Code Store & Validation
+# ------------------------------------------------------------------------------
+
+def hash_onboarding_code(code: str) -> str:
+    """Computes a SHA-256 hash of the normalized onboarding code for secure storage."""
+    return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
+
+
+def load_onboarding_codes_db():
+    ensure_directories()
+    if ONBOARDING_CODES_FILE.exists():
+        try:
+            with open(ONBOARDING_CODES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Corrupt {ONBOARDING_CODES_FILE} ({e}). Checking backup...", file=sys.stderr)
+            if BACKUP_ONBOARDING_CODES_FILE.exists():
+                try:
+                    with open(BACKUP_ONBOARDING_CODES_FILE, "r", encoding="utf-8") as bf:
+                        return json.load(bf)
+                except Exception:
+                    pass
+    return {"codes": {}}
+
+
+def save_onboarding_codes_db(db):
+    ensure_directories()
+    temp_file = ONBOARDING_CODES_FILE.with_suffix(".tmp")
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2)
+
+    if ONBOARDING_CODES_FILE.exists():
+        try:
+            shutil.copy2(ONBOARDING_CODES_FILE, BACKUP_ONBOARDING_CODES_FILE)
+        except Exception:
+            pass
+
+    temp_file.replace(ONBOARDING_CODES_FILE)
+
+
+def generate_onboarding_code(ttl_seconds=DEFAULT_ONBOARDING_TTL_SEC):
+    """
+    Generates a cryptographically secure, single-use onboarding code.
+    Format: PS-XXXX-XXXX
+    Stores SHA-256 hash in onboarding_codes.json.
+    Returns (code_str, ttl_seconds).
+    """
+    chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    part1 = "".join(secrets.choice(chars) for _ in range(4))
+    part2 = "".join(secrets.choice(chars) for _ in range(4))
+    code = f"PS-{part1}-{part2}"
+
+    code_hash = hash_onboarding_code(code)
+    now_dt = datetime.now(timezone.utc)
+    expires_dt = datetime.fromtimestamp(now_dt.timestamp() + ttl_seconds, tz=timezone.utc)
+
+    with ONBOARDING_LOCK:
+        db = load_onboarding_codes_db()
+        # Clean up stale codes older than 24 hours
+        now_ts = now_dt.timestamp()
+        filtered = {}
+        for h, info in db.get("codes", {}).items():
+            try:
+                exp_ts = datetime.fromisoformat(info["expires_at"]).timestamp()
+                if now_ts - exp_ts < 86400:
+                    filtered[h] = info
+            except Exception:
+                pass
+        db["codes"] = filtered
+
+        db.setdefault("codes", {})[code_hash] = {
+            "created_at": now_dt.isoformat(),
+            "expires_at": expires_dt.isoformat(),
+            "used": False,
+            "used_at": None,
+            "used_by_node": None
+        }
+        save_onboarding_codes_db(db)
+
+    return code, ttl_seconds
+
+
+def validate_and_consume_onboarding_code(code: str, node_id: str) -> tuple:
+    """
+    Thread-safe validation and single-use consumption of an onboarding code.
+    Returns (is_valid: bool, error_reason: str).
+    """
+    if not code or not code.strip():
+        return False, "Missing onboarding code"
+
+    input_hash = hash_onboarding_code(code)
+    now_dt = datetime.now(timezone.utc)
+
+    with ONBOARDING_LOCK:
+        db = load_onboarding_codes_db()
+        codes = db.get("codes", {})
+
+        matched_entry = None
+        for h, entry in codes.items():
+            if hmac.compare_digest(h, input_hash):
+                matched_entry = entry
+                break
+
+        if not matched_entry:
+            return False, "Invalid onboarding code"
+
+        if matched_entry.get("used"):
+            return False, "Onboarding code has already been used"
+
+        try:
+            expires_at = datetime.fromisoformat(matched_entry["expires_at"])
+            if now_dt > expires_at:
+                return False, "Onboarding code has expired"
+        except Exception:
+            return False, "Corrupt expiration timestamp on onboarding code"
+
+        # Atomically consume the code
+        matched_entry["used"] = True
+        matched_entry["used_at"] = now_dt.isoformat()
+        matched_entry["used_by_node"] = node_id
+        save_onboarding_codes_db(db)
+
+        return True, ""
 
 
 def sanitize_node_record(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
@@ -534,15 +667,23 @@ class ControllerHandler(BaseHTTPRequestHandler):
         # 1. Node Registration: POST /register
         # ----------------------------------------------------------------------
         if path == "/register":
-            enrollment_token = get_or_create_enrollment_token()
-            if not token or token != enrollment_token:
-                self.send_json(401, {"error": "Unauthorized: Invalid enrollment token"})
-                return
+            onboarding_code = self.headers.get("X-Onboarding-Code", "").strip()
 
             node_id = body.get("node_id")
             if not node_id:
                 self.send_json(400, {"error": "Missing required field 'node_id'"})
                 return
+
+            if onboarding_code:
+                is_valid, err = validate_and_consume_onboarding_code(onboarding_code, node_id)
+                if not is_valid:
+                    self.send_json(401, {"error": f"Unauthorized: {err}"})
+                    return
+            else:
+                enrollment_token = get_or_create_enrollment_token()
+                if not token or token != enrollment_token:
+                    self.send_json(401, {"error": "Unauthorized: Invalid enrollment token"})
+                    return
 
             node_name = body.get("name", "unknown")
             node_role = body.get("role", "compute")
@@ -1375,6 +1516,10 @@ def main():
     # token command
     subparsers.add_parser("token", help="Display enrollment token file path")
 
+    # onboard-code command
+    p_onboard = subparsers.add_parser("onboard-code", help="Generate a short-lived single-use node onboarding code")
+    p_onboard.add_argument("--ttl", type=int, default=DEFAULT_ONBOARDING_TTL_SEC, help="Time to live in seconds (default: 900 / 15m)")
+
     args = parser.parse_args()
 
     if not args.command or args.command == "start":
@@ -1403,6 +1548,14 @@ def main():
     elif args.command == "token":
         get_or_create_enrollment_token()
         print(f"Enrollment token stored at: {ENROLLMENT_TOKEN_FILE}")
+    elif args.command == "onboard-code":
+        ttl = getattr(args, "ttl", DEFAULT_ONBOARDING_TTL_SEC)
+        code, ttl_sec = generate_onboarding_code(ttl)
+        minutes = ttl_sec // 60
+        print("==========================================")
+        print(f"Onboarding code: {code}")
+        print(f"Expires in:      {minutes} minutes")
+        print("==========================================")
 
 
 if __name__ == "__main__":
