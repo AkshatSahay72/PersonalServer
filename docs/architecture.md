@@ -1,74 +1,83 @@
-# PersonalServer Architecture (v1.0)
+# PersonalServer System Architecture
 
-## 1. Architectural Philosophy
+PersonalServer is a distributed, self-hosted personal server and cluster management platform built for heterogeneous edge hardware (Android devices running Termux, Raspberry Pis, Linux servers, and desktop hosts).
 
-PersonalServer is designed around the concept of a **sovereign, multi-tier personal cloud** using inexpensive, repurposed edge devices. Rather than relying on heavy containerization engines or cloud orchestration layers, PersonalServer uses clean, language-level process abstractions and native OS tools.
+---
+
+## 1. High-Level System Architecture
 
 ```text
-                     PERSONALSERVER TOPOLOGY
-                                │
-               ┌────────────────┼────────────────┐
-               ▼                ▼                ▼
-         [COMPUTE TIER]  [STORAGE TIER]   [CONTROL TIER]
-           Vivo Y31        Storage Root      Laptop
-           Workloads       File Server     Controller
-           Jobs/Retry      Upload/Download Scheduler
-               │                │                │
-               └────────────────┼────────────────┘
-                                │
-                        Web Operations UI
-                                │
-                        Cloudflare Tunnel
-                                │
-                            Internet
++─────────────────────────────────────────────────────────────────────────────+
+|                                PUBLIC ACCESS                                |
++─────────────────────────────────────────────────────────────────────────────+
+                                       │
+                                       ▼ (HTTPS Ingress)
+                      +─────────────────────────────────+
+                      |     Cloudflare Zero Trust       |
+                      +─────────────────────────────────+
+                                       │
+                                       ▼ (http://127.0.0.1:8080)
++─────────────────────────────────────────────────────────────────────────────+
+|                              NODE 01 (VIVO Y31)                             |
+|                                                                             |
+|   +─────────────────────────────────────────────────────────────────────+   |
+|   |                    Node API & Operations Web Console                |   |
+|   |  - Cluster Summary Strip               - System Telemetry           |   |
+|   |  - Nodes Table & Live Status           - Workload Job Execution UI  |   |
+|   |  - Multi-Node Storage Browser          - Settings & Diagnostics     |   |
+|   +─────────────────────────────────────────────────────────────────────+   |
+|                                      │                                      |
+|   +──────────────────────────────────┴─────+   +────────────────────────+   |
+|   |         Local Storage Root             |   |       Node Agent       |   |
+|   |     ~/PersonalServer/storage/          |   |  - Service Supervisor  |   |
+|   |     (Sandboxed & Traversal Defended)   |   |  - Heartbeat Reporter  |   |
+|   +────────────────────────────────────────+   |  - Job Executor        |   |
+|                                                +────────────┬───────────+   |
++─────────────────────────────────────────────────────────────┼───────────────+
+                                                              │
+                                                Tailscale WireGuard Mesh
+                                                              │
+                 ┌────────────────────────────────────────────┴─────────────┐
+                 │                                                          │
+                 ▼                                                          ▼
++──────────────────────────────────────────+   +────────────────────────────┴─+
+|               NODE 02                    |   |      LAPTOP CONTROLLER       |
+|                                          |   |                              |
+|   +──────────────────────────────────+   |   |   +───────────────────────+  |
+|   |       Node API (:8080)           |   |   |   | PersonalServer        |  |
+|   |   - Remote Storage Read/Write    |   |   |   | Controller (:8000)    |  |
+|   +──────────────────────────────────+   |   |   | - Cluster Inventory   |  |
+|   |       Node Agent                 |   |   |   | - Resource Scheduler  |  |
+|   |   - Hardware Discovery           |   |   |   | - Lease Sweeper       |  |
+|   |   - Workload Job Executor        |   |   |   | - Onboarding Store    |  |
+|   +──────────────────────────────────+   |   |   +───────────────────────+  |
+|   |       Storage Root               |   |   +──────────────────────────────+
+|   |   ~/PersonalServer/storage/      |   |
+|   +──────────────────────────────────+   |
++──────────────────────────────────────────+
 ```
 
 ---
 
 ## 2. Core Subsystems
 
-### 2.1 The Laptop Controller (`controller/controller.py`)
-- **Port**: `:8000` (Tailscale private).
-- **Functions**:
-  - Central inventory of cluster nodes (`controller/data/nodes.json`).
-  - Persistent job database (`controller/data/jobs.json`).
-  - Liveness monitoring with configurable heartbeat timeouts (default 60s).
-  - Resource-Aware Scheduler with deterministic scoring algorithms.
-  - Lease management and automatic recovery engine.
-  - Token-based node enrollment and removal.
+### 2.1 Controller (`controller/controller.py`)
+* **Cluster Inventory**: Maintains registered nodes, roles, capabilities, and liveness states in `controller/data/nodes.json`.
+* **Resource-Aware Scheduler**: Selects optimal execution nodes evaluating CPU cores, load averages, memory availability, and hardware capabilities.
+* **Lease-Based Failure Detection & Sweeper**: Automatically tracks job execution leases, detects worker disconnections, and initiates recovery.
+* **One-Time Onboarding Store**: Generates temporary, single-use `PS-XXXX-XXXX` pairing codes with SHA-256 hashed storage in `controller/data/onboarding_codes.json`.
 
-### 2.2 The Node Agent (`agent/node-agent.py`)
-- Runs locally on each server node (e.g. Vivo Y31 under Termux).
-- Performs service lifecycle management (`scripts/start.sh`, `stop.sh`, `restart.sh`, `status.sh`, `health.sh`).
-- Collects system metrics (`nproc`, `uptime`, `free -h`, `df -h`).
-- Sends authenticated periodic heartbeats to the Controller.
-- Fetches and claims pending workload jobs via `/nodes/<node_id>/jobs/next`.
-- Executes workloads safely via `agent/job_executor.py`.
+### 2.2 Node Agent (`agent/node-agent.py`)
+* **Hardware Discovery**: Inspects CPU cores, RAM, storage, platform, and OS without manual configuration.
+* **One-Command Onboarding**: Enrolls nodes with the controller via `onboard` CLI, synthesizing configuration files and starting services.
+* **Liveness & Telemetry**: Sends periodic authenticated heartbeats reporting system load, memory, disk usage, and service states.
+* **Job Executor (`agent/job_executor.py`)**: Executes allowlisted workloads under non-root user permissions with strict timeout enforcement.
 
-### 2.3 The Node API & Storage Subsystem (`services/node-api/app.py`)
-- **Port**: `:8080` (Localhost / Tailscale / Cloudflare Tunnel).
-- Serves the Operations Web Interface (`services/node-api/static/`).
-- Hosts the Storage Subsystem managing `~/PersonalServer/storage/`.
-- Proxies cluster and workload requests to the Controller.
+### 2.3 Node API & Storage Manager (`services/node-api/app.py`)
+* **Operations Web Console**: Modern, information-dense administration interface for cluster health, jobs, telemetry, and storage.
+* **Multi-Node Decentralized Storage**: Exposes local and remote storage roots (`~/PersonalServer/storage/`) with strict path traversal defenses.
+* **Remote Storage Proxy**: Routes storage requests transparently to remote node APIs over Tailscale.
 
----
-
-## 3. Network Architecture & Ingress
-
-```text
-Public Internet
-       │
-       ▼ (HTTPS :443)
-Cloudflare Edge Network
-       │
-       ▼ (Cloudflare Tunnel)
-Node 01 (Vivo Y31) -> Node API (:8080)
-       │
-       ▼ (Tailscale Private Network)
-Laptop Controller (:8000)
-```
-
-- **Cloudflare Tunnel**: Provides public remote access to the Web Interface without exposing open inbound router ports or requiring static public IP addresses.
-- **Tailscale Mesh**: Secure, encrypted private network for cluster node-to-controller communication and private SSH administration.
-- **SSH (`:8022`)**: Private, accessible only via Tailscale.
-- **Node API (`:8080`)**: Private cluster service, bridged to the public Internet exclusively through Cloudflare Tunnel.
+### 2.4 Private Mesh & Ingress Networking
+* **Tailscale WireGuard Mesh**: Encrypts and isolates all inter-node traffic (Controller `:8000`, Node APIs `:8080`, SSH `:8022`).
+* **Cloudflare Tunnel**: Exposes the Web Console securely over HTTPS without requiring port forwarding or exposing internal services.
