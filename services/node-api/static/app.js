@@ -39,7 +39,8 @@ function navigate() {
     dashboard: { main: "Dashboard", sub: "Cluster overview" },
     nodes: { main: "Nodes", sub: "Cluster inventory & telemetry" },
     jobs: { main: "Jobs", sub: "Workload execution & lifecycle" },
-    storage: { main: "Storage", sub: "Personal file manager" }
+    storage: { main: "Storage", sub: "Personal file manager" },
+    settings: { main: "Settings", sub: "Cluster configuration" }
   };
 
   const meta = titles[hash] || { main: "Dashboard", sub: "Cluster overview" };
@@ -105,34 +106,20 @@ function getFileTypeCategory(filename, isDir) {
   return "File";
 }
 
-function getFileIcon(typeCategory) {
-  switch (typeCategory) {
-    case "Folder": return "📁";
-    case "Archive": return "📦";
-    case "Image": return "🖼️";
-    case "Video": return "🎬";
-    case "Audio": return "🎵";
-    case "Code": return "📜";
-    default: return "📄";
-  }
-}
-
 function renderStatusPill(state) {
   const s = (state || "").toUpperCase();
   if (s === "ONLINE" || s === "SUCCEEDED") {
-    return `<span class="status-pill pill-online"><span class="status-dot dot-online">●</span> ${s === "ONLINE" ? "Online" : "Succeeded"}</span>`;
+    return `<span class="text-online">${s}</span>`;
   } else if (s === "RUNNING") {
-    return `<span class="status-pill pill-online"><span class="status-dot dot-online">●</span> Running</span>`;
-  } else if (s === "QUEUED" || s === "CLAIMED") {
-    return `<span class="status-pill pill-warning"><span class="status-dot dot-warning">●</span> ${s === "QUEUED" ? "Queued" : "Claimed"}</span>`;
-  } else if (s === "RECOVERING") {
-    return `<span class="status-pill pill-warning"><span class="status-dot dot-warning">●</span> Recovering</span>`;
+    return `<span class="text-warning">RUNNING</span>`;
+  } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING") {
+    return `<span class="text-warning">${s}</span>`;
   } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED") {
-    return `<span class="status-pill pill-failed"><span class="status-dot dot-error">●</span> ${s}</span>`;
+    return `<span class="text-offline">${s}</span>`;
   } else if (s === "OFFLINE") {
-    return `<span class="status-pill pill-offline"><span class="status-dot dot-offline">○</span> Offline</span>`;
+    return `<span class="text-offline">OFFLINE</span>`;
   }
-  return `<span class="status-pill pill-neutral"><span class="status-dot dot-offline">○</span> ${s || "Unknown"}</span>`;
+  return `<span class="cell-muted">${s || "UNKNOWN"}</span>`;
 }
 
 function updateLastRefreshed() {
@@ -151,14 +138,14 @@ async function loadSession() {
       if (userEl) userEl.textContent = userText;
       if (topUserEl) topUserEl.textContent = userText;
     } else {
-      if (userEl) userEl.textContent = "Signed in";
-      if (topUserEl) topUserEl.textContent = "Signed in";
+      if (userEl) userEl.textContent = "Local Admin";
+      if (topUserEl) topUserEl.textContent = "Local Admin";
     }
   } catch {
     const userEl = document.getElementById("side-session-user");
     const topUserEl = document.getElementById("topbar-user-email");
-    if (userEl) userEl.textContent = "Signed in";
-    if (topUserEl) topUserEl.textContent = "Signed in";
+    if (userEl) userEl.textContent = "Local Admin";
+    if (topUserEl) topUserEl.textContent = "Local Admin";
   }
 }
 
@@ -186,25 +173,26 @@ async function loadDashboard() {
       document.getElementById("sum-card-cluster-main").textContent = `${onlineCount} online`;
       document.getElementById("sum-card-cluster-sub").textContent = `${offlineCount} offline`;
       document.getElementById("side-cluster-online").textContent = `${onlineCount} online`;
+      const topbarStatus = document.getElementById("topbar-cluster-status");
+      if (topbarStatus) topbarStatus.textContent = `${onlineCount} online`;
 
       const tbody = document.getElementById("dash-nodes-tbody");
       if (nodes.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="6" class="cell-muted">No cluster nodes registered.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">No cluster nodes registered.</td></tr>`;
       } else {
         tbody.innerHTML = nodes.map(n => {
           const isOnline = (n.status || "").toUpperCase() === "ONLINE";
-          const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${n.resources.ram_mb} MB` : "-");
+          const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${(n.resources.ram_mb/1024).toFixed(1)} GB` : "-");
           const cores = n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-";
-          const lastSeen = isOnline ? timeAgo(n.last_seen) : (n.last_seen ? timeAgo(n.last_seen) : "offline");
+          const storageStr = n.last_heartbeat?.system?.storage || (n.resources?.storage_gb ? `${n.resources.storage_gb} GB` : "-");
 
           return `
             <tr style="cursor: pointer;" onclick="window.location.hash='#nodes'; setTimeout(() => viewNodeById('${n.node_id}'), 50);">
-              <td>${renderStatusPill(n.status)}</td>
               <td><strong>${n.name || n.node_id}</strong></td>
-              <td class="cell-muted">${n.role || 'compute'}</td>
+              <td>${renderStatusPill(n.status)}</td>
               <td class="mono">${cores} cores</td>
               <td class="mono">${memStr}</td>
-              <td class="mono cell-muted">${lastSeen}</td>
+              <td class="mono">${storageStr}</td>
             </tr>
           `;
         }).join("");
@@ -213,11 +201,14 @@ async function loadDashboard() {
         const primary = nodes[0];
         if (primary) {
           const sys = primary.last_heartbeat?.system || {};
-          document.getElementById("dash-sys-node-id").textContent = primary.node_id.slice(0, 16);
-          document.getElementById("sys-metric-host").textContent = primary.name || primary.node_id;
-          document.getElementById("sys-metric-arch").textContent = `${primary.platform || 'Termux'} · ${primary.architecture || 'aarch64'}`;
-          document.getElementById("sys-metric-cpu").textContent = `${sys.cpu_cores || primary.resources?.cpu_cores || '8'} cores`;
-          document.getElementById("sys-metric-mem").textContent = sys.memory || (primary.resources?.ram_mb ? `${primary.resources.ram_mb} MB` : '5.6 GB');
+          const sysNodeId = document.getElementById("dash-sys-node-id");
+          if (sysNodeId) sysNodeId.textContent = primary.node_id ? primary.node_id.slice(0, 16) : "";
+          if (document.getElementById("sys-metric-cpu")) document.getElementById("sys-metric-cpu").textContent = `${sys.cpu_cores || primary.resources?.cpu_cores || '8'} cores`;
+          if (document.getElementById("sys-metric-mem")) document.getElementById("sys-metric-mem").textContent = sys.memory || (primary.resources?.ram_mb ? `${(primary.resources.ram_mb/1024).toFixed(1)} GB` : '5.7 GB');
+          if (document.getElementById("sys-metric-storage")) document.getElementById("sys-metric-storage").textContent = sys.storage || (primary.resources?.storage_gb ? `${primary.resources.storage_gb} GB` : '106 GB');
+          if (document.getElementById("sys-metric-arch")) document.getElementById("sys-metric-arch").textContent = primary.architecture || 'aarch64';
+          if (document.getElementById("sys-metric-os")) document.getElementById("sys-metric-os").textContent = primary.os || 'Linux';
+          if (document.getElementById("sys-metric-uptime")) document.getElementById("sys-metric-uptime").textContent = sys.uptime ? formatDuration(sys.uptime) : (primary.last_seen ? timeAgo(primary.last_seen) : 'active');
         }
       }
     }
@@ -236,23 +227,20 @@ async function loadDashboard() {
 
       const jobsTbody = document.getElementById("dash-jobs-tbody");
       if (allJobs.length === 0) {
-        jobsTbody.innerHTML = `<tr><td colspan="6" class="cell-muted">No workload jobs executed yet.</td></tr>`;
+        jobsTbody.innerHTML = `<tr><td colspan="4" class="cell-muted">No workload jobs executed yet.</td></tr>`;
       } else {
         const recent = [...allJobs].reverse().slice(0, 6);
         jobsTbody.innerHTML = recent.map(j => {
           const jobId = j.job_id || j.id || "";
           const target = j.assigned_node || j.target_node || j.target || "auto";
           const duration = j.result?.duration_ms ? (j.result.duration_ms + "ms") : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
-          const createdStr = j.created_at ? new Date(j.created_at).toLocaleTimeString() : "-";
 
           return `
             <tr>
               <td class="mono"><a href="#jobs" onclick="setTimeout(() => viewJobById('${jobId}'), 50)"><strong>${jobId}</strong></a></td>
-              <td>${j.type}</td>
-              <td class="mono">${target}</td>
               <td>${renderStatusPill(j.status || j.state)}</td>
+              <td class="mono">${target}</td>
               <td class="mono cell-muted">${duration}</td>
-              <td class="mono cell-muted">${createdStr}</td>
             </tr>
           `;
         }).join("");
@@ -266,7 +254,6 @@ async function loadDashboard() {
       const usedPct = s.disk?.used_percent ? `${s.disk.used_percent} used` : "-";
       document.getElementById("sum-card-storage-main").textContent = freeStr;
       document.getElementById("sum-card-storage-sub").textContent = `${usedPct} · ${s.files_count || 0} files`;
-      document.getElementById("sys-metric-storage").textContent = s.storage_root || "~/PersonalServer/storage";
     }
 
     // Services Status
@@ -279,9 +266,6 @@ async function loadDashboard() {
 
       document.getElementById("sum-card-services-main").textContent = `${activeCount} active`;
       document.getElementById("sum-card-services-sub").textContent = `Node API, Tunnel, Controller`;
-      document.getElementById("sys-metric-services").innerHTML = `
-        <span class="status-dot dot-online">●</span> ${activeCount} connected
-      `;
     }
 
   } catch (err) {
@@ -311,25 +295,27 @@ async function loadNodes() {
     }
 
     if (cachedNodes.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="9" class="cell-muted">No cluster nodes registered.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="10" class="cell-muted">No cluster nodes registered.</td></tr>`;
       return;
     }
 
     tbody.innerHTML = cachedNodes.map(n => {
       const isOnline = (n.status || "").toUpperCase() === "ONLINE";
-      const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${n.resources.ram_mb} MB` : "-");
+      const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${(n.resources.ram_mb/1024).toFixed(1)} GB` : "-");
       const cores = n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-";
+      const storageStr = n.last_heartbeat?.system?.storage || (n.resources?.storage_gb ? `${n.resources.storage_gb} GB` : "-");
       const lastSeen = isOnline ? timeAgo(n.last_seen) : (n.last_seen ? timeAgo(n.last_seen) : "offline");
 
       return `
         <tr>
-          <td>${renderStatusPill(n.status)}</td>
           <td><strong>${n.name || n.node_id}</strong></td>
+          <td>${renderStatusPill(n.status)}</td>
           <td class="cell-muted">${n.role || 'compute'}</td>
           <td class="cell-muted">${n.platform || '-'}</td>
           <td class="mono cell-muted">${n.architecture || '-'}</td>
           <td class="mono">${cores} cores</td>
           <td class="mono">${memStr}</td>
+          <td class="mono">${storageStr}</td>
           <td class="mono cell-muted">${lastSeen}</td>
           <td style="text-align: right;">
             <button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button>
@@ -339,7 +325,7 @@ async function loadNodes() {
     }).join("");
 
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="9" class="pill-failed">Unable to load nodes: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="text-offline">Unable to load nodes: ${err.message}</td></tr>`;
   }
 }
 
@@ -365,11 +351,11 @@ window.viewNodeById = function(nodeId) {
     <div class="detail-item"><span class="detail-label">Platform</span><span class="detail-value">${node.platform || '-'} (${node.os || 'Linux'})</span></div>
     <div class="detail-item"><span class="detail-label">Architecture</span><span class="detail-value mono">${node.architecture || '-'}</span></div>
     <div class="detail-item"><span class="detail-label">CPU Cores</span><span class="detail-value mono">${sys.cpu_cores || node.resources?.cpu_cores || '-'} cores</span></div>
-    <div class="detail-item"><span class="detail-label">Memory</span><span class="detail-value mono">${sys.memory || (node.resources?.ram_mb ? node.resources.ram_mb + ' MB' : '-')}</span></div>
+    <div class="detail-item"><span class="detail-label">Memory</span><span class="detail-value mono">${sys.memory || (node.resources?.ram_mb ? (node.resources.ram_mb/1024).toFixed(1) + ' GB' : '-')}</span></div>
     <div class="detail-item"><span class="detail-label">Storage</span><span class="detail-value mono">${sys.storage || (node.resources?.storage_gb ? node.resources.storage_gb + ' GB' : '-')}</span></div>
     <div class="detail-item"><span class="detail-label">Capabilities</span><span class="detail-value mono">${caps}</span></div>
     <div class="detail-item"><span class="detail-label">Last Heartbeat</span><span class="detail-value mono">${node.last_seen || '-'} (${timeAgo(node.last_seen)})</span></div>
-    <div class="detail-item"><span class="detail-label">Services</span><span class="detail-value mono">Node API: ${srv.node_api || srv['node-api'] || 'running'} · Tunnel: ${srv.cloudflare || 'connected'}</span></div>
+    <div class="detail-item"><span class="detail-label">Services</span><span class="detail-value mono">API: ${srv.node_api || srv['node-api'] || 'running'} · Tunnel: ${srv.cloudflare || 'connected'}</span></div>
     <div class="detail-item"><span class="detail-label">Load Average</span><span class="detail-value mono">${(sys.load_average || []).join(', ') || '-'}</span></div>
   `;
 
@@ -424,7 +410,7 @@ async function loadJobs() {
     }).join("");
 
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" class="pill-failed">Unable to load jobs: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="text-offline">Unable to load jobs: ${err.message}</td></tr>`;
   }
 }
 
@@ -450,7 +436,7 @@ window.viewJobById = function(jobId) {
       <div class="detail-item"><span class="detail-label">Duration</span><span class="detail-value mono">${res.duration_ms ? res.duration_ms + 'ms' : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : '-')}</span></div>
       <div class="detail-item"><span class="detail-label">Exit Code</span><span class="detail-value mono">${res.exit_code !== undefined ? res.exit_code : '-'}</span></div>
       <div class="detail-item"><span class="detail-label">Created At</span><span class="detail-value mono">${j.created_at || '-'}</span></div>
-      <div class="detail-item"><span class="detail-label">Scheduler Decision</span><span class="detail-value">${sched.reason || 'Explicit selection'}</span></div>
+      <div class="detail-item"><span class="detail-label">Scheduler Reason</span><span class="detail-value">${sched.reason || 'Explicit selection'}</span></div>
       <div class="detail-item"><span class="detail-label">Retry Reason</span><span class="detail-value">${j.retry_reason || 'None'}</span></div>
     `;
 
@@ -548,9 +534,9 @@ function renderStorageNodePills() {
 
     return `
       <div class="storage-node-pill ${isSelected ? 'active' : ''}" onclick="switchStorageNode('${n.name || n.node_id}')">
-        <span class="status-dot ${isOnline ? 'dot-online' : 'dot-offline'}">●</span>
+        <span class="${isOnline ? 'text-online' : 'text-offline'}">●</span>
         <span>${n.name || n.node_id}${n.is_local ? ' (Local)' : ''}</span>
-        ${freeStr ? `<span class="node-pill-storage">${freeStr}</span>` : ''}
+        ${freeStr ? `<span class="node-pill-storage">· ${freeStr}</span>` : ''}
       </div>
     `;
   }).join("");
@@ -591,7 +577,7 @@ async function loadStorage(path = "", node = selectedStorageNode) {
       actionsContainer.innerHTML = `
         <input type="file" id="file-upload-input" style="display:none">
         <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
-        <button id="create-folder-btn" class="btn btn-sm">New folder</button>
+        <button id="create-folder-btn" class="btn btn-sm">New Folder</button>
       `;
       document.getElementById("upload-file-btn")?.addEventListener("click", () => {
         document.getElementById("file-upload-input")?.click();
@@ -600,7 +586,7 @@ async function loadStorage(path = "", node = selectedStorageNode) {
       document.getElementById("create-folder-btn")?.addEventListener("click", handleCreateFolder);
     } else {
       actionsContainer.innerHTML = `
-        <span class="storage-badge-ro">⚠️ Node Offline (Write Disabled)</span>
+        <span class="storage-badge-ro">Node Offline (Read Only)</span>
       `;
     }
   }
@@ -623,7 +609,6 @@ async function loadStorage(path = "", node = selectedStorageNode) {
         const itemRelPath = path ? `${path}/${item.name}` : item.name;
         const isDir = item.is_dir;
         const typeCategory = getFileTypeCategory(item.name, isDir);
-        const icon = getFileIcon(typeCategory);
         const modStr = item.modified ? new Date(item.modified * 1000).toLocaleDateString() : "-";
         const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
 
@@ -635,16 +620,16 @@ async function loadStorage(path = "", node = selectedStorageNode) {
           <tr>
             <td>
               ${isDir 
-                ? `<a href="javascript:void(0)" onclick="loadStorage('${itemRelPath}', '${node}')" style="font-weight: 500;">${icon} ${item.name}</a>`
-                : `<span class="mono">${icon} ${item.name}</span>`
+                ? `<a href="javascript:void(0)" onclick="loadStorage('${itemRelPath}', '${node}')" style="font-weight: 600;">📁 ${item.name}</a>`
+                : `<span class="mono">${item.name}</span>`
               }
             </td>
             <td class="cell-muted">${typeCategory}</td>
             <td class="mono cell-muted">${sizeStr}</td>
             <td class="mono cell-muted">${modStr}</td>
             <td style="text-align: right;">
-              <div style="display: inline-flex; gap: 6px;">
-                ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm btn-primary" download>Download</a>` : ''}
+              <div style="display: inline-flex; gap: 4px;">
+                ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download>Download</a>` : ''}
                 ${isOnline ? `<button class="btn btn-sm" onclick="renameItem('${itemRelPath}')">Rename</button>` : ''}
                 ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="deleteItem('${itemRelPath}', ${isDir})">Delete</button>` : ''}
               </div>
@@ -654,7 +639,7 @@ async function loadStorage(path = "", node = selectedStorageNode) {
       }).join("");
     }
 
-    // Load usage stats for the active node
+    // Load usage stats for active node
     const usageUrl = isLocal ? `/storage/usage` : `/storage/usage?node=${encodeURIComponent(node)}`;
     const usage = await apiFetch(usageUrl).catch(() => null);
     if (usage) {
@@ -667,7 +652,7 @@ async function loadStorage(path = "", node = selectedStorageNode) {
   } catch (err) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="5" class="pill-failed">
+        <td colspan="5" class="text-offline">
           Unable to load storage on ${nodeDisplayName}: ${err.message}
           <button class="btn btn-sm" style="margin-left: 10px;" onclick="loadStorage('${path}', '${node}')">Retry</button>
         </td>
