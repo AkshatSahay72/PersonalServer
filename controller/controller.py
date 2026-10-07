@@ -286,6 +286,60 @@ def allocate_host_port(apps_db):
     raise RuntimeError(f"Port exhaustion: All host ports in range {PORT_RANGE_START}-{PORT_RANGE_END} are allocated.")
 
 
+RESERVED_ROUTES = {
+    "/", "/api", "/static", "/storage", "/health", "/status",
+    "/cluster", "/nodes", "/jobs", "/admin", "/login", "/ws", "/apps"
+}
+
+
+def validate_app_route(route_dict, apps_db, current_app_id=None):
+    """
+    Validates application route metadata:
+    - Path must match ^/[a-zA-Z0-9_-]+$
+    - Path normalized to lowercase
+    - Rejects reserved system routes
+    - Enforces route path uniqueness across non-deleted applications
+    """
+    if route_dict is None:
+        return None
+
+    if not isinstance(route_dict, dict):
+        raise ValueError("Route specification must be an object with 'path' field.")
+
+    if not route_dict.get("enabled", True):
+        raw_path = str(route_dict.get("path", "")).strip().lower()
+        return {
+            "enabled": False,
+            "type": str(route_dict.get("type", "path")).lower(),
+            "path": raw_path,
+            "strip_prefix": bool(route_dict.get("strip_prefix", True)),
+            "public_access": bool(route_dict.get("public_access", True))
+        }
+
+    path = str(route_dict.get("path") or "").strip().lower()
+    if path in RESERVED_ROUTES:
+        raise ValueError(f"Route path '{path}' is a reserved PersonalServer system path.")
+
+    if not path or not re.match(r'^\/[a-zA-Z0-9_-]+$', path):
+        raise ValueError("Invalid route path. Must start with '/' followed only by alphanumeric characters, dashes, or underscores.")
+
+    for existing in apps_db.get("apps", {}).values():
+        if existing.get("status") == "DELETED" or existing.get("app_id") == current_app_id:
+            continue
+        existing_route = existing.get("route")
+        if existing_route and isinstance(existing_route, dict) and existing_route.get("enabled", True):
+            if str(existing_route.get("path", "")).strip().lower() == path:
+                raise ValueError(f"Route path '{path}' is already registered to application '{existing.get('name')}'.")
+
+    return {
+        "enabled": True,
+        "type": str(route_dict.get("type", "path")).lower(),
+        "path": path,
+        "strip_prefix": bool(route_dict.get("strip_prefix", True)),
+        "public_access": bool(route_dict.get("public_access", True))
+    }
+
+
 # ------------------------------------------------------------------------------
 # Onboarding Code Store & Validation
 # ------------------------------------------------------------------------------
@@ -1343,6 +1397,14 @@ class ControllerHandler(BaseHTTPRequestHandler):
                         self.send_json(409, {"error": f"Application with name '{name}' already exists."})
                         return
 
+                # Route metadata validation
+                route_data = body.get("route")
+                try:
+                    validated_route = validate_app_route(route_data, apps_db)
+                except ValueError as e:
+                    self.send_json(400, {"error": str(e)})
+                    return
+
                 try:
                     host_port = allocate_host_port(apps_db)
                 except Exception as e:
@@ -1364,6 +1426,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     "status": APP_STATE_CREATED,
                     "selected_node": None,
                     "container_id": f"ps-{name}",
+                    "route": validated_route,
                     "env": env if isinstance(env, dict) else {},
                     "cpu_limit": cpu_limit,
                     "memory_limit": memory_limit,
@@ -1381,6 +1444,34 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "status": "created",
                 "app_id": app_id,
                 "app": app_record
+            })
+            return
+
+        if path.startswith("/apps/") and path.endswith("/route"):
+            app_id = path[6:-6].strip()
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app:
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                route_data = body.get("route") if body else None
+                try:
+                    validated_route = validate_app_route(route_data, apps_db, current_app_id=app_id)
+                except ValueError as e:
+                    self.send_json(400, {"error": str(e)})
+                    return
+
+                app["route"] = validated_route
+                app["updated_at"] = get_current_iso_timestamp()
+                save_apps_db(apps_db)
+
+            self.send_json(200, {
+                "status": "updated",
+                "app_id": app_id,
+                "route": validated_route,
+                "app": app
             })
             return
 
