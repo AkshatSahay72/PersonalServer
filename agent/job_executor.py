@@ -8,6 +8,7 @@ output truncation limits, and exit-code capture.
 
 import sys
 import os
+import re
 import json
 import time
 import subprocess
@@ -162,7 +163,7 @@ class JobExecutor:
                 image = validate_docker_identifier(params.get("image"), "Docker Image")
                 container_name = validate_docker_identifier(params.get("container_name") or f"ps-{job_id}", "Container Name")
                 host_port = int(params.get("host_port", 0))
-                container_port = int(params.get("port") or params.get("container_port", 8000))
+                container_port = int(params.get("container_port") or params.get("target_port") or params.get("port", 8000))
                 if not (1 <= host_port <= 65535) or not (1 <= container_port <= 65535):
                     raise ValueError(f"Invalid port configuration: host_port={host_port}, container_port={container_port}")
 
@@ -181,19 +182,21 @@ class JobExecutor:
                 # Clean up existing container with same name if any
                 subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                # Pull image
-                pull_res = subprocess.run(["docker", "pull", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
-                if pull_res.returncode != 0:
-                    return {
-                        "job_id": job_id,
-                        "status": JOB_STATE_FAILED,
-                        "exit_code": pull_res.returncode,
-                        "stdout": truncate_output(pull_res.stdout),
-                        "stderr": f"Failed to pull image '{image}': {pull_res.stderr.strip()}",
-                        "duration_ms": int((time.time() - start_time) * 1000),
-                        "started_at": started_iso,
-                        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                    }
+                # Check if image exists locally first, otherwise pull image
+                image_inspect = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if image_inspect.returncode != 0:
+                    pull_res = subprocess.run(["docker", "pull", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
+                    if pull_res.returncode != 0:
+                        return {
+                            "job_id": job_id,
+                            "status": JOB_STATE_FAILED,
+                            "exit_code": pull_res.returncode,
+                            "stdout": truncate_output(pull_res.stdout),
+                            "stderr": f"Failed to pull image '{image}': {pull_res.stderr.strip()}",
+                            "duration_ms": int((time.time() - start_time) * 1000),
+                            "started_at": started_iso,
+                            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        }
 
                 # Construct safe run arguments (no shell=True, no host root mounts)
                 run_args = [

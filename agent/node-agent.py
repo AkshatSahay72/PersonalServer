@@ -109,21 +109,10 @@ def discover_hardware(base_dir=BASE_DIR):
     # Total Storage in GB
     storage_gb = 0
     try:
-        stat = os.statvfs(str(base_dir))
-        storage_gb = int(round((stat.f_blocks * stat.f_frsize) / (1024 ** 3)))
+        total_bytes, _, _ = shutil.disk_usage(str(base_dir))
+        storage_gb = int(round(total_bytes / (1024 ** 3)))
     except Exception:
         pass
-
-    if storage_gb <= 0:
-        try:
-            df_raw = run_cmd("df -k ~")
-            lines = df_raw.splitlines()
-            if len(lines) >= 2:
-                parts = lines[-1].split()
-                if len(parts) >= 2 and parts[1].isdigit():
-                    storage_gb = int(round(int(parts[1]) / (1024 * 1024)))
-        except Exception:
-            pass
 
     if storage_gb <= 0:
         storage_gb = 32  # safe fallback
@@ -131,9 +120,9 @@ def discover_hardware(base_dir=BASE_DIR):
     # Platform & OS & Architecture & Hostname
     is_termux = "com.termux" in os.environ.get("PREFIX", "")
     platform_name = "termux" if is_termux else sys.platform
-    os_name = platform.system() or run_cmd("uname -s") or "Linux"
-    arch = platform.machine() or run_cmd("uname -m") or "unknown"
-    hostname = socket.gethostname() or run_cmd("hostname") or "node"
+    os_name = "Android" if is_termux else (platform.system() or "Linux")
+    arch = platform.machine() or "unknown"
+    hostname = socket.gethostname() or "node"
 
     # Capability probing: Docker is true ONLY if daemon is reachable
     capabilities = {
@@ -203,25 +192,18 @@ def load_node_config():
         except Exception as e:
             print(f"Warning: Failed to read {NODE_CONF}: {e}", file=sys.stderr)
 
-    default_caps = {
-        "compute": True,
-        "storage": True,
-        "network": True
-    }
-    if is_docker_available():
-        default_caps["container_runtime:docker"] = True
-
+    hw = discover_hardware()
     return {
         "node_id": config.get("node_id", "unknown"),
-        "name": config.get("name", config.get("node_name", run_cmd("hostname") or "localhost")),
+        "name": config.get("name", config.get("node_name", hw["name"])),
         "role": config.get("role", config.get("node_role", "compute")),
-        "platform": config.get("platform", "termux" if "com.termux" in os.environ.get("PREFIX", "") else sys.platform),
-        "os": config.get("os", run_cmd("uname -s") or "Linux"),
-        "architecture": config.get("architecture", run_cmd("uname -m") or "unknown"),
-        "cpu_cores": int(config.get("cpu_cores", run_cmd("nproc") or 1)),
-        "ram_mb": int(config.get("ram_mb", 0)),
-        "storage_gb": int(config.get("storage_gb", 0)),
-        "capabilities": config.get("capabilities", default_caps)
+        "platform": config.get("platform", hw["platform"]),
+        "os": config.get("os", hw["os"]),
+        "architecture": config.get("architecture", hw["architecture"]),
+        "cpu_cores": int(config.get("cpu_cores", hw["cpu_cores"])),
+        "ram_mb": int(config.get("ram_mb", hw["ram_mb"])),
+        "storage_gb": int(config.get("storage_gb", hw["storage_gb"])),
+        "capabilities": config.get("capabilities", hw["capabilities"])
     }
 
 
@@ -285,45 +267,50 @@ def is_pid_alive(pid_str, pattern=None):
 def get_service_states():
     services = {}
 
-    api_pid = ""
-    api_pid_file = RUNTIME_DIR / "node-api.pid"
-    if api_pid_file.exists():
-        try:
-            api_pid = api_pid_file.read_text().strip()
-        except Exception:
-            pass
+    if is_docker_available():
+        services["docker"] = "running"
 
-    if not is_pid_alive(api_pid, "services/node-api/app.py"):
-        api_pid = run_cmd("pgrep -f 'services/node-api/app.py' | head -n 1")
+    if (BASE_DIR / "services" / "node-api" / "app.py").exists():
+        api_pid = ""
+        api_pid_file = RUNTIME_DIR / "node-api.pid"
+        if api_pid_file.exists():
+            try:
+                api_pid = api_pid_file.read_text().strip()
+            except Exception:
+                pass
 
-    if is_pid_alive(api_pid, "services/node-api/app.py"):
-        try:
-            req = urllib.request.Request("http://127.0.0.1:8080/health", headers={"User-Agent": "NodeAgent/1.0"})
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                if resp.status == 200:
-                    services["node_api"] = "running"
-                else:
-                    services["node_api"] = "degraded"
-        except Exception:
-            services["node_api"] = "unresponsive"
-    else:
-        services["node_api"] = "stopped"
+        if not is_pid_alive(api_pid, "services/node-api/app.py"):
+            api_pid = run_cmd("pgrep -f 'services/node-api/app.py' | head -n 1")
 
-    cf_pid = ""
-    cf_pid_file = RUNTIME_DIR / "cloudflared.pid"
-    if cf_pid_file.exists():
-        try:
-            cf_pid = cf_pid_file.read_text().strip()
-        except Exception:
-            pass
+        if is_pid_alive(api_pid, "services/node-api/app.py"):
+            try:
+                req = urllib.request.Request("http://127.0.0.1:8080/health", headers={"User-Agent": "NodeAgent/1.0"})
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    if resp.status == 200:
+                        services["node_api"] = "running"
+                    else:
+                        services["node_api"] = "degraded"
+            except Exception:
+                services["node_api"] = "unresponsive"
+        elif (BASE_DIR / "start.sh").exists():
+            services["node_api"] = "stopped"
 
-    if not is_pid_alive(cf_pid, "cloudflared"):
-        cf_pid = run_cmd("pgrep -f 'cloudflared tunnel run' | head -n 1")
+    if (BASE_DIR / "start.sh").exists():
+        cf_pid = ""
+        cf_pid_file = RUNTIME_DIR / "cloudflared.pid"
+        if cf_pid_file.exists():
+            try:
+                cf_pid = cf_pid_file.read_text().strip()
+            except Exception:
+                pass
 
-    if is_pid_alive(cf_pid, "cloudflared"):
-        services["cloudflare"] = "running"
-    else:
-        services["cloudflare"] = "stopped"
+        if not is_pid_alive(cf_pid, "cloudflared"):
+            cf_pid = run_cmd("pgrep -f 'cloudflared tunnel run' | head -n 1")
+
+        if is_pid_alive(cf_pid, "cloudflared"):
+            services["cloudflare"] = "running"
+        else:
+            services["cloudflare"] = "stopped"
 
     return services
 
@@ -506,6 +493,12 @@ def cmd_register(args):
         return 1
 
     node_info = load_node_config()
+    if not node_info.get("node_id") or node_info.get("node_id") == "unknown":
+        node_info["node_id"] = generate_node_id()
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(NODE_JSON, "w", encoding="utf-8") as f:
+            json.dump(node_info, f, indent=2)
+
     register_endpoint = f"{controller_url}/register"
 
     payload = json.dumps(node_info).encode("utf-8")

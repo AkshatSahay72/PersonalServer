@@ -1435,7 +1435,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                         "image": app["image"],
                         "container_name": app.get("container_id") or f"ps-{app['name']}",
                         "host_port": app["host_port"],
-                        "port": app["port"],
+                        "container_port": app.get("container_port", 8000),
                         "env": app.get("env", {}),
                         "cpu_limit": app.get("cpu_limit", "0.5"),
                         "memory_limit": app.get("memory_limit", "256m")

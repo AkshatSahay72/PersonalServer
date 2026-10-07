@@ -20,9 +20,13 @@ import time
 import urllib.request
 import urllib.error
 import unittest
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
 
 CONTROLLER_URL = "http://127.0.0.1:8000"
-ENROLLMENT_TOKEN_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "secrets", "enrollment.token")
+ENROLLMENT_TOKEN_PATH = os.path.join(str(BASE_DIR), "config", "secrets", "enrollment.token")
 
 def get_token():
     if os.path.exists(ENROLLMENT_TOKEN_PATH):
@@ -146,33 +150,25 @@ class Phase11BTests(unittest.TestCase):
 
     def test_04_scheduler_docker_capability_filtering(self):
         """
-        Verify that attempting to deploy a Docker container to the current cluster
-        (which consists of Android/Termux nodes vivo-y31 and node-02)
-        is cleanly rejected by the scheduler because no Docker-capable node exists.
-        The Android nodes must NOT be chosen.
+        Verify that attempting to schedule a Docker container on Android/non-docker nodes
+        is cleanly rejected by the scheduler.
         """
-        # Create an app
-        status, res = http_req("/apps", method="POST", data={
-            "name": "docker-scheduler-test",
-            "image": "python:3.11-slim",
-            "container_port": 5000,
-            "target": "auto"
-        }, headers=AUTH_HEADER)
-        self.assertEqual(status, 201)
-        app_id = res["app"]["app_id"]
-
-        try:
-            # Trigger Deploy
-            status, deploy_res = http_req(f"/apps/{app_id}/deploy", method="POST", headers=AUTH_HEADER)
-            # Must return 400/200 with FAILED status and explainable error
-            app_state = deploy_res.get("app", {})
-            self.assertEqual(app_state.get("status"), "FAILED", f"App should be FAILED, got: {app_state}")
-            self.assertIn("No Docker-capable node is currently available", app_state.get("failure_reason", ""))
-            self.assertIsNone(app_state.get("selected_node"), "Android node should NOT have been selected!")
-
-        finally:
-            # Clean up
-            http_req(f"/apps/{app_id}", method="DELETE", headers=AUTH_HEADER)
+        from datetime import datetime, timezone
+        from scheduler.scheduler import ResourceScheduler
+        android_only_cluster = {
+            "nodes": {
+                "server-5387a86bf36116b1": {
+                    "node_id": "server-5387a86bf36116b1",
+                    "name": "vivo-y31",
+                    "status": "ONLINE",
+                    "capabilities": {"compute": True, "storage": True, "network": True},
+                    "last_seen": datetime.now(timezone.utc).isoformat()
+                }
+            }
+        }
+        decision = ResourceScheduler.select_node({"capabilities": ["container_runtime:docker"]}, android_only_cluster, timeout_seconds=60)
+        self.assertIsNone(decision.get("selected_node"), "Android node should NOT have been selected for Docker workload")
+        self.assertIn("container_runtime:docker", decision.get("rejected", {}).get("server-5387a86bf36116b1", ""))
 
     def test_05_job_executor_security_and_argument_safety(self):
         """
@@ -230,10 +226,11 @@ class Phase11BTests(unittest.TestCase):
         self.assertIn("vivo-y31", node_names)
         self.assertIn("node-02", node_names)
 
-        # Ensure Docker capability is correctly False/absent on Android nodes
+        # Ensure Docker capability is correctly False on Android nodes
         for node in online_nodes:
-            caps = node.get("capabilities", {})
-            self.assertFalse(caps.get("container_runtime:docker", False), f"Node {node['name']} must not fake Docker support")
+            if node.get("name") in ["vivo-y31", "node-02"]:
+                caps = node.get("capabilities", {})
+                self.assertFalse(caps.get("container_runtime:docker", False), f"Node {node['name']} must not fake Docker support")
 
     def test_07_regression_standard_jobs(self):
         """Verify standard non-docker workloads continue to execute normally."""
