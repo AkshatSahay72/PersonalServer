@@ -319,73 +319,116 @@
         </div>
       </section>
 
-      <!-- 4. STORAGE VIEW -->
+      <!-- 4. STORAGE VIEW (Windows Explorer Style) -->
       <section id="view-storage" class="page-view">
-        <div class="section-card" id="storage-main-card">
-          <!-- Storage Header & Actions -->
-          <div class="storage-head">
-            <div class="storage-title-wrap">
-              <span class="section-title">Storage</span>
-              <span class="storage-summary-badge mono cell-muted" id="storage-summary-badge">Cluster Storage · 96 GB free</span>
+        <div class="explorer-container" id="storage-main-card">
+          
+          <!-- Top Explorer Header & Controls Toolbar -->
+          <div class="explorer-toolbar">
+            <!-- Navigation Buttons: Back, Forward, Up -->
+            <div class="explorer-nav-buttons">
+              <button id="storage-back-btn" class="explorer-btn" title="Back" disabled>←</button>
+              <button id="storage-forward-btn" class="explorer-btn" title="Forward" disabled>→</button>
+              <button id="storage-up-btn" class="explorer-btn" title="Up one folder" disabled>↑</button>
             </div>
-            <div class="storage-toolbar">
+
+            <!-- Explorer Address Bar (Breadcrumbs + Location Selector) -->
+            <div class="explorer-address-bar">
+              <span class="explorer-address-icon">📁</span>
+              <div class="storage-breadcrumbs mono" id="storage-breadcrumbs">
+                <span class="crumb current">Home</span>
+              </div>
+              <div class="explorer-location-dropdown">
+                <select id="storage-node-select" class="form-input form-input-sm mono explorer-node-select" title="Storage Location">
+                  <option value="auto">Storage: Auto (Cluster)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Explorer Actions & Search on Right -->
+            <div class="explorer-actions-bar">
+              <div class="explorer-search-wrap">
+                <input type="text" id="storage-filter-input" class="form-input form-input-sm mono" placeholder="Search storage...">
+              </div>
+              <button id="storage-refresh-btn" class="explorer-btn" title="Refresh storage">⟳</button>
+              
               <div class="storage-actions" id="storage-actions-container">
-                <input type="file" id="file-upload-input" style="display:none">
+                <input type="file" id="file-upload-input" style="display:none" multiple>
                 <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
                 <button id="create-folder-btn" class="btn btn-sm">New Folder</button>
               </div>
-              <div class="storage-filter-wrap">
-                <input type="text" id="storage-filter-input" class="form-input form-input-sm mono" placeholder="Filter files...">
+            </div>
+          </div>
+
+          <!-- Explorer Workspace: Left Quick-Access Sidebar + Main Details View -->
+          <div class="explorer-workspace">
+            
+            <!-- Left Explorer Navigation Pane -->
+            <aside class="explorer-nav-pane">
+              <div class="explorer-nav-group">
+                <div class="explorer-nav-header">Quick access</div>
+                <nav class="explorer-shortcuts">
+                  <a href="javascript:void(0)" class="explorer-shortcut active" data-nav-path="" onclick="navigateToShortcut('')">
+                    <span class="shortcut-icon">🏠</span>
+                    <span>Home</span>
+                  </a>
+                  <a href="javascript:void(0)" class="explorer-shortcut" data-nav-path="Documents" onclick="navigateToShortcut('Documents')">
+                    <span class="shortcut-icon">📄</span>
+                    <span>Documents</span>
+                  </a>
+                  <a href="javascript:void(0)" class="explorer-shortcut" data-nav-path="Downloads" onclick="navigateToShortcut('Downloads')">
+                    <span class="shortcut-icon">⬇️</span>
+                    <span>Downloads</span>
+                  </a>
+                  <a href="javascript:void(0)" class="explorer-shortcut" data-nav-path="Projects" onclick="navigateToShortcut('Projects')">
+                    <span class="shortcut-icon">📦</span>
+                    <span>Projects</span>
+                  </a>
+                </nav>
               </div>
-              <button id="storage-refresh-btn" class="btn btn-sm" title="Refresh storage">↻</button>
-              <button id="storage-adv-toggle-btn" class="btn btn-sm" title="Advanced node placement">Location ▾</button>
+
+              <div class="explorer-nav-group">
+                <div class="explorer-nav-header">Locations</div>
+                <div class="explorer-node-list mono" id="explorer-node-list">
+                  <!-- Dynamically populated node items -->
+                </div>
+              </div>
+            </aside>
+
+            <!-- Main File Details Area & Dropzone -->
+            <div class="explorer-content-pane storage-dropzone" id="storage-dropzone">
+              <div class="table-container explorer-table-wrap">
+                <table class="data-table explorer-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 44%;">Name</th>
+                      <th style="width: 16%;">Type</th>
+                      <th style="width: 14%;">Size</th>
+                      <th style="width: 26%;">Date modified</th>
+                      <th class="explorer-actions-col" style="width: 1px; text-align: right;"></th>
+                    </tr>
+                  </thead>
+                  <tbody id="storage-tbody">
+                    <tr><td colspan="5" class="cell-muted">Loading storage items...</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
 
-          <!-- Multi-Node Switcher Bar (Hidden by default / Advanced) -->
-          <div class="storage-node-bar" id="storage-node-bar" style="display:none;">
-            <span class="storage-node-label mono cell-muted">TARGET NODE:</span>
-            <div class="storage-node-pills" id="storage-node-pills">
-              <span class="storage-node-pill active">Auto (Cluster)</span>
-              <span class="storage-node-pill">vivo-y31 (Local)</span>
-              <span class="storage-node-pill">node-02</span>
-            </div>
-          </div>
-
-          <!-- Breadcrumbs Bar with Back / Up Button -->
-          <div class="storage-nav-bar">
-            <button id="storage-up-btn" class="btn btn-sm" title="Go up one folder" disabled>↰ Up</button>
-            <div class="storage-breadcrumbs mono" id="storage-breadcrumbs">
-              <span class="crumb current">Home</span>
-            </div>
-          </div>
-
-          <!-- File Table & Dropzone -->
-          <div class="table-container storage-dropzone" id="storage-dropzone">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th style="width: 100px;">Type</th>
-                  <th style="width: 110px;">Size</th>
-                  <th style="width: 140px;">Modified</th>
-                  <th style="width: 220px; text-align: right;">Actions</th>
-                </tr>
-              </thead>
-              <tbody id="storage-tbody">
-                <tr><td colspan="5" class="cell-muted">Loading storage items...</td></tr>
-              </tbody>
-            </table>
-          </div>
-
-          <!-- Storage Footer -->
-          <div class="storage-footer mono cell-muted" id="storage-footer-stats">
-            96 GB free · 0 files · 0 folders
+          <!-- Explorer Status Bar -->
+          <div class="explorer-status-bar mono cell-muted">
+            <span id="storage-footer-stats-left">0 items</span>
+            <span id="storage-footer-stats-right">96 GB available</span>
+            <div id="storage-footer-stats" style="display:none"></div>
+            <div id="storage-summary-badge" style="display:none"></div>
+            <div id="storage-node-pills" style="display:none"></div>
+            <div id="storage-node-bar" style="display:none"></div>
           </div>
         </div>
 
-        <!-- Storage Item Properties Panel -->
-        <div id="storage-properties-panel" class="section-card" style="display:none">
+        <!-- Storage Item Properties Panel (Windows Details Style) -->
+        <div id="storage-properties-panel" class="section-card explorer-properties-panel" style="display:none">
           <div class="section-header">
             <span class="section-title" id="storage-props-title">Item Properties</span>
             <button class="btn btn-sm" onclick="closeStorageProperties()">Close</button>

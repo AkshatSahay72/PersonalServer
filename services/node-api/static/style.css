@@ -427,141 +427,294 @@ a:hover {
 }
 .form-btn-cell .btn {
   height: 28px;
-}
-
-/* Storage Section */
-.storage-head {
+/* Windows File Explorer Container & Layout */
+.explorer-container {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border-color);
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.storage-title-wrap {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-.storage-summary-badge {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.storage-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.storage-actions {
-  display: flex;
-  gap: 6px;
-}
-.storage-filter-wrap {
-  width: 160px;
-}
-.form-input-sm {
-  height: 24px;
-  padding: 2px 8px;
-  font-size: 11px;
-}
-
-/* Storage Multi-Node Switcher */
-.storage-node-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  background-color: rgba(0, 0, 0, 0.15);
-  border-bottom: 1px solid var(--border-color);
-  flex-wrap: wrap;
-}
-.storage-node-label {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-.storage-node-pills {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.storage-node-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
-  font-size: 11px;
-  font-family: var(--font-mono);
+  flex-direction: column;
   background-color: var(--bg-panel);
   border: 1px solid var(--border-color);
   border-radius: var(--radius);
-  color: var(--text-muted);
-  cursor: pointer;
+  overflow: hidden;
 }
-.storage-node-pill:hover {
-  background-color: var(--bg-active);
+
+/* 1. Top Ribbon & Controls Toolbar */
+.explorer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background-color: var(--bg-panel-header);
+  border-bottom: 1px solid var(--border-color);
+  flex-wrap: wrap;
+}
+
+.explorer-nav-buttons {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.explorer-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
   color: var(--text-main);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+
+.explorer-btn:hover:not(:disabled) {
+  background-color: var(--bg-active);
   border-color: var(--text-dim);
 }
-.storage-node-pill.active {
-  background-color: var(--bg-active);
-  border-color: var(--text-main);
-  color: var(--text-main);
-  font-weight: 600;
+
+.explorer-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  color: var(--text-muted);
 }
-.storage-node-pill .node-pill-storage {
-  color: var(--text-dim);
-  margin-left: 2px;
+
+/* 2. Windows Explorer Address Bar */
+.explorer-address-bar {
+  flex: 1;
+  min-width: 220px;
+  height: 26px;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  gap: 6px;
 }
-.storage-badge-ro {
-  display: inline-flex;
+
+.explorer-address-bar:focus-within {
+  border-color: var(--border-focus);
+}
+
+.explorer-address-icon {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.storage-breadcrumbs {
+  flex: 1;
+  display: flex;
   align-items: center;
   gap: 4px;
   font-size: 11px;
-  color: var(--status-yellow);
-  font-family: var(--font-mono);
-}
-
-/* Breadcrumbs & Navigation Bar */
-.storage-nav-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border-color);
-  background-color: rgba(0, 0, 0, 0.25);
-}
-.storage-breadcrumbs {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
   overflow-x: auto;
   white-space: nowrap;
 }
+
 .crumb {
-  color: var(--link-color);
+  color: var(--text-muted);
   cursor: pointer;
+  padding: 1px 4px;
+  border-radius: 2px;
 }
+
 .crumb:hover {
-  text-decoration: underline;
+  background-color: var(--bg-active);
+  color: var(--text-main);
+  text-decoration: none;
 }
+
 .crumb.current {
   color: var(--text-main);
   font-weight: 600;
   cursor: default;
+}
+
+.explorer-location-dropdown {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.explorer-node-select {
+  height: 22px;
+  padding: 1px 6px;
+  font-size: 11px;
+  background-color: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+}
+
+.explorer-node-select:hover, .explorer-node-select:focus {
+  background-color: var(--bg-active);
+  border-color: var(--border-color);
+  color: var(--text-main);
+}
+
+/* 3. Actions & Search Bar */
+.explorer-actions-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.explorer-search-wrap {
+  width: 150px;
+}
+
+.explorer-search-wrap input {
+  height: 26px;
+  font-size: 11px;
+}
+
+/* 4. Explorer Workspace: Split Navigation Pane + Main Content */
+.explorer-workspace {
+  display: flex;
+  min-height: 420px;
+}
+
+.explorer-nav-pane {
+  width: 170px;
+  min-width: 170px;
+  background-color: var(--bg-sidebar);
+  border-right: 1px solid var(--border-color);
+  padding: 10px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+.explorer-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.explorer-nav-header {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  padding: 2px 8px 4px 8px;
+}
+
+.explorer-shortcuts, .explorer-node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.explorer-shortcut, .explorer-node-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-radius: var(--radius);
+  cursor: pointer;
   text-decoration: none;
+}
+
+.explorer-shortcut:hover, .explorer-node-item:hover {
+  background-color: var(--bg-panel);
+  color: var(--text-main);
+  text-decoration: none;
+}
+
+.explorer-shortcut.active, .explorer-node-item.active {
+  background-color: var(--bg-active);
+  color: var(--text-main);
+  font-weight: 600;
+}
+
+.shortcut-icon {
+  font-size: 12px;
+  width: 14px;
+  text-align: center;
+}
+
+/* 5. Main Content Pane & Details Table */
+.explorer-content-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background-color: var(--bg-panel);
+}
+
+.explorer-table-wrap {
+  flex: 1;
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+.explorer-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.explorer-table tbody tr {
+  cursor: pointer;
+  user-select: none;
+}
+
+.explorer-table tbody tr:hover {
+  background-color: var(--bg-row-hover);
+}
+
+.explorer-table tbody tr.selected {
+  background-color: var(--bg-active);
+}
+
+.explorer-table tbody tr.selected td {
+  color: var(--text-main);
+}
+
+.explorer-table .file-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.explorer-table .file-icon {
+  font-size: 13px;
+  width: 16px;
+  text-align: center;
+}
+
+.explorer-row-actions {
+  display: inline-flex;
+  gap: 4px;
+  opacity: 0.35;
+  transition: opacity 0.1s ease;
+}
+
+.explorer-table tr:hover .explorer-row-actions,
+.explorer-table tr.selected .explorer-row-actions {
+  opacity: 1;
+}
+
+/* 6. Explorer Status Bar */
+.explorer-status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 12px;
+  background-color: var(--bg-panel-header);
+  border-top: 1px solid var(--border-color);
+  font-size: 11px;
 }
 
 /* Dropzone & Drag State */
 .storage-dropzone {
   position: relative;
-  min-height: 180px;
-  transition: background-color 0.15s ease, border-color 0.15s ease;
+  transition: background-color 0.15s ease;
 }
+
 .storage-dropzone.drag-active {
   background-color: rgba(88, 166, 255, 0.08);
   outline: 2px dashed var(--border-focus);
@@ -574,16 +727,25 @@ a:hover {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 36px 16px;
-  gap: 12px;
+  padding: 48px 16px;
+  gap: 8px;
   color: var(--text-muted);
 }
-.storage-empty-title {
-  font-size: 13px;
+
+.storage-empty-icon {
+  font-size: 24px;
+  opacity: 0.4;
 }
+
+.storage-empty-title {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 .storage-empty-actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
+  margin-top: 4px;
 }
 
 /* File / Folder Row Items */

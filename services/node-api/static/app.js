@@ -104,9 +104,21 @@ function getFileTypeCategory(filename, isDir) {
   if (["jpg", "jpeg", "png", "gif", "svg", "webp", "ico"].includes(ext)) return "Image";
   if (["mp4", "mkv", "webm", "mov", "avi"].includes(ext)) return "Video";
   if (["mp3", "wav", "flac", "ogg"].includes(ext)) return "Audio";
-  if (["pdf", "doc", "docx", "txt", "md", "csv", "json", "yml", "yaml", "xml"].includes(ext)) return "Document";
+  if (["pdf"].includes(ext)) return "PDF Document";
+  if (["doc", "docx", "txt", "md", "csv", "json", "yml", "yaml", "xml"].includes(ext)) return "Document";
   if (["py", "sh", "js", "ts", "html", "css", "c", "cpp", "go", "rs"].includes(ext)) return "Code";
   return "File";
+}
+
+function getFileIcon(filename, isDir) {
+  if (isDir) return "📁";
+  const ext = (filename.split('.').pop() || "").toLowerCase();
+  if (["zip", "tar", "gz", "tgz", "bz2", "7z", "rar"].includes(ext)) return "📦";
+  if (["jpg", "jpeg", "png", "gif", "svg", "webp", "ico"].includes(ext)) return "🖼️";
+  if (["mp4", "mkv", "webm", "mov", "avi"].includes(ext)) return "🎬";
+  if (["mp3", "wav", "flac", "ogg"].includes(ext)) return "🎵";
+  if (["py", "sh", "js", "ts", "html", "css", "c", "cpp", "go", "rs"].includes(ext)) return "💻";
+  return "📄";
 }
 
 function renderStatusPill(state) {
@@ -496,9 +508,13 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
   }
 });
 
-// 4. Storage View & Multi-Node Discovery
+// 4. Storage View (Windows File Explorer Subsystem)
 let cachedStorageItems = [];
 let storageFilterQuery = "";
+let pathHistory = [""];
+let historyIndex = 0;
+let isNavigatingHistory = false;
+let selectedItemName = null;
 
 async function loadStorageNodes() {
   try {
@@ -522,72 +538,123 @@ async function loadStorageNodes() {
     }];
   }
 
-  // If no node selected, default to auto/local
-  if (!selectedStorageNode) {
-    const localNode = cachedStorageNodes.find(n => n.is_local) || cachedStorageNodes[0];
-    selectedStorageNode = localNode ? (localNode.name || localNode.node_id) : "vivo-y31";
+  // Populate address bar location dropdown & left pane location list
+  const nodeSelect = document.getElementById("storage-node-select");
+  if (nodeSelect) {
+    const currentVal = selectedStorageNode || "auto";
+    nodeSelect.innerHTML = `<option value="auto">Storage: Auto (Cluster)</option>` +
+      cachedStorageNodes.map(n => `<option value="${n.name || n.node_id}">Node: ${n.name || n.node_id}${n.is_local ? ' (Local)' : ''} [${n.status}]</option>`).join("");
+    nodeSelect.value = selectedStorageNode ? (selectedStorageNode === "vivo-y31" ? "auto" : selectedStorageNode) : "auto";
   }
 
-  renderStorageNodePills();
-}
-
-function renderStorageNodePills() {
-  const container = document.getElementById("storage-node-pills");
-  if (!container) return;
-
-  container.innerHTML = cachedStorageNodes.map(n => {
-    const isOnline = (n.status || "").toUpperCase() === "ONLINE";
-    const isSelected = n.name === selectedStorageNode || n.node_id === selectedStorageNode;
-    const freeStr = n.storage?.available ? `${n.storage.available} free` : "";
-
-    return `
-      <div class="storage-node-pill ${isSelected ? 'active' : ''}" onclick="switchStorageNode('${n.name || n.node_id}')">
-        <span class="${isOnline ? 'text-online' : 'text-offline'}">●</span>
-        <span>${n.name || n.node_id}${n.is_local ? ' (Local)' : ''}</span>
-        ${freeStr ? `<span class="node-pill-storage">· ${freeStr}</span>` : ''}
-      </div>
-    `;
-  }).join("");
+  const nodeList = document.getElementById("explorer-node-list");
+  if (nodeList) {
+    nodeList.innerHTML = cachedStorageNodes.map(n => {
+      const isOnline = (n.status || "").toUpperCase() === "ONLINE";
+      const isSelected = n.name === selectedStorageNode || n.node_id === selectedStorageNode;
+      const isAutoSelected = !selectedStorageNode && n.is_local;
+      const activeClass = (isSelected || isAutoSelected) ? "active" : "";
+      return `
+        <a href="javascript:void(0)" class="explorer-node-item ${activeClass}" onclick="switchStorageNode('${n.name || n.node_id}')">
+          <span class="${isOnline ? 'text-online' : 'text-offline'}" style="font-size: 9px;">●</span>
+          <span>${n.name || n.node_id}${n.is_local ? ' (Local)' : ''}</span>
+        </a>
+      `;
+    }).join("");
+  }
 }
 
 window.switchStorageNode = function(nodeNameOrId) {
-  selectedStorageNode = nodeNameOrId;
+  selectedStorageNode = (nodeNameOrId === "auto") ? null : nodeNameOrId;
   currentPath = "";
-  renderStorageNodePills();
-  loadStorage("", selectedStorageNode);
+  pathHistory = [""];
+  historyIndex = 0;
+  loadStorageNodes().then(() => loadStorage("", selectedStorageNode, true));
 };
 
-// Toggle Advanced Location Bar
-document.getElementById("storage-adv-toggle-btn")?.addEventListener("click", () => {
-  const bar = document.getElementById("storage-node-bar");
-  if (bar) {
-    bar.style.display = (bar.style.display === "none" || !bar.style.display) ? "flex" : "none";
+// Location select dropdown in Address Bar
+document.getElementById("storage-node-select")?.addEventListener("change", (e) => {
+  const val = e.target.value;
+  switchStorageNode(val);
+});
+
+// Navigation Toolbar Buttons: Back, Forward, Up, Refresh
+document.getElementById("storage-back-btn")?.addEventListener("click", () => {
+  if (historyIndex > 0) {
+    isNavigatingHistory = true;
+    historyIndex--;
+    loadStorage(pathHistory[historyIndex], selectedStorageNode, false);
+    isNavigatingHistory = false;
   }
 });
 
-// Up button handler
+document.getElementById("storage-forward-btn")?.addEventListener("click", () => {
+  if (historyIndex < pathHistory.length - 1) {
+    isNavigatingHistory = true;
+    historyIndex++;
+    loadStorage(pathHistory[historyIndex], selectedStorageNode, false);
+    isNavigatingHistory = false;
+  }
+});
+
 document.getElementById("storage-up-btn")?.addEventListener("click", () => {
   if (!currentPath) return;
   const parts = currentPath.split("/").filter(Boolean);
   parts.pop();
   const parentPath = parts.join("/");
-  loadStorage(parentPath, selectedStorageNode);
+  loadStorage(parentPath, selectedStorageNode, true);
 });
 
-// Search / Filter input listener
+document.getElementById("storage-refresh-btn")?.addEventListener("click", () => {
+  loadStorage(currentPath, selectedStorageNode, false);
+});
+
+// Search input listener
 document.getElementById("storage-filter-input")?.addEventListener("input", (e) => {
   storageFilterQuery = (e.target.value || "").trim().toLowerCase();
   renderStorageTable();
 });
 
-// Refresh button
-document.getElementById("storage-refresh-btn")?.addEventListener("click", () => {
-  loadStorage(currentPath, selectedStorageNode);
-});
+// Quick access shortcut navigation
+window.navigateToShortcut = function(navPath) {
+  loadStorage(navPath, selectedStorageNode, true);
+};
 
-async function loadStorage(path = "", node = selectedStorageNode) {
+function updateNavButtonsAndShortcuts() {
+  const backBtn = document.getElementById("storage-back-btn");
+  const fwdBtn = document.getElementById("storage-forward-btn");
+  const upBtn = document.getElementById("storage-up-btn");
+
+  if (backBtn) backBtn.disabled = (historyIndex <= 0);
+  if (fwdBtn) fwdBtn.disabled = (historyIndex >= pathHistory.length - 1);
+  if (upBtn) upBtn.disabled = !currentPath;
+
+  // Highlight active shortcut
+  document.querySelectorAll(".explorer-shortcut").forEach(el => {
+    const navPath = el.getAttribute("data-nav-path");
+    if (navPath === currentPath) {
+      el.classList.add("active");
+    } else {
+      el.classList.remove("active");
+    }
+  });
+}
+
+async function loadStorage(path = "", node = selectedStorageNode, pushHistory = true) {
   updateLastRefreshed();
   currentPath = path;
+
+  // Manage History Stack
+  if (pushHistory && !isNavigatingHistory) {
+    if (pathHistory[historyIndex] !== path) {
+      pathHistory = pathHistory.slice(0, historyIndex + 1);
+      pathHistory.push(path);
+      historyIndex = pathHistory.length - 1;
+    }
+  }
+
+  updateNavButtonsAndShortcuts();
+  renderBreadcrumbs(path);
 
   let nodeObj = cachedStorageNodes.find(n => n.name === node || n.node_id === node);
   if (!nodeObj && cachedStorageNodes.length > 0) {
@@ -596,18 +663,8 @@ async function loadStorage(path = "", node = selectedStorageNode) {
     node = selectedStorageNode;
   }
   const isLocal = !nodeObj || nodeObj.is_local;
-  const nodeDisplayName = nodeObj ? (nodeObj.name || nodeObj.node_id) : (node || "vivo-y31");
-
-  // Update Up Button state
-  const upBtn = document.getElementById("storage-up-btn");
-  if (upBtn) {
-    upBtn.disabled = !currentPath;
-  }
-
-  renderStorageNodePills();
-  renderBreadcrumbs(path);
-
   const isOnline = (nodeObj?.status || "").toUpperCase() === "ONLINE";
+
   const actionsContainer = document.getElementById("storage-actions-container");
   if (actionsContainer) {
     if (isOnline) {
@@ -634,7 +691,7 @@ async function loadStorage(path = "", node = selectedStorageNode) {
   }
 
   const tbody = document.getElementById("storage-tbody");
-  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">Loading storage items...</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted" style="text-align: center; padding: 24px;">Loading storage items...</td></tr>`;
 
   try {
     const listUrl = isLocal 
@@ -645,31 +702,38 @@ async function loadStorage(path = "", node = selectedStorageNode) {
     cachedStorageItems = data.items || [];
     renderStorageTable();
 
-    // Load usage stats for storage summary
+    // Fetch usage statistics for footer status bar
     const usageUrl = isLocal ? `/storage/usage` : `/storage/usage?node=${encodeURIComponent(node)}`;
     const usage = await apiFetch(usageUrl).catch(() => null);
-    if (usage) {
-      const freeStr = usage.disk?.available ? `${usage.disk.available} free` : (nodeObj?.storage?.available || "Available");
-      const totalStr = usage.disk?.total ? ` / ${usage.disk.total}` : "";
-      const usedPct = usage.disk?.used_percent ? `${usage.disk.used_percent} used` : (nodeObj?.storage?.used_percent || "-");
-      
-      const badgeEl = document.getElementById("storage-summary-badge");
-      if (badgeEl) {
-        badgeEl.textContent = `${freeStr}${totalStr}`;
+    
+    const leftStats = document.getElementById("storage-footer-stats-left");
+    const rightStats = document.getElementById("storage-footer-stats-right");
+    const oldFooter = document.getElementById("storage-footer-stats");
+
+    const filesCount = cachedStorageItems.filter(i => !i.is_dir).length;
+    const foldersCount = cachedStorageItems.filter(i => i.is_dir).length;
+    const totalCount = cachedStorageItems.length;
+
+    if (leftStats) {
+      leftStats.textContent = `${totalCount} item${totalCount === 1 ? '' : 's'} (${filesCount} file${filesCount === 1 ? '' : 's'}, ${foldersCount} folder${foldersCount === 1 ? '' : 's'})`;
+    }
+
+    if (usage && usage.disk) {
+      const availStr = usage.disk.available || "Available";
+      if (rightStats) {
+        rightStats.textContent = `${availStr} available`;
       }
-      
-      const footerEl = document.getElementById("storage-footer-stats");
-      if (footerEl) {
-        footerEl.textContent = `${freeStr} free · ${usedPct} · ${usage.files_count || 0} files · ${usage.folders_count || 0} folders`;
+      if (oldFooter) {
+        oldFooter.textContent = `${availStr} free · ${usage.disk.used_percent || '-'} · ${usage.files_count || 0} files · ${usage.folders_count || 0} folders`;
       }
     }
 
   } catch (err) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="5" class="text-offline">
+        <td colspan="5" class="text-offline" style="text-align: center; padding: 20px;">
           Unable to load storage: ${err.message}
-          <button class="btn btn-sm" style="margin-left: 10px;" onclick="loadStorage('${path}', '${node}')">Retry</button>
+          <button class="btn btn-sm" style="margin-left: 10px;" onclick="loadStorage('${path}', '${node}', false)">Retry</button>
         </td>
       </tr>
     `;
@@ -692,12 +756,13 @@ function renderStorageTable() {
 
   if (items.length === 0) {
     if (storageFilterQuery) {
-      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted" style="text-align: center; padding: 24px;">No items match "${storageFilterQuery}".</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted" style="text-align: center; padding: 32px;">No items match "${escapeHtml(storageFilterQuery)}".</td></tr>`;
     } else {
       tbody.innerHTML = `
         <tr>
           <td colspan="5" style="padding: 0;">
             <div class="storage-empty-state">
+              <span class="storage-empty-icon">📁</span>
               <span class="storage-empty-title">This folder is empty.</span>
               <div class="storage-empty-actions">
                 ${isOnline ? `<button class="btn btn-sm btn-primary" onclick="document.getElementById('file-upload-input')?.click()">Upload File</button>` : ''}
@@ -711,7 +776,7 @@ function renderStorageTable() {
     return;
   }
 
-  // Sort directories first, then alphabetical
+  // Sort folders first, then alphabetical
   items.sort((a, b) => {
     if (a.is_dir && !b.is_dir) return -1;
     if (!a.is_dir && b.is_dir) return 1;
@@ -722,9 +787,11 @@ function renderStorageTable() {
     const itemRelPath = currentPath ? `${currentPath}/${item.name}` : item.name;
     const isDir = item.is_dir;
     const typeCategory = getFileTypeCategory(item.name, isDir);
-    const modStr = item.modified ? new Date(item.modified * 1000).toLocaleDateString() : "-";
+    const icon = getFileIcon(item.name, isDir);
+    const modStr = item.modified ? new Date(item.modified * 1000).toLocaleString(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    }) : "-";
     const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
-    const icon = isDir ? "📁" : "📄";
 
     const downloadUrl = isLocal
       ? `/storage/download?path=${encodeURIComponent(itemRelPath)}`
@@ -732,15 +799,16 @@ function renderStorageTable() {
 
     const escapedPath = itemRelPath.replace(/'/g, "\\'");
     const escapedName = item.name.replace(/'/g, "\\'");
+    const isSelected = selectedItemName === item.name ? "selected" : "";
 
     return `
-      <tr>
+      <tr class="explorer-row ${isSelected}" onclick="selectStorageRow(event, '${escapedName}')" ondblclick="${isDir ? `loadStorage('${escapedPath}', '${node}', true)` : `viewStorageProperties('${escapedPath}', false)`}">
         <td>
           <div class="file-name-cell">
             <span class="file-icon">${icon}</span>
             ${isDir 
-              ? `<a href="javascript:void(0)" onclick="loadStorage('${escapedPath}', '${node}')">${item.name}</a>`
-              : `<span class="mono">${item.name}</span>`
+              ? `<a href="javascript:void(0)" class="mono" style="font-weight: 500;" onclick="event.stopPropagation(); loadStorage('${escapedPath}', '${node}', true)">${escapeHtml(item.name)}</a>`
+              : `<span class="mono">${escapeHtml(item.name)}</span>`
             }
           </div>
         </td>
@@ -748,11 +816,11 @@ function renderStorageTable() {
         <td class="mono cell-muted">${sizeStr}</td>
         <td class="mono cell-muted">${modStr}</td>
         <td style="text-align: right;">
-          <div style="display: inline-flex; gap: 4px;">
-            ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download>Download</a>` : ''}
-            ${isOnline ? `<button class="btn btn-sm" onclick="renameItem('${escapedPath}')">Rename</button>` : ''}
-            ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="deleteItem('${escapedPath}', ${isDir})">Delete</button>` : ''}
-            <button class="btn btn-sm" onclick="viewStorageProperties('${escapedPath}', ${isDir})">Properties</button>
+          <div class="explorer-row-actions">
+            ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download title="Download file" onclick="event.stopPropagation()">Download</a>` : ''}
+            ${isOnline ? `<button class="btn btn-sm" onclick="event.stopPropagation(); renameItem('${escapedPath}')" title="Rename">Rename</button>` : ''}
+            ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteItem('${escapedPath}', ${isDir})" title="Delete">Delete</button>` : ''}
+            <button class="btn btn-sm" onclick="event.stopPropagation(); viewStorageProperties('${escapedPath}', ${isDir})" title="Item Properties">Props</button>
           </div>
         </td>
       </tr>
@@ -760,25 +828,32 @@ function renderStorageTable() {
   }).join("");
 }
 
+window.selectStorageRow = function(event, itemName) {
+  selectedItemName = itemName;
+  document.querySelectorAll(".explorer-row").forEach(tr => tr.classList.remove("selected"));
+  const row = event.currentTarget;
+  if (row) row.classList.add("selected");
+};
+
 function renderBreadcrumbs(path) {
   const container = document.getElementById("storage-breadcrumbs");
   if (!container) return;
 
   const parts = path ? path.split("/").filter(Boolean) : [];
-  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('', '${selectedStorageNode}')">Home</span>`;
+  let html = `<span class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="loadStorage('', '${selectedStorageNode}', true)">Home</span>`;
 
   let accumulated = "";
   parts.forEach((p, index) => {
     accumulated += (accumulated ? "/" : "") + p;
     const isLast = index === parts.length - 1;
     const clickPath = accumulated;
-    html += ` <span class="cell-muted">/</span> <span class="crumb ${isLast ? 'current' : ''}" ${!isLast ? `onclick="loadStorage('${clickPath}', '${selectedStorageNode}')"` : ''}>${p}</span>`;
+    html += ` <span class="cell-muted">&gt;</span> <span class="crumb ${isLast ? 'current' : ''}" ${!isLast ? `onclick="loadStorage('${clickPath}', '${selectedStorageNode}', true)"` : ''}>${escapeHtml(p)}</span>`;
   });
 
   container.innerHTML = html;
 }
 
-// Drag and Drop implementation
+// Drag and Drop File Dropzone
 const dropzone = document.getElementById("storage-dropzone");
 if (dropzone) {
   ['dragenter', 'dragover'].forEach(eventName => {
@@ -838,12 +913,12 @@ async function uploadFiles(fileList) {
     }
   }
 
-  loadStorage(currentPath, selectedStorageNode);
+  loadStorage(currentPath, selectedStorageNode, false);
 }
 
 // Create folder handler
 async function handleCreateFolder() {
-  const name = prompt("Folder name:");
+  const name = prompt("New folder name:");
   if (!name || !name.trim()) return;
 
   let nodeObj = cachedStorageNodes.find(n => n.name === selectedStorageNode || n.node_id === selectedStorageNode);
@@ -858,7 +933,7 @@ async function handleCreateFolder() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name.trim(), path: currentPath })
     });
-    loadStorage(currentPath, selectedStorageNode);
+    loadStorage(currentPath, selectedStorageNode, false);
   } catch (err) {
     alert("Failed to create folder: " + err.message);
   }
@@ -885,7 +960,7 @@ window.renameItem = async function(itemRelPath) {
         new_name: newName.trim()
       })
     });
-    loadStorage(currentPath, selectedStorageNode);
+    loadStorage(currentPath, selectedStorageNode, false);
   } catch (err) {
     alert("Rename failed: " + err.message);
   }
@@ -906,13 +981,13 @@ window.deleteItem = async function(itemRelPath, isDir) {
     await apiFetch(deleteUrl, {
       method: "DELETE"
     });
-    loadStorage(currentPath, selectedStorageNode);
+    loadStorage(currentPath, selectedStorageNode, false);
   } catch (err) {
     alert("Delete failed: " + err.message);
   }
 };
 
-// View Storage Item Properties
+// View Storage Item Properties (Windows Explorer Style)
 window.viewStorageProperties = function(itemRelPath, isDir) {
   const itemName = itemRelPath.split("/").pop();
   const item = cachedStorageItems.find(i => i.name === itemName);
@@ -932,9 +1007,9 @@ window.viewStorageProperties = function(itemRelPath, isDir) {
   const physPath = `~/PersonalServer/storage/${itemRelPath}`;
 
   grid.innerHTML = `
-    <div class="detail-item"><span class="detail-label">Name</span><span class="detail-value mono">${itemName}</span></div>
+    <div class="detail-item"><span class="detail-label">Name</span><span class="detail-value mono">${escapeHtml(itemName)}</span></div>
     <div class="detail-item"><span class="detail-label">Type</span><span class="detail-value">${typeStr}</span></div>
-    <div class="detail-item"><span class="detail-label">Logical Path</span><span class="detail-value mono">Home/${itemRelPath}</span></div>
+    <div class="detail-item"><span class="detail-label">Logical Path</span><span class="detail-value mono">Home/${escapeHtml(itemRelPath)}</span></div>
     <div class="detail-item"><span class="detail-label">Size</span><span class="detail-value mono">${sizeStr}</span></div>
     <div class="detail-item"><span class="detail-label">Modified</span><span class="detail-value mono">${modStr}</span></div>
     <div class="detail-item"><span class="detail-label">Storage Node</span><span class="detail-value mono">${nodeName}</span></div>
