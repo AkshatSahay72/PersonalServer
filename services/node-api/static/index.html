@@ -105,6 +105,36 @@
           </div>
         </div>
 
+        <!-- Compact Cluster Utilization Section -->
+        <div class="section-card" id="cluster-utilization-card" style="margin-bottom: var(--space-4);">
+          <div class="section-header">
+            <span class="section-title">Cluster Utilization</span>
+            <span class="mono cell-muted" id="cluster-util-summary">Live capacity &amp; usage</span>
+          </div>
+          <div class="summary-strip" style="margin-bottom: 0;">
+            <div class="summary-col">
+              <span class="summary-label">CPU Cores</span>
+              <span class="summary-value mono" id="util-cluster-cpu">-</span>
+              <span class="cell-muted mono" id="util-cluster-cpu-sub" style="font-size: 11px;">Active online cores</span>
+            </div>
+            <div class="summary-col">
+              <span class="summary-label">Memory</span>
+              <span class="summary-value mono" id="util-cluster-mem">-</span>
+              <span class="cell-muted mono" id="util-cluster-mem-sub" style="font-size: 11px;">-</span>
+            </div>
+            <div class="summary-col">
+              <span class="summary-label">Storage</span>
+              <span class="summary-value mono" id="util-cluster-storage">-</span>
+              <span class="cell-muted mono" id="util-cluster-storage-sub" style="font-size: 11px;">-</span>
+            </div>
+            <div class="summary-col">
+              <span class="summary-label">Workloads</span>
+              <span class="summary-value mono" id="util-cluster-workloads">-</span>
+              <span class="cell-muted mono" id="util-cluster-workloads-sub" style="font-size: 11px;">-</span>
+            </div>
+          </div>
+        </div>
+
         <!-- Row 2: Nodes Table + System KV -->
         <div class="dash-grid-row">
           <!-- Left: Nodes -->
@@ -122,10 +152,11 @@
                     <th>CPU</th>
                     <th>RAM</th>
                     <th>Storage</th>
+                    <th>Workloads</th>
                   </tr>
                 </thead>
                 <tbody id="dash-nodes-tbody">
-                  <tr><td colspan="5" class="cell-muted">Loading nodes...</td></tr>
+                  <tr><td colspan="6" class="cell-muted">Loading nodes...</td></tr>
                 </tbody>
               </table>
             </div>
@@ -205,16 +236,17 @@
                   <th style="width: 100px;">Status</th>
                   <th>Role</th>
                   <th>Platform</th>
-                  <th>Arch</th>
                   <th>CPU</th>
                   <th>RAM</th>
                   <th>Storage</th>
+                  <th>Jobs</th>
+                  <th>Containers</th>
                   <th>Last seen</th>
                   <th style="width: 70px; text-align: right;">Action</th>
                 </tr>
               </thead>
               <tbody id="nodes-tbody">
-                <tr><td colspan="10" class="cell-muted">Loading cluster nodes...</td></tr>
+                <tr><td colspan="11" class="cell-muted">Loading cluster nodes...</td></tr>
               </tbody>
             </table>
           </div>

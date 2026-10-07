@@ -198,12 +198,55 @@ async function loadSession() {
 async function loadDashboard() {
   updateLastRefreshed();
   try {
-    const [clusterData, jobsData, storageData, srvData] = await Promise.allSettled([
+    const [clusterData, jobsData, storageData, srvData, utilData] = await Promise.allSettled([
       apiFetch("/api/cluster"),
       apiFetch("/api/jobs"),
       apiFetch("/storage/usage"),
-      apiFetch("/api/services")
+      apiFetch("/api/services"),
+      apiFetch("/api/cluster/utilization")
     ]);
+
+    // Populate Cluster Utilization Strip if available
+    let nodesUtil = {};
+    if (utilData.status === "fulfilled" && utilData.value?.cluster) {
+      const u = utilData.value.cluster;
+      nodesUtil = utilData.value.nodes || {};
+
+      const cpuEl = document.getElementById("util-cluster-cpu");
+      if (cpuEl) cpuEl.textContent = `${u.cpu_cores_total} Cores`;
+
+      const memEl = document.getElementById("util-cluster-mem");
+      if (memEl) {
+        const memUsedGb = (u.memory_used_mb / 1024).toFixed(1);
+        const memTotGb = (u.memory_total_mb / 1024).toFixed(1);
+        memEl.textContent = `${memUsedGb} / ${memTotGb} GB`;
+      }
+      const memSub = document.getElementById("util-cluster-mem-sub");
+      if (memSub) {
+        const pct = u.memory_total_mb > 0 ? ((u.memory_used_mb / u.memory_total_mb) * 100).toFixed(0) : 0;
+        const availGb = (u.memory_available_mb / 1024).toFixed(1);
+        memSub.textContent = `${pct}% used · ${availGb} GB available`;
+      }
+
+      const stEl = document.getElementById("util-cluster-storage");
+      if (stEl) {
+        stEl.textContent = `${u.storage_used_gb} / ${u.storage_total_gb} GB`;
+      }
+      const stSub = document.getElementById("util-cluster-storage-sub");
+      if (stSub) {
+        const pct = u.storage_total_gb > 0 ? ((u.storage_used_gb / u.storage_total_gb) * 100).toFixed(0) : 0;
+        stSub.textContent = `${pct}% used · ${u.storage_available_gb} GB available`;
+      }
+
+      const wlEl = document.getElementById("util-cluster-workloads");
+      if (wlEl) {
+        wlEl.textContent = `${u.active_jobs} jobs · ${u.running_containers} containers`;
+      }
+      const wlSub = document.getElementById("util-cluster-workloads-sub");
+      if (wlSub) {
+        wlSub.textContent = `${u.running_jobs} currently running jobs`;
+      }
+    }
 
     // Cluster Summary & Nodes Table
     let nodes = [];
@@ -223,21 +266,50 @@ async function loadDashboard() {
 
       const tbody = document.getElementById("dash-nodes-tbody");
       if (nodes.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5" class="cell-muted">No cluster nodes registered.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" class="cell-muted">No cluster nodes registered.</td></tr>`;
       } else {
         tbody.innerHTML = nodes.map(n => {
+          const uNode = nodesUtil[n.node_id];
           const isOnline = (n.status || "").toUpperCase() === "ONLINE";
-          const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${(n.resources.ram_mb/1024).toFixed(1)} GB` : "-");
-          const cores = n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-";
-          const storageStr = n.last_heartbeat?.system?.storage || (n.resources?.storage_gb ? `${n.resources.storage_gb} GB` : "-");
+
+          let coresStr = "-";
+          if (uNode?.cpu?.cores) {
+            coresStr = `${uNode.cpu.cores}c`;
+            if (uNode.cpu.cpu_percent != null) coresStr += ` (${uNode.cpu.cpu_percent}%)`;
+            else if (uNode.cpu.load_average?.length) coresStr += ` (L:${uNode.cpu.load_average[0]})`;
+          } else {
+            coresStr = `${n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-"} cores`;
+          }
+
+          let memStr = "-";
+          if (uNode?.memory?.total_mb) {
+            memStr = `${(uNode.memory.used_mb/1024).toFixed(1)}/${(uNode.memory.total_mb/1024).toFixed(1)}G (${uNode.memory.used_percent}%)`;
+          } else {
+            memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${(n.resources.ram_mb/1024).toFixed(1)} GB` : "-");
+          }
+
+          let storageStr = "-";
+          if (uNode?.storage?.total_gb) {
+            storageStr = `${uNode.storage.used_gb}/${uNode.storage.total_gb}G (${uNode.storage.used_percent}%)`;
+          } else {
+            storageStr = n.last_heartbeat?.system?.storage || (n.resources?.storage_gb ? `${n.resources.storage_gb} GB` : "-");
+          }
+
+          let wlStr = "-";
+          if (uNode?.workloads) {
+            wlStr = `${uNode.workloads.active_jobs} jobs · ${uNode.workloads.running_containers} cnt`;
+          } else {
+            wlStr = "0 jobs · 0 cnt";
+          }
 
           return `
             <tr style="cursor: pointer;" onclick="window.location.hash='#nodes'; setTimeout(() => viewNodeById('${n.node_id}'), 50);">
               <td><strong>${n.name || n.node_id}</strong></td>
               <td>${renderStatusPill(n.status)}</td>
-              <td class="mono">${cores} cores</td>
+              <td class="mono">${coresStr}</td>
               <td class="mono">${memStr}</td>
               <td class="mono">${storageStr}</td>
+              <td class="mono cell-muted">${wlStr}</td>
             </tr>
           `;
         }).join("");
@@ -319,13 +391,21 @@ async function loadDashboard() {
 }
 
 // 2. Nodes View
+let cachedUtilMap = {};
+
 async function loadNodes() {
   updateLastRefreshed();
   const tbody = document.getElementById("nodes-tbody");
   const targetSelect = document.getElementById("job-target");
 
   try {
-    const data = await apiFetch("/api/cluster");
+    const [clusterRes, utilRes] = await Promise.allSettled([
+      apiFetch("/api/cluster"),
+      apiFetch("/api/cluster/utilization")
+    ]);
+    const data = clusterRes.status === "fulfilled" ? clusterRes.value : { nodes: [] };
+    cachedUtilMap = (utilRes.status === "fulfilled" && utilRes.value?.nodes) ? utilRes.value.nodes : {};
+
     cachedNodes = (data.nodes || []).filter(n => n.status !== "REMOVED");
 
     const onlineCount = cachedNodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
@@ -340,15 +420,41 @@ async function loadNodes() {
     }
 
     if (cachedNodes.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="10" class="cell-muted">No cluster nodes registered.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="11" class="cell-muted">No cluster nodes registered.</td></tr>`;
       return;
     }
 
     tbody.innerHTML = cachedNodes.map(n => {
       const isOnline = (n.status || "").toUpperCase() === "ONLINE";
-      const memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${(n.resources.ram_mb/1024).toFixed(1)} GB` : "-");
-      const cores = n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-";
-      const storageStr = n.last_heartbeat?.system?.storage || (n.resources?.storage_gb ? `${n.resources.storage_gb} GB` : "-");
+      const uNode = cachedUtilMap[n.node_id];
+
+      let coresStr = "-";
+      if (uNode?.cpu?.cores) {
+        coresStr = `${uNode.cpu.cores}c`;
+        if (uNode.cpu.cpu_percent != null) coresStr += ` (${uNode.cpu.cpu_percent}%)`;
+        else if (uNode.cpu.load_average?.length) coresStr += ` (${uNode.cpu.load_average[0]})`;
+      } else {
+        coresStr = `${n.last_heartbeat?.system?.cpu_cores || n.resources?.cpu_cores || "-"} cores`;
+      }
+
+      let memStr = "-";
+      if (uNode?.memory?.total_mb) {
+        memStr = `${(uNode.memory.used_mb/1024).toFixed(1)} / ${(uNode.memory.total_mb/1024).toFixed(1)} GB (${uNode.memory.used_percent}%)`;
+      } else {
+        memStr = n.last_heartbeat?.system?.memory || (n.resources?.ram_mb ? `${(n.resources.ram_mb/1024).toFixed(1)} GB` : "-");
+      }
+
+      let storageStr = "-";
+      if (uNode?.storage?.total_gb) {
+        storageStr = `${uNode.storage.used_gb} / ${uNode.storage.total_gb} GB (${uNode.storage.used_percent}%)`;
+      } else {
+        storageStr = n.last_heartbeat?.system?.storage || (n.resources?.storage_gb ? `${n.resources.storage_gb} GB` : "-");
+      }
+
+      const activeJobs = uNode?.workloads?.active_jobs ?? 0;
+      const runningJobs = uNode?.workloads?.running_jobs ?? 0;
+      const runningContainers = uNode?.workloads?.running_containers ?? 0;
+
       const lastSeen = isOnline ? timeAgo(n.last_seen) : (n.last_seen ? timeAgo(n.last_seen) : "offline");
 
       return `
@@ -357,10 +463,11 @@ async function loadNodes() {
           <td>${renderStatusPill(n.status)}</td>
           <td class="cell-muted">${n.role || 'compute'}</td>
           <td class="cell-muted">${n.platform || '-'}</td>
-          <td class="mono cell-muted">${n.architecture || '-'}</td>
-          <td class="mono">${cores} cores</td>
+          <td class="mono">${coresStr}</td>
           <td class="mono">${memStr}</td>
           <td class="mono">${storageStr}</td>
+          <td class="mono">${activeJobs} active (${runningJobs} run)</td>
+          <td class="mono">${runningContainers} running</td>
           <td class="mono cell-muted">${lastSeen}</td>
           <td style="text-align: right;">
             <button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button>
@@ -370,7 +477,7 @@ async function loadNodes() {
     }).join("");
 
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="10" class="text-offline">Unable to load nodes: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="text-offline">Unable to load nodes: ${err.message}</td></tr>`;
   }
 }
 
@@ -388,6 +495,9 @@ window.viewNodeById = function(nodeId) {
   const sys = hb.system || {};
   const srv = hb.services || {};
   const caps = Object.keys(node.capabilities || {}).filter(k => node.capabilities[k]).join(", ") || "compute, storage, network";
+  const uNode = cachedUtilMap[node.node_id] || {};
+
+  const wlStr = `${uNode.workloads?.active_jobs || 0} active jobs · ${uNode.workloads?.running_jobs || 0} running jobs · ${uNode.workloads?.running_containers || 0} running containers`;
 
   grid.innerHTML = `
     <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(node.status)}</span></div>
@@ -395,9 +505,10 @@ window.viewNodeById = function(nodeId) {
     <div class="detail-item"><span class="detail-label">Role</span><span class="detail-value">${node.role || 'compute'}</span></div>
     <div class="detail-item"><span class="detail-label">Platform</span><span class="detail-value">${node.platform || '-'} (${node.os || 'Linux'})</span></div>
     <div class="detail-item"><span class="detail-label">Architecture</span><span class="detail-value mono">${node.architecture || '-'}</span></div>
-    <div class="detail-item"><span class="detail-label">CPU Cores</span><span class="detail-value mono">${sys.cpu_cores || node.resources?.cpu_cores || '-'} cores</span></div>
+    <div class="detail-item"><span class="detail-label">CPU Cores</span><span class="detail-value mono">${sys.cpu_cores || node.resources?.cpu_cores || '-'} cores ${uNode.cpu?.cpu_percent != null ? '(' + uNode.cpu.cpu_percent + '%)' : ''}</span></div>
     <div class="detail-item"><span class="detail-label">Memory</span><span class="detail-value mono">${sys.memory || (node.resources?.ram_mb ? (node.resources.ram_mb/1024).toFixed(1) + ' GB' : '-')}</span></div>
     <div class="detail-item"><span class="detail-label">Storage</span><span class="detail-value mono">${sys.storage || (node.resources?.storage_gb ? node.resources.storage_gb + ' GB' : '-')}</span></div>
+    <div class="detail-item"><span class="detail-label">Workloads</span><span class="detail-value mono">${wlStr}</span></div>
     <div class="detail-item"><span class="detail-label">Capabilities</span><span class="detail-value mono">${caps}</span></div>
     <div class="detail-item"><span class="detail-label">Last Heartbeat</span><span class="detail-value mono">${node.last_seen || '-'} (${timeAgo(node.last_seen)})</span></div>
     <div class="detail-item"><span class="detail-label">Services</span><span class="detail-value mono">API: ${srv.node_api || srv['node-api'] || 'running'} · Tunnel: ${srv.cloudflare || 'connected'}</span></div>

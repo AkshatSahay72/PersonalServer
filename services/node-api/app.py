@@ -829,6 +829,11 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_json(200, get_platform_config().to_dict())
             return
 
+        # 8c. Cluster Utilization and Cluster Info Proxy
+        if path == "/cluster/utilization" or path == "/cluster" or path.startswith("/cluster/"):
+            self.proxy_to_controller("GET", path, parsed.query)
+            return
+
         # 9. Proxy to Controller for UI: /api/cluster, /api/jobs, /api/jobs/<job_id>
         if path.startswith("/api/"):
             subpath = path[4:]  # /api/cluster -> /cluster, /api/jobs -> /jobs

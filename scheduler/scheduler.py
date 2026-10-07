@@ -124,6 +124,124 @@ def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
         return STATE_UNKNOWN
 
 
+def extract_node_telemetry(node, status=None, node_jobs=None):
+    """
+    Extracts standardized, cross-platform resource and workload telemetry for a node.
+    Distinguishes Capacity, Usage, and Available without inventing metrics.
+    """
+    if not node or not isinstance(node, dict):
+        return {
+            "status": status or STATE_UNKNOWN,
+            "cpu": {"cores": 0},
+            "memory": {"total_mb": 0.0, "used_mb": 0.0, "available_mb": 0.0, "used_percent": 0.0},
+            "storage": {"total_gb": 0.0, "used_gb": 0.0, "available_gb": 0.0, "used_percent": 0.0},
+            "workloads": {"active_jobs": 0, "running_jobs": 0, "running_containers": 0},
+            "capabilities": {}
+        }
+
+    liveness = status or compute_node_liveness(node)
+    resources = node.get("resources", {}) or {}
+    last_hb = node.get("last_heartbeat", {}) or {}
+    hb_system = last_hb.get("system", {}) or {}
+    hb_workloads = last_hb.get("workloads", {}) or {}
+
+    # CPU
+    try:
+        cpu_cores = int(hb_system.get("cpu_cores") or resources.get("cpu_cores", 1))
+    except (ValueError, TypeError):
+        cpu_cores = 1
+
+    cpu_info = {"cores": max(0, cpu_cores)}
+
+    load_avg = hb_system.get("load_average")
+    if load_avg is not None and isinstance(load_avg, list) and len(load_avg) > 0:
+        try:
+            cpu_info["load_average"] = [float(x) for x in load_avg]
+        except (ValueError, TypeError):
+            pass
+
+    cpu_pct = hb_system.get("cpu_percent")
+    if cpu_pct is not None and isinstance(cpu_pct, (int, float)):
+        cpu_info["cpu_percent"] = round(float(cpu_pct), 1)
+
+    # Memory
+    mem_details = hb_system.get("memory_details")
+    if mem_details and isinstance(mem_details, dict) and "total_mb" in mem_details:
+        try:
+            total_mem_mb = float(mem_details.get("total_mb", 0.0))
+            used_mem_mb = float(mem_details.get("used_mb", 0.0))
+            avail_mem_mb = float(mem_details.get("available_mb", 0.0))
+            mem_pct = float(mem_details.get("used_percent", 0.0))
+        except (ValueError, TypeError):
+            total_mem_mb, used_mem_mb, avail_mem_mb, mem_pct = 0.0, 0.0, 0.0, 0.0
+    else:
+        mem_data = hb_system.get("memory") or str(resources.get("ram_mb", "0"))
+        total_mem_mb, used_mem_mb, avail_mem_mb = parse_memory_mb(mem_data)
+        mem_pct = round((used_mem_mb / total_mem_mb * 100), 1) if total_mem_mb > 0 else 0.0
+
+    memory_info = {
+        "total_mb": max(0.0, round(total_mem_mb, 1)),
+        "used_mb": max(0.0, round(used_mem_mb, 1)),
+        "available_mb": max(0.0, round(avail_mem_mb, 1)),
+        "used_percent": max(0.0, min(100.0, round(mem_pct, 1)))
+    }
+
+    # Storage
+    st_details = hb_system.get("storage_details")
+    if st_details and isinstance(st_details, dict) and "total_gb" in st_details:
+        try:
+            total_st_gb = float(st_details.get("total_gb", 0.0))
+            used_st_gb = float(st_details.get("used_gb", 0.0))
+            avail_st_gb = float(st_details.get("available_gb", 0.0))
+            st_pct = float(st_details.get("used_percent", 0.0))
+        except (ValueError, TypeError):
+            total_st_gb, used_st_gb, avail_st_gb, st_pct = 0.0, 0.0, 0.0, 0.0
+    else:
+        st_data = hb_system.get("storage") or str(resources.get("storage_gb", "0"))
+        total_st_gb, used_st_gb, avail_st_gb = parse_storage_gb(st_data)
+        st_pct = round((used_st_gb / total_st_gb * 100), 1) if total_st_gb > 0 else 0.0
+
+    storage_info = {
+        "total_gb": max(0.0, round(total_st_gb, 1)),
+        "used_gb": max(0.0, round(used_st_gb, 1)),
+        "available_gb": max(0.0, round(avail_st_gb, 1)),
+        "used_percent": max(0.0, min(100.0, round(st_pct, 1)))
+    }
+
+    # Workloads
+    try:
+        running_containers = int(hb_workloads.get("running_containers", 0))
+    except (ValueError, TypeError):
+        running_containers = 0
+
+    active_jobs = 0
+    running_jobs = 0
+    if node_jobs and isinstance(node_jobs, list):
+        for j in node_jobs:
+            st = j.get("status")
+            if st in ("CLAIMED", "RUNNING", "RECOVERING"):
+                active_jobs += 1
+            if st == "RUNNING":
+                running_jobs += 1
+
+    workloads_info = {
+        "active_jobs": active_jobs,
+        "running_jobs": running_jobs,
+        "running_containers": max(0, running_containers)
+    }
+
+    capabilities_info = node.get("capabilities", {}) or {}
+
+    return {
+        "status": liveness,
+        "cpu": cpu_info,
+        "memory": memory_info,
+        "storage": storage_info,
+        "workloads": workloads_info,
+        "capabilities": capabilities_info
+    }
+
+
 class ResourceScheduler:
     """
     Deterministic, resource-aware scheduler that filters eligible nodes
@@ -240,25 +358,47 @@ class ResourceScheduler:
                 continue
 
             # Memory
-            mem_data = hb_system.get("memory") or str(resources.get("ram_mb", "0"))
-            total_mem_mb, used_mem_mb, avail_mem_mb = parse_memory_mb(mem_data)
+            mem_details = hb_system.get("memory_details")
+            if mem_details and isinstance(mem_details, dict) and "total_mb" in mem_details:
+                total_mem_mb = float(mem_details.get("total_mb", 0.0))
+                used_mem_mb = float(mem_details.get("used_mb", 0.0))
+                avail_mem_mb = float(mem_details.get("available_mb", 0.0))
+            else:
+                mem_data = hb_system.get("memory") or str(resources.get("ram_mb", "0"))
+                total_mem_mb, used_mem_mb, avail_mem_mb = parse_memory_mb(mem_data)
+
             min_mem = float(reqs.get("min_memory_mb", 0))
             if avail_mem_mb < min_mem:
                 rejected[node_id] = f"Insufficient available memory: ~{avail_mem_mb:.0f} MB available, required {min_mem:.0f} MB"
                 continue
 
             # Storage
-            storage_data = hb_system.get("storage") or str(resources.get("storage_gb", "0"))
-            total_st_gb, used_st_gb, avail_st_gb = parse_storage_gb(storage_data)
+            st_details = hb_system.get("storage_details")
+            if st_details and isinstance(st_details, dict) and "total_gb" in st_details:
+                total_st_gb = float(st_details.get("total_gb", 0.0))
+                used_st_gb = float(st_details.get("used_gb", 0.0))
+                avail_st_gb = float(st_details.get("available_gb", 0.0))
+            else:
+                storage_data = hb_system.get("storage") or str(resources.get("storage_gb", "0"))
+                total_st_gb, used_st_gb, avail_st_gb = parse_storage_gb(storage_data)
+
             min_st = float(reqs.get("min_storage_gb", 0))
             if avail_st_gb < min_st:
                 rejected[node_id] = f"Insufficient available storage: ~{avail_st_gb:.1f} GB available, required {min_st:.1f} GB"
                 continue
 
-            # CPU Load factor
+            # CPU Load factor (supports Unix load average and Windows cpu_percent)
             load_avg = hb_system.get("load_average", [])
-            load_1m = float(load_avg[0]) if load_avg and len(load_avg) >= 1 else 1.0
-            load_ratio = min(load_1m / max(cpu_cores, 1), 2.0)  # normalized (0.0 to 2.0)
+            if load_avg and len(load_avg) >= 1:
+                load_1m = float(load_avg[0])
+                load_ratio = min(load_1m / max(cpu_cores, 1), 2.0)
+            elif hb_system.get("cpu_percent") is not None:
+                cpu_pct = float(hb_system.get("cpu_percent", 0.0))
+                load_1m = round((cpu_pct / 100.0) * max(cpu_cores, 1), 2)
+                load_ratio = min((cpu_pct / 100.0) * 2.0, 2.0)
+            else:
+                load_1m = 1.0
+                load_ratio = min(load_1m / max(cpu_cores, 1), 2.0)
 
             # ------------------------------------------------------------------
             # 6. Explainable Resource-Aware Scoring (0 - 100)
@@ -299,6 +439,7 @@ class ResourceScheduler:
                     "avail_mem_mb": round(avail_mem_mb, 0),
                     "avail_storage_gb": round(avail_st_gb, 1)
                 },
+                "telemetry": extract_node_telemetry(node, liveness),
                 "reason": explanation
             })
 

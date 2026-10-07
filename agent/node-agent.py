@@ -15,6 +15,8 @@ import socket
 import platform
 import argparse
 import subprocess
+import shutil
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -208,45 +210,220 @@ def load_node_config():
 
 
 def get_system_metrics():
-    """Collect lightweight system metrics."""
+    """
+    Collect lightweight, cross-platform system telemetry:
+    - CPU cores, load average (Linux/Android), CPU utilization percent (Windows & Linux)
+    - Total, used, available RAM and utilization percent
+    - Total, used, available storage and utilization percent
+    - Uptime
+    """
     try:
-        cpu_cores = int(run_cmd("nproc") or 1)
+        cpu_cores = os.cpu_count() or int(run_cmd("nproc") or 1)
     except Exception:
         cpu_cores = 1
 
-    uptime_raw = run_cmd("uptime")
-    load_match = re.search(r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)", uptime_raw)
-    load_average = [float(load_match.group(i)) for i in range(1, 4)] if load_match else []
+    load_average = []
+    cpu_percent = 0.0
+    uptime_raw = ""
+    is_windows = sys.platform == "win32"
 
-    memory = {"total": "N/A", "used": "N/A", "available": "N/A"}
-    mem_raw = run_cmd("free -h")
-    for line in mem_raw.splitlines():
-        if line.startswith("Mem:"):
-            parts = line.split()
-            if len(parts) >= 7:
-                memory = {"total": parts[1], "used": parts[2], "available": parts[6]}
-            elif len(parts) >= 4:
-                memory = {"total": parts[1], "used": parts[2], "available": parts[3]}
+    total_mem_mb = 0.0
+    used_mem_mb = 0.0
+    avail_mem_mb = 0.0
+    mem_pct = 0.0
 
-    storage = {"total": "N/A", "used": "N/A", "available": "N/A", "used_percent": "N/A"}
-    df_raw = run_cmd("df -h ~")
-    df_lines = df_raw.splitlines()
-    if len(df_lines) >= 2:
-        parts = df_lines[-1].split()
-        if len(parts) >= 5:
-            storage = {
-                "total": parts[1],
-                "used": parts[2],
-                "available": parts[3],
-                "used_percent": parts[4]
-            }
+    if is_windows:
+        # 1. Windows CPU Utilization & Uptime via ctypes
+        try:
+            import ctypes
+            class FILETIME(ctypes.Structure):
+                _fields_ = [("dwLowDateTime", ctypes.c_ulong), ("dwHighDateTime", ctypes.c_ulong)]
+
+            def _to_int(ft):
+                return (ft.dwHighDateTime << 32) + ft.dwLowDateTime
+
+            i1, k1, u1 = FILETIME(), FILETIME(), FILETIME()
+            ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(i1), ctypes.byref(k1), ctypes.byref(u1))
+            time.sleep(0.04)
+            i2, k2, u2 = FILETIME(), FILETIME(), FILETIME()
+            ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(i2), ctypes.byref(k2), ctypes.byref(u2))
+
+            idle_delta = _to_int(i2) - _to_int(i1)
+            total_delta = (_to_int(k2) - _to_int(k1)) + (_to_int(u2) - _to_int(u1))
+            if total_delta > 0:
+                cpu_percent = round((1.0 - (idle_delta / total_delta)) * 100, 1)
+
+            uptime_ms = ctypes.windll.kernel32.GetTickCount64()
+            uptime_hrs = uptime_ms // 3600000
+            uptime_mins = (uptime_ms % 3600000) // 60000
+            uptime_raw = f"{uptime_hrs}h {uptime_mins}m"
+        except Exception:
+            uptime_raw = "N/A"
+
+        # 2. Windows Memory via GlobalMemoryStatusEx
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                total_mem_mb = round(stat.ullTotalPhys / (1024 * 1024), 1)
+                avail_mem_mb = round(stat.ullAvailPhys / (1024 * 1024), 1)
+                used_mem_mb = round(total_mem_mb - avail_mem_mb, 1)
+                mem_pct = round(float(stat.dwMemoryLoad), 1)
+        except Exception:
+            pass
+
+    else:
+        # Linux / Termux
+        uptime_raw = run_cmd("uptime")
+        load_match = re.search(r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)", uptime_raw)
+        if load_match:
+            load_average = [float(load_match.group(i)) for i in range(1, 4)]
+        elif hasattr(os, "getloadavg"):
+            try:
+                load_average = [round(x, 2) for x in os.getloadavg()]
+            except Exception:
+                load_average = []
+
+        # Linux /proc/stat for true CPU utilization percentage if accessible
+        if Path("/proc/stat").exists():
+            try:
+                def _read_cpu_stat():
+                    with open("/proc/stat", "r") as f:
+                        for line in f:
+                            if line.startswith("cpu "):
+                                parts = [float(x) for x in line.split()[1:]]
+                                idle = parts[3] + (parts[4] if len(parts) > 4 else 0.0)
+                                total = sum(parts)
+                                return idle, total
+                    return None, None
+                id1, tot1 = _read_cpu_stat()
+                if id1 is not None and tot1 is not None:
+                    time.sleep(0.04)
+                    id2, tot2 = _read_cpu_stat()
+                    if id2 is not None and tot2 is not None and tot2 > tot1:
+                        idle_delta = id2 - id1
+                        tot_delta = tot2 - tot1
+                        cpu_percent = round((1.0 - (idle_delta / tot_delta)) * 100, 1)
+            except Exception:
+                pass
+
+        # Linux /proc/meminfo parsing
+        if Path("/proc/meminfo").exists():
+            try:
+                meminfo = {}
+                with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            meminfo[parts[0].rstrip(":")] = int(parts[1])
+
+                tot_kb = meminfo.get("MemTotal", 0)
+                free_kb = meminfo.get("MemFree", 0)
+                avail_kb = meminfo.get("MemAvailable", free_kb + meminfo.get("Buffers", 0) + meminfo.get("Cached", 0))
+
+                total_mem_mb = round(tot_kb / 1024, 1)
+                avail_mem_mb = round(avail_kb / 1024, 1)
+                used_mem_mb = round(total_mem_mb - avail_mem_mb, 1)
+                if total_mem_mb > 0:
+                    mem_pct = round((used_mem_mb / total_mem_mb) * 100, 1)
+            except Exception:
+                pass
+
+        if total_mem_mb <= 0:
+            mem_raw = run_cmd("free -h")
+            for line in mem_raw.splitlines():
+                if line.startswith("Mem:"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        pass
+
+    # Storage (Cross-Platform via shutil.disk_usage)
+    total_st_gb = 0.0
+    used_st_gb = 0.0
+    avail_st_gb = 0.0
+    st_pct = 0.0
+    try:
+        check_path = str(BASE_DIR) if BASE_DIR.exists() else str(Path.home())
+        total_b, used_b, free_b = shutil.disk_usage(check_path)
+        total_st_gb = round(total_b / (1024 ** 3), 1)
+        used_st_gb = round(used_b / (1024 ** 3), 1)
+        avail_st_gb = round(free_b / (1024 ** 3), 1)
+        if total_b > 0:
+            st_pct = round((used_b / total_b) * 100, 1)
+    except Exception:
+        pass
+
+    # Safe formatting for legacy string consumers
+    mem_used_str = f"{used_mem_mb/1024:.1f}Gi" if total_mem_mb >= 1024 else f"{used_mem_mb:.0f}M"
+    mem_tot_str = f"{total_mem_mb/1024:.1f}Gi" if total_mem_mb >= 1024 else f"{total_mem_mb:.0f}M"
+    mem_avail_str = f"{avail_mem_mb/1024:.1f}Gi" if total_mem_mb >= 1024 else f"{avail_mem_mb:.0f}M"
+
+    st_used_str = f"{used_st_gb:.1f}G"
+    st_tot_str = f"{total_st_gb:.1f}G"
+    st_avail_str = f"{avail_st_gb:.1f}G"
 
     return {
         "cpu_cores": cpu_cores,
         "load_average": load_average,
-        "memory": memory,
-        "storage": storage,
+        "cpu_percent": cpu_percent,
+        "memory": {
+            "total": mem_tot_str,
+            "used": mem_used_str,
+            "available": mem_avail_str
+        },
+        "memory_details": {
+            "total_mb": total_mem_mb,
+            "used_mb": used_mem_mb,
+            "available_mb": avail_mem_mb,
+            "used_percent": mem_pct
+        },
+        "storage": {
+            "total": st_tot_str,
+            "used": st_used_str,
+            "available": st_avail_str,
+            "used_percent": f"{st_pct:.0f}%"
+        },
+        "storage_details": {
+            "total_gb": total_st_gb,
+            "used_gb": used_st_gb,
+            "available_gb": avail_st_gb,
+            "used_percent": st_pct
+        },
         "uptime": uptime_raw.strip()
+    }
+
+
+def get_workload_metrics():
+    """Collect active local workload metrics."""
+    running_containers = 0
+    if is_docker_available():
+        try:
+            res = subprocess.run(
+                ["docker", "ps", "-q"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3,
+                text=True
+            )
+            if res.returncode == 0:
+                running_containers = len([c for c in res.stdout.strip().splitlines() if c.strip()])
+        except Exception:
+            pass
+    return {
+        "running_containers": running_containers
     }
 
 
@@ -578,6 +755,7 @@ def cmd_heartbeat(args=None):
 
     system_metrics = get_system_metrics()
     services_state = get_service_states()
+    workload_metrics = get_workload_metrics()
     now = get_current_iso_timestamp()
 
     payload_data = {
@@ -585,11 +763,15 @@ def cmd_heartbeat(args=None):
         "status": "online",
         "timestamp": now,
         "services": services_state,
+        "workloads": workload_metrics,
         "system": {
             "cpu_cores": system_metrics.get("cpu_cores"),
             "load_average": system_metrics.get("load_average"),
+            "cpu_percent": system_metrics.get("cpu_percent"),
             "memory": f"{system_metrics['memory']['used']}/{system_metrics['memory']['total']}",
+            "memory_details": system_metrics.get("memory_details"),
             "storage": f"{system_metrics['storage']['used']}/{system_metrics['storage']['total']} ({system_metrics['storage']['used_percent']})",
+            "storage_details": system_metrics.get("storage_details"),
             "uptime": system_metrics.get("uptime")
         }
     }

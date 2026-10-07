@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 # Import ResourceScheduler
-from scheduler.scheduler import ResourceScheduler, compute_node_liveness
+from scheduler.scheduler import ResourceScheduler, compute_node_liveness, extract_node_telemetry
 from config.platform_config import get_platform_config
 
 CONFIG_DIR = BASE_DIR / "config"
@@ -797,6 +797,78 @@ def get_cluster_summary(db, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
     }
 
 
+def get_cluster_utilization(nodes_db=None, jobs_db=None, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
+    """
+    Computes overall cluster utilization and per-node telemetry.
+    Offline nodes MUST NOT contribute stale utilization as active capacity.
+    """
+    if nodes_db is None:
+        nodes_db = load_nodes_db()
+    if jobs_db is None:
+        jobs_db = load_jobs_db()
+
+    nodes = nodes_db.get("nodes", {})
+    all_jobs = list(jobs_db.get("jobs", {}).values())
+
+    # Map jobs by target node
+    jobs_by_node = {}
+    total_active_jobs = 0
+    total_running_jobs = 0
+    for j in all_jobs:
+        target = j.get("target_node")
+        st = j.get("status")
+        if target:
+            jobs_by_node.setdefault(target, []).append(j)
+        if st in (JOB_STATE_CLAIMED, JOB_STATE_RUNNING, JOB_STATE_RECOVERING):
+            total_active_jobs += 1
+        if st == JOB_STATE_RUNNING:
+            total_running_jobs += 1
+
+    cluster_cpu_cores_total = 0
+    cluster_memory_total_mb = 0.0
+    cluster_memory_used_mb = 0.0
+    cluster_memory_available_mb = 0.0
+    cluster_storage_total_gb = 0.0
+    cluster_storage_used_gb = 0.0
+    cluster_storage_available_gb = 0.0
+    cluster_running_containers = 0
+
+    nodes_telemetry = {}
+    for node_id, node in nodes.items():
+        node_status = compute_node_liveness(node, timeout_seconds)
+        node_tel = extract_node_telemetry(node, status=node_status, node_jobs=jobs_by_node.get(node_id, []))
+        nodes_telemetry[node_id] = node_tel
+
+        # Offline nodes must NOT contribute stale utilization as active capacity
+        if node_status == STATE_ONLINE:
+            cluster_cpu_cores_total += node_tel["cpu"].get("cores", 0)
+            cluster_memory_total_mb += node_tel["memory"].get("total_mb", 0.0)
+            cluster_memory_used_mb += node_tel["memory"].get("used_mb", 0.0)
+            cluster_memory_available_mb += node_tel["memory"].get("available_mb", 0.0)
+            cluster_storage_total_gb += node_tel["storage"].get("total_gb", 0.0)
+            cluster_storage_used_gb += node_tel["storage"].get("used_gb", 0.0)
+            cluster_storage_available_gb += node_tel["storage"].get("available_gb", 0.0)
+            cluster_running_containers += node_tel["workloads"].get("running_containers", 0)
+
+    cluster_summary = {
+        "cpu_cores_total": cluster_cpu_cores_total,
+        "memory_total_mb": round(cluster_memory_total_mb, 1),
+        "memory_used_mb": round(cluster_memory_used_mb, 1),
+        "memory_available_mb": round(cluster_memory_available_mb, 1),
+        "storage_total_gb": round(cluster_storage_total_gb, 1),
+        "storage_used_gb": round(cluster_storage_used_gb, 1),
+        "storage_available_gb": round(cluster_storage_available_gb, 1),
+        "active_jobs": total_active_jobs,
+        "running_jobs": total_running_jobs,
+        "running_containers": cluster_running_containers
+    }
+
+    return {
+        "cluster": cluster_summary,
+        "nodes": nodes_telemetry
+    }
+
+
 # ------------------------------------------------------------------------------
 # Lease Sweeping & Recovery Subsystem
 # ------------------------------------------------------------------------------
@@ -982,6 +1054,15 @@ class ControllerHandler(BaseHTTPRequestHandler):
         # GET /platform or GET /api/platform
         if path in ("/platform", "/api/platform"):
             self.send_json(200, get_platform_config().to_dict())
+            return
+
+        # GET /cluster/utilization
+        if path == "/cluster/utilization":
+            nodes_db = load_nodes_db()
+            jobs_db = load_jobs_db()
+            sweep_expired_leases(jobs_db, nodes_db, self.heartbeat_timeout)
+            util = get_cluster_utilization(nodes_db, jobs_db, self.heartbeat_timeout)
+            self.send_json(200, util)
             return
 
         # GET /cluster
@@ -1452,7 +1533,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
             node_entry["last_heartbeat"] = {
                 "timestamp": body.get("timestamp", now),
                 "services": body.get("services", {}),
-                "system": body.get("system", {})
+                "system": body.get("system", {}),
+                "workloads": body.get("workloads", {})
             }
 
             save_nodes_db(nodes_db)
