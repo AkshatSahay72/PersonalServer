@@ -442,42 +442,113 @@
 
       <!-- 5. APPLICATIONS VIEW -->
       <section id="view-apps" class="page-view">
-        <!-- Create Application Form -->
+        <!-- Application Deployment Card -->
         <div class="section-card">
-          <div class="section-header">
-            <span class="section-title">Create Application</span>
-          </div>
-          <form id="app-create-form" class="job-form">
-            <div class="form-grid">
-              <div class="form-cell">
-                <label for="app-name">Name</label>
-                <input type="text" id="app-name" class="form-input mono" placeholder="web-api" required pattern="[a-zA-Z0-9_-]+">
-              </div>
-              <div class="form-cell">
-                <label for="app-image">Docker Image</label>
-                <input type="text" id="app-image" class="form-input mono" placeholder="python:3.11-slim" required>
-              </div>
-              <div class="form-cell">
-                <label for="app-container-port">Container Port</label>
-                <input type="number" id="app-container-port" class="form-input mono" value="8000" min="1" max="65535" required>
-              </div>
-              <div class="form-cell">
-                <label for="app-target">Target</label>
-                <select id="app-target" class="form-input mono">
-                  <option value="auto">Auto (Scheduler)</option>
-                </select>
-              </div>
-              <div class="form-cell form-btn-cell">
-                <button type="submit" class="btn btn-primary">Create Application</button>
-              </div>
+          <div class="section-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <span class="section-title">Application Deployment</span>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-sm btn-primary" id="btn-show-github-deploy">+ Deploy from GitHub</button>
+              <button class="btn btn-sm" id="btn-toggle-manual-deploy">Advanced / Manual</button>
             </div>
-          </form>
+          </div>
+
+          <!-- Deploy from GitHub Form (Render-like Source Deployment) -->
+          <div id="github-deploy-container" style="display: none; padding: 14px 16px; border-top: 1px solid var(--border-color);">
+            <form id="app-github-deploy-form">
+              <!-- Step 1: Repository -->
+              <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">Step 1: GitHub Repository</div>
+              <div class="form-grid" style="margin-bottom: 12px;">
+                <div class="form-cell" style="grid-column: span 2;">
+                  <label for="gh-repo">Repository (owner/repo)</label>
+                  <input type="text" id="gh-repo" class="form-input mono" placeholder="AkshatSahay72/RecallFlow" required pattern="[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+">
+                </div>
+                <div class="form-cell">
+                  <label for="gh-branch">Branch</label>
+                  <input type="text" id="gh-branch" class="form-input mono" value="main" required>
+                </div>
+                <div class="form-cell form-btn-cell">
+                  <button type="button" class="btn btn-sm" id="gh-inspect-btn" style="margin-top: 18px;">Inspect / Detect</button>
+                </div>
+              </div>
+
+              <!-- Detection Banner -->
+              <div id="gh-detection-banner" class="mono" style="display: none; padding: 8px 12px; margin-bottom: 12px; border-radius: var(--radius); font-size: 11px;"></div>
+
+              <!-- Step 2: Configuration & Route -->
+              <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">Step 2: Configuration & Route</div>
+              <div class="form-grid" style="margin-bottom: 12px;">
+                <div class="form-cell">
+                  <label for="gh-app-name">Application Name</label>
+                  <input type="text" id="gh-app-name" class="form-input mono" placeholder="recallflow" required pattern="[a-zA-Z0-9_-]+">
+                </div>
+                <div class="form-cell">
+                  <label for="gh-root-dir">Root Directory</label>
+                  <input type="text" id="gh-root-dir" class="form-input mono" value="." required>
+                </div>
+                <div class="form-cell">
+                  <label for="gh-dockerfile">Dockerfile</label>
+                  <input type="text" id="gh-dockerfile" class="form-input mono" value="Dockerfile" required>
+                </div>
+                <div class="form-cell">
+                  <label for="gh-route">Public Route Path</label>
+                  <input type="text" id="gh-route" class="form-input mono" placeholder="/recallflow" required pattern="^/[a-zA-Z0-9_-]+$">
+                </div>
+              </div>
+
+              <!-- Step 3: Environment Variables -->
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted);">Step 3: Environment Variables</div>
+                <button type="button" class="btn btn-sm" id="gh-add-env-btn">+ Add Variable</button>
+              </div>
+              <div id="gh-env-list" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px;"></div>
+
+              <!-- Step 4: Deploy Action -->
+              <div style="display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--border-subtle); padding-top: 12px;">
+                <button type="button" class="btn btn-sm" onclick="hideGithubDeploy()">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="gh-deploy-submit-btn">Deploy from GitHub</button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Manual Docker App Form (Advanced) -->
+          <div id="manual-deploy-container" style="display: none; padding: 14px 16px; border-top: 1px solid var(--border-color);">
+            <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">Advanced: Manual Docker Container Deployment</div>
+            <form id="app-create-form" class="job-form">
+              <div class="form-grid">
+                <div class="form-cell">
+                  <label for="app-name">Name</label>
+                  <input type="text" id="app-name" class="form-input mono" placeholder="web-api" required pattern="[a-zA-Z0-9_-]+">
+                </div>
+                <div class="form-cell">
+                  <label for="app-image">Docker Image</label>
+                  <input type="text" id="app-image" class="form-input mono" placeholder="python:3.11-slim" required>
+                </div>
+                <div class="form-cell">
+                  <label for="app-container-port">Container Port</label>
+                  <input type="number" id="app-container-port" class="form-input mono" value="8000" min="1" max="65535" required>
+                </div>
+                <div class="form-cell">
+                  <label for="app-route-input">Public Route</label>
+                  <input type="text" id="app-route-input" class="form-input mono" placeholder="/web-api" pattern="^/[a-zA-Z0-9_-]+$">
+                </div>
+                <div class="form-cell">
+                  <label for="app-target">Target</label>
+                  <select id="app-target" class="form-input mono">
+                    <option value="auto">Auto (Scheduler)</option>
+                  </select>
+                </div>
+                <div class="form-cell form-btn-cell">
+                  <button type="submit" class="btn btn-primary">Create Application</button>
+                </div>
+              </div>
+            </form>
+          </div>
         </div>
 
         <!-- Applications Table -->
         <div class="section-card">
           <div class="section-header">
-            <span class="section-title">Deployed Applications</span>
+            <span class="section-title">Applications</span>
             <span class="mono cell-muted" id="apps-count-header">0 applications</span>
           </div>
           <div class="table-container">
@@ -485,85 +556,168 @@
               <thead>
                 <tr>
                   <th>Application</th>
+                  <th>Source</th>
                   <th style="width: 110px;">Status</th>
+                  <th>Route / Endpoint</th>
                   <th>Node</th>
-                  <th>Image</th>
-                  <th style="width: 130px;">Port (Host:Cont)</th>
-                  <th style="width: 250px; text-align: right;">Actions</th>
+                  <th style="width: 110px;">Port</th>
+                  <th style="width: 280px; text-align: right;">Actions</th>
                 </tr>
               </thead>
               <tbody id="apps-tbody">
-                <tr><td colspan="6" class="cell-muted">Loading applications...</td></tr>
+                <tr><td colspan="7" class="cell-muted">Loading applications...</td></tr>
               </tbody>
             </table>
           </div>
         </div>
 
-        <!-- Application Logs Panel -->
-        <div id="app-logs-panel" class="section-card" style="display:none">
-          <div class="section-header">
-            <span class="section-title" id="app-logs-title">Application Logs</span>
-            <div style="display:flex; gap:6px;">
-              <button class="btn btn-sm" id="app-logs-refresh-btn">Refresh</button>
-              <button class="btn btn-sm" onclick="closeAppLogs()">Close</button>
+        <!-- Application Multi-Tab Management Panel -->
+        <div id="app-details-panel" class="section-card" style="display:none; margin-top: 16px;">
+          <div class="section-header" style="justify-content: space-between;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="section-title" id="app-panel-title">Application: -</span>
+              <span id="app-panel-status-pill"></span>
             </div>
-          </div>
-          <div class="detail-content">
-            <pre id="app-logs-stdout" class="log-box mono" style="max-height: 350px; overflow-y: auto;"></pre>
-          </div>
-        </div>
-
-        <!-- Application Files Panel (Sandboxed Project File Explorer) -->
-        <div id="app-files-panel" class="section-card explorer-frame" style="display:none; margin-top: 16px;">
-          <!-- Top Ribbon -->
-          <div class="explorer-toolbar">
-            <div class="explorer-nav-group-left">
-              <div class="explorer-nav-buttons">
-                <button id="app-files-up-btn" class="explorer-icon-btn" title="Up one folder" disabled>↑</button>
-              </div>
-              <div class="explorer-address-bar">
-                <span class="explorer-bar-icon mono">/</span>
-                <div class="storage-breadcrumbs mono" id="app-files-breadcrumbs">
-                  <span class="crumb current" id="app-files-root-crumb">Application</span>
-                </div>
-              </div>
-            </div>
-
-            <div class="explorer-nav-group-right">
-              <button id="app-files-refresh-btn" class="explorer-icon-btn" title="Refresh">⟳</button>
-              <div class="storage-actions">
-                <input type="file" id="app-file-upload-input" style="display:none" multiple>
-                <button id="app-upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
-                <button id="app-create-folder-btn" class="btn btn-sm">New Folder</button>
-                <button class="btn btn-sm" onclick="closeAppFiles()">Close</button>
-              </div>
+            <div style="display: flex; gap: 6px;">
+              <button class="btn btn-sm btn-primary" id="app-panel-redeploy-btn">Redeploy</button>
+              <button class="btn btn-sm" onclick="closeAppDetails()">Close</button>
             </div>
           </div>
 
-          <!-- Files Table -->
-          <div class="explorer-main">
-            <div class="table-container explorer-table-container">
-              <table class="data-table explorer-table">
+          <!-- Navigation Tabs -->
+          <div class="app-tabs-header">
+            <button class="tab-btn active" data-tab="overview" onclick="switchAppTab('overview')">Overview</button>
+            <button class="tab-btn" data-tab="deployments" onclick="switchAppTab('deployments')">Deployments</button>
+            <button class="tab-btn" data-tab="logs" onclick="switchAppTab('logs')">Logs</button>
+            <button class="tab-btn" data-tab="files" onclick="switchAppTab('files')">Files</button>
+            <button class="tab-btn" data-tab="env" onclick="switchAppTab('env')">Environment</button>
+          </div>
+
+          <!-- Tab 1: Overview -->
+          <div id="app-tab-overview" class="tab-pane active">
+            <div class="sys-kv-list mono" id="app-overview-kv">
+              <div class="sys-kv-row"><span class="sys-kv-k">Loading...</span></div>
+            </div>
+          </div>
+
+          <!-- Tab 2: Deployments History -->
+          <div id="app-tab-deployments" class="tab-pane">
+            <div class="table-container">
+              <table class="data-table">
                 <thead>
                   <tr>
-                    <th style="width: 50%;">Name</th>
-                    <th style="width: 18%;">Type</th>
-                    <th style="width: 14%;">Size</th>
-                    <th style="width: 18%; text-align: right;">Action</th>
+                    <th style="width: 90px;">Deploy #</th>
+                    <th style="width: 100px;">Commit</th>
+                    <th style="width: 110px;">Branch</th>
+                    <th style="width: 100px;">Trigger</th>
+                    <th style="width: 100px;">Status</th>
+                    <th style="width: 90px;">Duration</th>
+                    <th>Started At</th>
                   </tr>
                 </thead>
-                <tbody id="app-files-tbody">
-                  <tr><td colspan="4" class="cell-muted" style="text-align: center; padding: 24px;">Loading project files...</td></tr>
+                <tbody id="app-deployments-tbody">
+                  <tr><td colspan="7" class="cell-muted">No deployment history recorded.</td></tr>
                 </tbody>
               </table>
             </div>
           </div>
 
-          <!-- Status Bar -->
-          <footer class="explorer-footer mono cell-muted">
-            <div id="app-files-stats-left">0 files · 0 folders</div>
-            <div id="app-files-stats-right">Sandboxed Application Storage</div>
-          </footer>
+          <!-- Tab 3: Logs -->
+          <div id="app-tab-logs" class="tab-pane">
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+              <button class="btn btn-sm" id="app-logs-refresh-btn">Refresh Logs</button>
+            </div>
+            <pre id="app-logs-stdout" class="log-box mono" style="max-height: 380px; overflow-y: auto;"></pre>
+          </div>
+
+          <!-- Tab 4: Files (Sandboxed Project File Explorer) -->
+          <div id="app-tab-files" class="tab-pane explorer-frame" style="padding: 0;">
+            <div class="explorer-toolbar">
+              <div class="explorer-nav-group-left">
+                <div class="explorer-nav-buttons">
+                  <button id="app-files-up-btn" class="explorer-icon-btn" title="Up one folder" disabled>↑</button>
+                </div>
+                <div class="explorer-address-bar">
+                  <span class="explorer-bar-icon mono">/</span>
+                  <div class="storage-breadcrumbs mono" id="app-files-breadcrumbs">
+                    <span class="crumb current" id="app-files-root-crumb">Application</span>
+                  </div>
+                </div>
+              </div>
+              <div class="explorer-nav-group-right">
+                <button id="app-files-refresh-btn" class="explorer-icon-btn" title="Refresh">⟳</button>
+                <div class="storage-actions">
+                  <input type="file" id="app-file-upload-input" style="display:none" multiple>
+                  <button id="app-upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
+                  <button id="app-create-folder-btn" class="btn btn-sm">New Folder</button>
+                </div>
+              </div>
+            </div>
+            <div class="explorer-main">
+              <div class="table-container explorer-table-container">
+                <table class="data-table explorer-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 50%;">Name</th>
+                      <th style="width: 18%;">Type</th>
+                      <th style="width: 14%;">Size</th>
+                      <th style="width: 18%; text-align: right;">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="app-files-tbody">
+                    <tr><td colspan="4" class="cell-muted" style="text-align: center; padding: 24px;">Loading project files...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <footer class="explorer-footer mono cell-muted">
+              <div id="app-files-stats-left">0 files · 0 folders</div>
+              <div id="app-files-stats-right">Sandboxed Application Storage</div>
+            </footer>
+          </div>
+
+          <!-- Tab 5: Environment Variables -->
+          <div id="app-tab-env" class="tab-pane">
+            <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 12px;">
+              Environment variables configured for this application. Secret values are masked by default and never exposed in logs or public routes.
+            </div>
+            <div class="table-container" style="margin-bottom: 16px;">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width: 35%;">Key</th>
+                    <th style="width: 45%;">Value</th>
+                    <th style="width: 20%; text-align: right;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="app-env-tbody">
+                  <tr><td colspan="3" class="cell-muted">No environment variables configured.</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <!-- Add Environment Variable Form -->
+            <div style="padding: 12px; background-color: var(--bg-panel-header); border: 1px solid var(--border-color); border-radius: var(--radius);">
+              <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">+ Add / Update Variable</div>
+              <form id="app-env-add-form" style="display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap;">
+                <div style="flex: 1; min-width: 140px;">
+                  <label for="env-new-key" class="modal-label">Key Name</label>
+                  <input type="text" id="env-new-key" class="form-input mono" placeholder="GROQ_API_KEY" required pattern="^[a-zA-Z_][a-zA-Z0-9_]*$">
+                </div>
+                <div style="flex: 2; min-width: 200px;">
+                  <label for="env-new-value" class="modal-label">Value</label>
+                  <input type="password" id="env-new-value" class="form-input mono" placeholder="Value..." required>
+                </div>
+                <div style="display: flex; align-items: center; gap: 6px; padding-bottom: 8px;">
+                  <input type="checkbox" id="env-new-is-secret" checked>
+                  <label for="env-new-is-secret" class="modal-label" style="cursor: pointer;">Secret</label>
+                </div>
+                <div>
+                  <button type="submit" class="btn btn-sm btn-primary">Save Variable</button>
+                </div>
+              </form>
+            </div>
+          </div>
         </div>
       </section>
 

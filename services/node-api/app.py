@@ -35,6 +35,24 @@ STORAGE_ROOT = (BASE_DIR / "storage").resolve()
 STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 
 DEFAULT_CONTROLLER_URL = "http://100.120.251.42:8000"
+DEFAULT_ROUTER_URL = "http://100.120.251.42:8088"
+
+
+class ProxyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevents proxy from auto-following redirects so they can be rewritten/forwarded to client."""
+    def http_error_301(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_302(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_303(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_307(self, req, fp, code, msg, headers):
+        return fp
+    def http_error_308(self, req, fp, code, msg, headers):
+        return fp
+
+
+PROXY_OPENER = urllib.request.build_opener(ProxyRedirectHandler)
 
 DEFAULT_KNOWN_NODES = {
     "server-5387a86bf36116b1": {"name": "vivo-y31", "endpoint": "http://100.85.108.5:8080"},
@@ -429,6 +447,55 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json(502, {"error": f"Controller unavailable at {controller_url}: {e}"})
 
+    def proxy_to_router(self, method, full_path, body_bytes=None):
+        config = load_config()
+        router_url = (config.get("ROUTER_URL") or DEFAULT_ROUTER_URL).rstrip("/")
+        target_url = f"{router_url}{full_path}"
+
+        headers = {}
+        for hdr, val in self.headers.items():
+            hdr_lower = hdr.lower()
+            if hdr_lower in ("host", "authorization", "x-auth-token", "x-onboarding-code", "cf-access-authenticated-user-email", "cf-access-jwt-assertion", "cf-access-user", "cookie-secret"):
+                continue
+            headers[hdr] = val
+
+        client_ip = self.client_address[0]
+        cf_ip = self.headers.get("Cf-Connecting-Ip") or self.headers.get("X-Forwarded-For")
+        remote_ip = cf_ip.split(",")[0].strip() if cf_ip else client_ip
+        headers["X-Forwarded-For"] = remote_ip
+        headers["X-Forwarded-Proto"] = self.headers.get("X-Forwarded-Proto", "https" if (self.headers.get("Cf-Ray") or self.headers.get("X-Forwarded-Proto") == "https") else "http")
+        headers["X-Forwarded-Host"] = self.headers.get("Host", "akshatsahay.space")
+
+        if body_bytes is not None:
+            headers["Content-Length"] = str(len(body_bytes))
+
+        req = urllib.request.Request(target_url, data=body_bytes, headers=headers, method=method)
+        try:
+            with PROXY_OPENER.open(req, timeout=15) as response:
+                resp_data = response.read()
+                self.send_response(response.status)
+                for k, v in response.headers.items():
+                    if k.lower() in ("transfer-encoding", "connection"):
+                        continue
+                    self.send_header(k, v)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(resp_data)
+        except urllib.error.HTTPError as e:
+            err_body = e.read()
+            self.send_response(e.code)
+            for k, v in e.headers.items():
+                if k.lower() in ("transfer-encoding", "connection"):
+                    continue
+                self.send_header(k, v)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(err_body)
+        except urllib.error.URLError as e:
+            self.send_json(504, {"error": "Application host node is temporarily unreachable", "status": 504})
+        except Exception as e:
+            self.send_json(502, {"error": "Application gateway error", "status": 502})
+
     def proxy_to_remote_storage(self, remote_endpoint, method, subpath, query_dict=None, body_bytes=None):
         target_url = f"{remote_endpoint.rstrip('/')}{subpath}"
         if query_dict:
@@ -744,7 +811,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.proxy_to_controller("GET", subpath, parsed.query)
             return
 
-        self.send_json(404, {"error": "Endpoint not found"})
+        # Fall through to PersonalServer Application Router (/demo-app/*, /recallflow/*, etc.)
+        self.proxy_to_router("GET", self.path)
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -971,7 +1039,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.proxy_to_controller("POST", subpath, parsed.query, body_bytes)
             return
 
-        self.send_json(404, {"error": "Endpoint not found"})
+        # Fall through to PersonalServer Application Router
+        content_len = int(self.headers.get("Content-Length", 0))
+        body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+        self.proxy_to_router("POST", self.path, body_bytes=body_bytes)
 
     def do_DELETE(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1031,7 +1102,28 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.proxy_to_controller("DELETE", subpath, parsed.query)
             return
 
-        self.send_json(404, {"error": "Endpoint not found"})
+        # Fall through to PersonalServer Application Router
+        content_len = int(self.headers.get("Content-Length", 0))
+        body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+        self.proxy_to_router("DELETE", self.path, body_bytes=body_bytes)
+
+    def do_PUT(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+        self.proxy_to_router("PUT", self.path, body_bytes=body_bytes)
+
+    def do_PATCH(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+        self.proxy_to_router("PATCH", self.path, body_bytes=body_bytes)
+
+    def do_HEAD(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path in ("/", "/health", "/status") or path.startswith("/static/"):
+            self.do_GET()
+            return
+        self.proxy_to_router("HEAD", self.path)
 
     def log_message(self, format, *args):
         print(f"[NODE-API] {args[0]}")

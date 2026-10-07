@@ -973,6 +973,66 @@ a:hover {
   border-radius: var(--radius);
 }
 
+/* Tabs & Application Details Styling */
+.app-tabs-header {
+  display: flex;
+  background-color: var(--bg-panel-header);
+  border-bottom: 1px solid var(--border-color);
+  padding: 0 8px;
+  gap: 4px;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.tab-btn:hover {
+  color: var(--text-main);
+  text-decoration: none;
+}
+
+.tab-btn.active {
+  color: var(--text-main);
+  border-bottom-color: var(--border-focus);
+  font-weight: 600;
+}
+
+.tab-pane {
+  display: none;
+  padding: 14px;
+}
+
+.tab-pane.active {
+  display: block;
+}
+
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  background-color: rgba(88, 166, 255, 0.12);
+  color: var(--link-color);
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  border-radius: var(--radius);
+}
+
+.source-badge-manual {
+  background-color: rgba(139, 148, 158, 0.12);
+  color: var(--text-muted);
+  border-color: rgba(139, 148, 158, 0.25);
+}
+
 .modal-footer {
   display: flex;
   justify-content: flex-end;

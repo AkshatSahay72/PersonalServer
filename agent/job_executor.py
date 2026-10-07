@@ -40,6 +40,7 @@ ALLOWLISTED_WORKLOADS = {
     "failing-test": "Controlled error-handling test workload",
     "timeout-test": "Controlled timeout test workload",
     "docker-deploy": "Pull image and safely launch containerized application",
+    "docker-build-deploy": "Build image from source and launch containerized application",
     "docker-stop": "Stop running containerized application",
     "docker-restart": "Restart containerized application",
     "docker-remove": "Remove containerized application",
@@ -154,15 +155,47 @@ class JobExecutor:
                 }
             cmd = ["python3", "-c", code]
 
-        elif job_type == "docker-deploy":
+        elif job_type in ("docker-deploy", "docker-build-deploy"):
             try:
                 # Security: Explicitly reject arbitrary host filesystem mounts
                 if params.get("volumes") or params.get("mounts"):
                     raise ValueError("Host volume mounts are not allowed in application deployment.")
 
-                image = validate_docker_identifier(params.get("image"), "Docker Image")
-                container_name = validate_docker_identifier(params.get("container_name") or f"ps-{job_id}", "Container Name")
-                host_port = int(params.get("host_port", 0))
+                app_id = params.get("app_id", "app")
+                app_name = validate_docker_identifier(params.get("app_name") or params.get("name") or "app", "Application Name")
+                container_name = validate_docker_identifier(params.get("container_name") or f"ps-{app_name}", "Container Name")
+
+                image = params.get("image")
+                source_dir = params.get("source_dir") or params.get("build_context")
+
+                # If source-based build is requested
+                if job_type == "docker-build-deploy" or source_dir:
+                    src_path = Path(source_dir).resolve()
+                    # Security check: must reside within application storage
+                    app_storage_root = (BASE_DIR / "storage" / "applications").resolve()
+                    try:
+                        src_path.relative_to(app_storage_root)
+                    except ValueError:
+                        raise ValueError("Access Denied: Source directory escapes application storage sandbox.")
+
+                    if not src_path.exists() or not src_path.is_dir():
+                        raise ValueError(f"Source directory not found: {source_dir}")
+
+                    dockerfile_rel = params.get("dockerfile") or "Dockerfile"
+                    dockerfile_path = (src_path / dockerfile_rel).resolve()
+                    try:
+                        dockerfile_path.relative_to(src_path)
+                    except ValueError:
+                        raise ValueError("Access Denied: Dockerfile escapes source directory sandbox.")
+
+                    if not dockerfile_path.exists() or not dockerfile_path.is_file():
+                        raise ValueError(f"Dockerfile not found at {dockerfile_rel}")
+
+                    build_tag = validate_docker_identifier(params.get("image_tag") or f"personalserver/{app_name}:latest", "Image Tag")
+                else:
+                    image = validate_docker_identifier(image or "python:3.11-slim", "Docker Image")
+
+                host_port = int(params.get("host_port") or 8000)
                 container_port = int(params.get("container_port") or params.get("target_port") or params.get("port", 8000))
                 if not (1 <= host_port <= 65535) or not (1 <= container_port <= 65535):
                     raise ValueError(f"Invalid port configuration: host_port={host_port}, container_port={container_port}")
@@ -179,24 +212,64 @@ class JobExecutor:
                         "finished_at": started_iso
                     }
 
-                # Clean up existing container with same name if any
-                subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if job_type == "docker-build-deploy" or source_dir:
+                    src_path = Path(source_dir).resolve()
+                    # Security check: must reside within application storage
+                    app_storage_root = (BASE_DIR / "storage" / "applications").resolve()
+                    try:
+                        src_path.relative_to(app_storage_root)
+                    except ValueError:
+                        raise ValueError("Access Denied: Source directory escapes application storage sandbox.")
 
-                # Check if image exists locally first, otherwise pull image
-                image_inspect = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if image_inspect.returncode != 0:
-                    pull_res = subprocess.run(["docker", "pull", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
-                    if pull_res.returncode != 0:
+                    if not src_path.exists() or not src_path.is_dir():
+                        raise ValueError(f"Source directory not found: {source_dir}")
+
+                    dockerfile_rel = params.get("dockerfile") or "Dockerfile"
+                    dockerfile_path = (src_path / dockerfile_rel).resolve()
+                    try:
+                        dockerfile_path.relative_to(src_path)
+                    except ValueError:
+                        raise ValueError("Access Denied: Dockerfile escapes source directory sandbox.")
+
+                    if not dockerfile_path.exists() or not dockerfile_path.is_file():
+                        raise ValueError(f"Dockerfile not found at {dockerfile_rel}")
+
+                    build_tag = validate_docker_identifier(params.get("image_tag") or f"personalserver/{app_name}:latest", "Image Tag")
+                    build_cmd = ["docker", "build", "-t", build_tag, "-f", str(dockerfile_path), str(src_path)]
+
+                    build_res = subprocess.run(build_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
+                    if build_res.returncode != 0:
                         return {
                             "job_id": job_id,
                             "status": JOB_STATE_FAILED,
-                            "exit_code": pull_res.returncode,
-                            "stdout": truncate_output(pull_res.stdout),
-                            "stderr": f"Failed to pull image '{image}': {pull_res.stderr.strip()}",
+                            "exit_code": build_res.returncode,
+                            "stdout": truncate_output(build_res.stdout),
+                            "stderr": f"Docker build failed for '{app_name}':\n{truncate_output(build_res.stderr.strip())}",
                             "duration_ms": int((time.time() - start_time) * 1000),
                             "started_at": started_iso,
                             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         }
+                    image = build_tag
+                else:
+                    image = validate_docker_identifier(image or "python:3.11-slim", "Docker Image")
+                    # Check if image exists locally first, otherwise pull image
+                    image_inspect = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if image_inspect.returncode != 0:
+                        pull_res = subprocess.run(["docker", "pull", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
+                        if pull_res.returncode != 0:
+                            return {
+                                "job_id": job_id,
+                                "status": JOB_STATE_FAILED,
+                                "exit_code": pull_res.returncode,
+                                "stdout": truncate_output(pull_res.stdout),
+                                "stderr": f"Failed to pull image '{image}': {pull_res.stderr.strip()}",
+                                "duration_ms": int((time.time() - start_time) * 1000),
+                                "started_at": started_iso,
+                                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                            }
+
+                # Clean up existing container with same name if any
+                subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                 # Construct safe run arguments (no shell=True, no host root mounts)
                 run_args = [
@@ -214,7 +287,7 @@ class JobExecutor:
                 if cpu_limit:
                     run_args.extend(["--cpus", str(cpu_limit)])
 
-                # Environment variables
+                # Environment variables: Passed safely as discrete command arguments
                 env_vars = params.get("env", {})
                 if isinstance(env_vars, dict):
                     for k, v in env_vars.items():
@@ -230,7 +303,7 @@ class JobExecutor:
                     "status": JOB_STATE_FAILED,
                     "exit_code": 1,
                     "stdout": "",
-                    "stderr": f"Validation Error in docker-deploy: {e}",
+                    "stderr": f"Validation Error in docker deployment: {e}",
                     "duration_ms": 0,
                     "started_at": started_iso,
                     "finished_at": started_iso

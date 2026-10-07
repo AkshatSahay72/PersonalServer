@@ -384,12 +384,14 @@ class PersonalServerRouter:
 
     def start(self, blocking=False):
         self.server = ThreadingHTTPServer((self.host, self.port), RouterHTTPHandler)
+        self.port = self.server.server_address[1]
         print(f"[PersonalServer App Router] Gateway listening on http://{self.host}:{self.port}")
         if blocking:
             self.server.serve_forever()
         else:
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
+        return self.port
 
     def stop(self):
         if self.server:

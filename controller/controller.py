@@ -116,8 +116,12 @@ JOB_STATE_CANCELLED = "CANCELLED"
 JOB_STATE_RECOVERING = "RECOVERING"
 JOB_STATE_REJECTED = "REJECTED"
 
-# Centralized Application States (Phase 11B Lifecycle)
+# Centralized Application States (Phase 11-13 Lifecycle)
 APP_STATE_CREATED = "CREATED"
+APP_STATE_FETCHING_SOURCE = "FETCHING_SOURCE"
+APP_STATE_CONFIGURING = "CONFIGURING"
+APP_STATE_BUILDING = "BUILDING"
+APP_STATE_SCHEDULING = "SCHEDULING"
 APP_STATE_DEPLOYING = "DEPLOYING"
 APP_STATE_RUNNING = "RUNNING"
 APP_STATE_STOPPED = "STOPPED"
@@ -134,6 +138,7 @@ ALLOWLISTED_WORKLOADS = {
     "failing-test": "Controlled error-handling test workload",
     "timeout-test": "Controlled timeout test workload",
     "docker-deploy": "Pull image and safely launch containerized application",
+    "docker-build-deploy": "Build image from source context and launch containerized application",
     "docker-stop": "Stop running containerized application",
     "docker-restart": "Restart containerized application",
     "docker-remove": "Remove containerized application",
@@ -338,6 +343,275 @@ def validate_app_route(route_dict, apps_db, current_app_id=None):
         "strip_prefix": bool(route_dict.get("strip_prefix", True)),
         "public_access": bool(route_dict.get("public_access", True))
     }
+
+
+# ------------------------------------------------------------------------------
+# Phase 13: PersonalServer Blueprint & GitHub Source Subsystem
+# ------------------------------------------------------------------------------
+
+def parse_yaml_or_json(content_str):
+    """Parses YAML (using PyYAML if installed or built-in YAML subset parser) or JSON."""
+    if not content_str or not isinstance(content_str, str):
+        return {}
+    content_str = content_str.strip()
+    if content_str.startswith("{"):
+        try:
+            return json.loads(content_str)
+        except Exception:
+            pass
+    try:
+        import yaml
+        return yaml.safe_load(content_str) or {}
+    except ImportError:
+        # Robust fallback parser for personalserver.yaml subset
+        result = {"services": []}
+        curr_service = None
+        curr_env_vars = None
+        for raw_line in content_str.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("- type:"):
+                curr_service = {"type": line.split(":", 1)[1].strip()}
+                result["services"].append(curr_service)
+                curr_env_vars = None
+            elif curr_service is not None:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    k = k.strip().lstrip("- ")
+                    v = v.strip().strip("'\"")
+                    if k == "envVars":
+                        curr_env_vars = []
+                        curr_service["envVars"] = curr_env_vars
+                    elif curr_env_vars is not None and k == "key":
+                        curr_env_vars.append({"key": v, "sync": False})
+                    elif k in ("name", "runtime", "rootDir", "dockerfile", "route"):
+                        curr_service[k] = v
+        return result
+
+
+def parse_and_validate_blueprint(blueprint_input, apps_db=None, current_app_id=None):
+    if apps_db is None:
+        apps_db = {"apps": {}}
+    """
+    Validates PersonalServer Blueprint schema:
+    services:
+      - type: web
+        name: <app_name>
+        runtime: docker
+        rootDir: .
+        dockerfile: ./Dockerfile
+        route: /<app_name>
+        envVars:
+          - key: KEY_NAME
+            sync: false
+    """
+    if isinstance(blueprint_input, str):
+        data = parse_yaml_or_json(blueprint_input)
+    elif isinstance(blueprint_input, dict):
+        data = blueprint_input
+    else:
+        raise ValueError("Blueprint must be a YAML/JSON string or an object.")
+
+    services = data.get("services")
+    if not services or not isinstance(services, list) or len(services) == 0:
+        raise ValueError("Blueprint must define at least one service under 'services'.")
+
+    svc = services[0]
+    if not isinstance(svc, dict):
+        raise ValueError("Service definition must be an object.")
+
+    svc_type = str(svc.get("type", "web")).strip().lower()
+    if svc_type != "web":
+        raise ValueError(f"Unsupported service type '{svc_type}'. Only 'web' is supported in this phase.")
+
+    svc_name = str(svc.get("name", "")).strip()
+    if not svc_name or not re.match(r'^[a-zA-Z0-9_-]+$', svc_name):
+        raise ValueError("Service name must be non-empty and contain only alphanumeric characters, dashes, and underscores.")
+
+    runtime = str(svc.get("runtime", "docker")).strip().lower()
+    if runtime != "docker":
+        raise ValueError(f"Unsupported runtime '{runtime}'. Only 'docker' is supported.")
+
+    root_dir = str(svc.get("rootDir") or ".").strip().replace("\\", "/")
+    if root_dir.startswith("/") or ".." in root_dir:
+        raise ValueError("rootDir must be a relative path and cannot escape repository root.")
+
+    dockerfile = str(svc.get("dockerfile") or "Dockerfile").strip().replace("\\", "/")
+    if dockerfile.startswith("/") or ".." in dockerfile:
+        raise ValueError("dockerfile must be a relative path within rootDir.")
+
+    # Route validation
+    route_path = svc.get("route")
+    route_obj = None
+    if route_path:
+        route_dict = {"enabled": True, "type": "path", "path": route_path, "strip_prefix": True, "public_access": True}
+        route_obj = validate_app_route(route_dict, apps_db, current_app_id)
+
+    # Environment variables validation
+    raw_env_vars = svc.get("envVars") or []
+    validated_env_vars = []
+    if isinstance(raw_env_vars, list):
+        for ev in raw_env_vars:
+            if isinstance(ev, dict) and "key" in ev:
+                k = str(ev["key"]).strip()
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', k):
+                    raise ValueError(f"Invalid environment variable name '{k}'.")
+                validated_env_vars.append({"key": k, "sync": bool(ev.get("sync", False))})
+            elif isinstance(ev, str):
+                k = ev.strip()
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', k):
+                    raise ValueError(f"Invalid environment variable name '{k}'.")
+                validated_env_vars.append({"key": k, "sync": False})
+
+    sanitized_blueprint = {
+        "version": "1.0",
+        "services": [
+            {
+                "type": "web",
+                "name": svc_name,
+                "runtime": "docker",
+                "rootDir": root_dir,
+                "dockerfile": dockerfile,
+                "route": route_obj.get("path") if route_obj else f"/{svc_name.lower()}",
+                "envVars": validated_env_vars
+            }
+        ]
+    }
+    return sanitized_blueprint
+
+
+def fetch_github_source(app_id, repository, branch="main", root_directory="."):
+    """
+    Fetches GitHub source repository into sandboxed application storage directory:
+    storage/applications/<app_id>/source/
+    Ensures safe unpacking and zero path traversal.
+    """
+    if not re.match(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$', repository.strip()):
+        raise ValueError("Invalid repository format. Expected 'owner/repository'.")
+
+    branch = branch.strip() or "main"
+    if not re.match(r'^[a-zA-Z0-9_./-]+$', branch) or ".." in branch:
+        raise ValueError("Invalid branch name.")
+
+    target_source_dir, app_base = resolve_safe_app_storage_path(app_id, "source")
+    target_source_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check local test fixture directories (e.g. tests/fixtures/sample_repo)
+    repo_leaf = repository.split("/")[-1]
+    fixture_dir = BASE_DIR / "tests" / "fixtures" / repo_leaf
+    commit_sha = "main"
+
+    if fixture_dir.exists() and fixture_dir.is_dir():
+        shutil.copytree(fixture_dir, target_source_dir, dirs_exist_ok=True)
+    else:
+        url = f"https://codeload.github.com/{repository}/tar.gz/refs/heads/{branch}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PersonalServer-SourceDeployer/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                import tarfile
+                import io
+                tar_bytes = resp.read()
+                tar_fp = io.BytesIO(tar_bytes)
+                with tarfile.open(fileobj=tar_fp, mode="r:gz") as tar:
+                    members = tar.getmembers()
+                    if not members:
+                        raise ValueError("Empty repository archive.")
+                    root_prefix = members[0].name.split("/")[0] + "/"
+                    for member in members:
+                        rel_path = member.name[len(root_prefix):] if member.name.startswith(root_prefix) else member.name
+                        if not rel_path or rel_path.startswith("/") or ".." in rel_path:
+                            continue
+                        member.name = rel_path
+                        dest_path = (target_source_dir / rel_path).resolve()
+                        dest_path.relative_to(target_source_dir)
+                        tar.extract(member, path=target_source_dir)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch GitHub repository '{repository}' on branch '{branch}': {e}")
+
+    # Inspect fetched source for blueprint or Dockerfile
+    resolved_root = (target_source_dir / (root_directory or ".")).resolve()
+    try:
+        resolved_root.relative_to(target_source_dir)
+    except ValueError:
+        raise ValueError("Access Denied: rootDirectory escapes source repository.")
+
+    blueprint = None
+    bp_file = resolved_root / "personalserver.yaml"
+    if not bp_file.exists():
+        bp_file = resolved_root / "personalserver.yml"
+
+    if bp_file.exists():
+        try:
+            blueprint = parse_and_validate_blueprint(bp_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise ValueError(f"Invalid blueprint file {bp_file.name}: {e}")
+    else:
+        dockerfile_file = resolved_root / "Dockerfile"
+        if dockerfile_file.exists():
+            app_name = repository.split("/")[-1].lower().replace(".", "-")
+            blueprint = {
+                "version": "1.0",
+                "services": [
+                    {
+                        "type": "web",
+                        "name": app_name,
+                        "runtime": "docker",
+                        "rootDir": root_directory or ".",
+                        "dockerfile": "Dockerfile",
+                        "route": f"/{app_name}",
+                        "envVars": []
+                    }
+                ]
+            }
+
+    return {
+        "status": "fetched",
+        "repository": repository,
+        "branch": branch,
+        "root_directory": root_directory,
+        "commit": commit_sha[:8],
+        "source_dir": str(target_source_dir),
+        "blueprint": blueprint
+    }
+
+
+def mask_app_record(app, reveal_secrets=False):
+    """Returns a sanitized copy of application record with secret environment variables masked."""
+    if not app or not isinstance(app, dict):
+        return app
+    app_copy = json.loads(json.dumps(app))
+
+    # Mask env_vars object
+    env_vars = app_copy.get("env_vars") or {}
+    if isinstance(env_vars, dict):
+        masked_env = {}
+        for k, v in env_vars.items():
+            if isinstance(v, dict):
+                is_sec = bool(v.get("is_secret", True if any(s in k.lower() for s in ("key", "secret", "password", "token", "auth")) else False))
+                val = v.get("value", "")
+                masked_env[k] = {
+                    "value": val if (reveal_secrets or not is_sec) else "********",
+                    "is_secret": is_sec
+                }
+            else:
+                is_sec = bool(any(s in k.lower() for s in ("key", "secret", "password", "token", "auth")))
+                masked_env[k] = {
+                    "value": str(v) if (reveal_secrets or not is_sec) else "********",
+                    "is_secret": is_sec
+                }
+        app_copy["env_vars"] = masked_env
+
+    # Mask legacy env dict
+    raw_env = app_copy.get("env") or {}
+    if isinstance(raw_env, dict):
+        masked_raw = {}
+        for k, v in raw_env.items():
+            is_sec = bool(any(s in k.lower() for s in ("key", "secret", "password", "token", "auth")))
+            masked_raw[k] = str(v) if (reveal_secrets or not is_sec) else "********"
+        app_copy["env"] = masked_raw
+
+    return app_copy
 
 
 # ------------------------------------------------------------------------------
@@ -829,10 +1103,64 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized: Authentication required"})
                 return
             apps_db = load_apps_db()
-            apps_list = list(apps_db.get("apps", {}).values())
+            apps_list = [mask_app_record(app) for app in apps_db.get("apps", {}).values() if app.get("status") != "DELETED"]
             self.send_json(200, {
                 "apps": apps_list,
                 "count": len(apps_list)
+            })
+            return
+
+        # GET /apps/<app_id>/deployments
+        if path.startswith("/apps/") and path.endswith("/deployments"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            app_id = path[6:-12].strip()
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app or app.get("status") == "DELETED":
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+            deployments = app.get("deployments", [])
+            self.send_json(200, {
+                "app_id": app_id,
+                "deployments": deployments,
+                "count": len(deployments)
+            })
+            return
+
+        # GET /apps/<app_id>/env
+        if path.startswith("/apps/") and path.endswith("/env"):
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            app_id = path[6:-4].strip()
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app or app.get("status") == "DELETED":
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+            masked_app = mask_app_record(app)
+            self.send_json(200, {
+                "app_id": app_id,
+                "env_vars": masked_app.get("env_vars", {}),
+                "env": masked_app.get("env", {})
+            })
+            return
+
+        # GET /apps/<app_id>
+        if path.startswith("/apps/") and not any(path.endswith(s) for s in ("/logs", "/files", "/env", "/deployments")) and "/" not in path[6:]:
+            if not self.is_authenticated_admin_or_node():
+                self.send_json(401, {"error": "Unauthorized: Authentication required"})
+                return
+            app_id = path[6:].strip()
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app or app.get("status") == "DELETED":
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+            self.send_json(200, {
+                "app": mask_app_record(app)
             })
             return
 
@@ -1333,7 +1661,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 apps_db = load_apps_db()
                 app = apps_db.get("apps", {}).get(app_id)
                 if app:
-                    if job.get("type") == "docker-deploy":
+                    if job.get("type") in ("docker-deploy", "docker-build-deploy"):
                         if job_status == JOB_STATE_SUCCEEDED:
                             app["status"] = APP_STATE_RUNNING
                             app["error"] = None
@@ -1341,7 +1669,16 @@ class ControllerHandler(BaseHTTPRequestHandler):
                         elif job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
                             app["status"] = APP_STATE_FAILED
                             app["error"] = body.get("stderr") or f"Deployment job {job_status}"
+                            app["failure_reason"] = app["error"]
                             app["updated_at"] = now_iso
+
+                        # Update deployment record if present
+                        if app.get("deployments"):
+                            last_dep = app["deployments"][-1]
+                            last_dep["status"] = "SUCCESS" if job_status == JOB_STATE_SUCCEEDED else "FAILED"
+                            last_dep["finished_at"] = now_iso
+                            last_dep["duration_ms"] = body.get("duration_ms", 0)
+
                     elif job.get("type") == "docker-stop" and job_status == JOB_STATE_SUCCEEDED:
                         app["status"] = APP_STATE_STOPPED
                         app["updated_at"] = now_iso
@@ -1368,12 +1705,45 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Unauthorized: Authentication required"})
                 return
 
+        # ----------------------------------------------------------------------
+        # GitHub Inspect: POST /apps/github/inspect
+        # ----------------------------------------------------------------------
+        if path == "/apps/github/inspect":
+            repo = (body.get("repository") or "").strip()
+            branch = (body.get("branch") or "main").strip()
+            root_dir = (body.get("root_directory") or ".").strip()
+            if not repo or not re.match(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$', repo):
+                self.send_json(400, {"error": "Invalid repository format. Must be 'owner/repository'."})
+                return
+            try:
+                inspect_id = f"inspect-{secrets.token_hex(4)}"
+                res = fetch_github_source(inspect_id, repo, branch, root_dir)
+                temp_dir = APP_STORAGE_ROOT / inspect_id
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                bp = res.get("blueprint")
+                self.send_json(200, {
+                    "status": "ok",
+                    "repository": repo,
+                    "branch": branch,
+                    "root_directory": root_dir,
+                    "commit": res.get("commit", "main"),
+                    "blueprint": bp,
+                    "has_blueprint": bp is not None,
+                    "env_vars_needed": bp.get("services", [{}])[0].get("envVars", []) if bp else []
+                })
+            except Exception as e:
+                self.send_json(400, {"error": f"Inspection failed: {e}"})
+            return
+
         if path == "/apps":
             name = (body.get("name") or "").strip()
+            source = body.get("source") or {"type": "manual"}
+            blueprint_input = body.get("blueprint")
             image = (body.get("image") or "").strip()
             port = int(body.get("container_port") or body.get("port") or 8000)
             target = (body.get("target") or "auto").strip()
-            env = body.get("env", {})
+            raw_env_vars = body.get("env_vars") or body.get("env") or {}
             cpu_limit = str(body.get("cpu_limit", "0.5"))
             memory_limit = str(body.get("memory_limit", "256m"))
 
@@ -1381,24 +1751,84 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid application name. Must contain only alphanumeric characters, dashes, and underscores."})
                 return
 
-            if not image or not re.match(r'^[a-zA-Z0-9_./:-]+$', image):
-                self.send_json(400, {"error": "Invalid Docker image reference."})
-                return
-
             if not (1 <= port <= 65535):
                 self.send_json(400, {"error": "Invalid container port. Must be between 1 and 65535."})
                 return
 
+            # Normalize env_vars
+            env_vars = {}
+            flat_env = {}
+            if isinstance(raw_env_vars, dict):
+                for k, v in raw_env_vars.items():
+                    k_str = str(k).strip()
+                    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', k_str):
+                        continue
+                    if isinstance(v, dict):
+                        is_sec = bool(v.get("is_secret", True if any(s in k_str.lower() for s in ("key", "secret", "password", "token", "auth")) else False))
+                        val_str = str(v.get("value", ""))
+                        env_vars[k_str] = {"value": val_str, "is_secret": is_sec}
+                        flat_env[k_str] = val_str
+                    else:
+                        is_sec = bool(any(s in k_str.lower() for s in ("key", "secret", "password", "token", "auth")))
+                        env_vars[k_str] = {"value": str(v), "is_secret": is_sec}
+                        flat_env[k_str] = str(v)
+            elif isinstance(raw_env_vars, list):
+                for item in raw_env_vars:
+                    if isinstance(item, dict) and "key" in item:
+                        k_str = str(item["key"]).strip()
+                        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', k_str):
+                            continue
+                        val_str = str(item.get("value", ""))
+                        is_sec = bool(item.get("is_secret", True if any(s in k_str.lower() for s in ("key", "secret", "password", "token", "auth")) else False))
+                        env_vars[k_str] = {"value": val_str, "is_secret": is_sec}
+                        flat_env[k_str] = val_str
+
             with APPS_LOCK:
                 apps_db = load_apps_db()
-                # Check for duplicate name
                 for existing in apps_db.get("apps", {}).values():
                     if existing.get("name") == name and existing.get("status") != "DELETED":
                         self.send_json(409, {"error": f"Application with name '{name}' already exists."})
                         return
 
-                # Route metadata validation
+                app_id = f"app-{secrets.token_hex(6)}"
+                now_iso = get_current_iso_timestamp()
+
+                source_type = str(source.get("type", "manual")).lower()
+                validated_blueprint = None
+
+                if source_type == "github":
+                    repo = str(source.get("repository", "")).strip()
+                    branch = str(source.get("branch", "main")).strip()
+                    root_dir = str(source.get("root_directory", ".")).strip()
+                    if not repo or not re.match(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$', repo):
+                        self.send_json(400, {"error": "Invalid GitHub repository format. Must be 'owner/repository'."})
+                        return
+                    try:
+                        fetch_res = fetch_github_source(app_id, repo, branch, root_dir)
+                        validated_blueprint = fetch_res.get("blueprint")
+                        if blueprint_input:
+                            validated_blueprint = parse_and_validate_blueprint(blueprint_input, apps_db, app_id)
+                    except Exception as e:
+                        self.send_json(400, {"error": f"GitHub source error: {e}"})
+                        return
+                    source = {
+                        "type": "github",
+                        "repository": repo,
+                        "branch": branch,
+                        "root_directory": root_dir
+                    }
+                else:
+                    source = {"type": "manual"}
+                    if not image or not re.match(r'^[a-zA-Z0-9_./:-]+$', image):
+                        self.send_json(400, {"error": "Invalid Docker image reference."})
+                        return
+
                 route_data = body.get("route")
+                if not route_data and validated_blueprint:
+                    bp_route = validated_blueprint.get("services", [{}])[0].get("route")
+                    if bp_route:
+                        route_data = {"enabled": True, "type": "path", "path": bp_route, "strip_prefix": True, "public_access": True}
+
                 try:
                     validated_route = validate_app_route(route_data, apps_db)
                 except ValueError as e:
@@ -1411,14 +1841,13 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     self.send_json(500, {"error": f"Failed to allocate host port: {e}"})
                     return
 
-                app_id = f"app-{secrets.token_hex(6)}"
-                now_iso = get_current_iso_timestamp()
-
                 app_record = {
                     "app_id": app_id,
                     "id": app_id,
                     "name": name,
-                    "image": image,
+                    "source": source,
+                    "blueprint": validated_blueprint,
+                    "image": image or f"personalserver/{name}:latest",
                     "port": host_port,
                     "container_port": port,
                     "host_port": host_port,
@@ -1427,7 +1856,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     "selected_node": None,
                     "container_id": f"ps-{name}",
                     "route": validated_route,
-                    "env": env if isinstance(env, dict) else {},
+                    "env_vars": env_vars,
+                    "env": flat_env,
+                    "deployments": [],
                     "cpu_limit": cpu_limit,
                     "memory_limit": memory_limit,
                     "created_at": now_iso,
@@ -1443,7 +1874,63 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.send_json(201, {
                 "status": "created",
                 "app_id": app_id,
-                "app": app_record
+                "app": mask_app_record(app_record)
+            })
+            return
+
+        # POST /apps/<app_id>/env
+        if path.startswith("/apps/") and path.endswith("/env"):
+            app_id = path[6:-4].strip()
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app or app.get("status") == "DELETED":
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                key = (body.get("key") or "").strip()
+                val = str(body.get("value") or "")
+                is_sec = bool(body.get("is_secret", True if any(s in key.lower() for s in ("key", "secret", "password", "token", "auth")) else False))
+
+                if not key or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):
+                    self.send_json(400, {"error": "Invalid environment variable name. Must start with letter/underscore."})
+                    return
+
+                app.setdefault("env_vars", {})[key] = {"value": val, "is_secret": is_sec}
+                app.setdefault("env", {})[key] = val
+                app["updated_at"] = get_current_iso_timestamp()
+                save_apps_db(apps_db)
+
+            masked_app = mask_app_record(app)
+            self.send_json(200, {
+                "status": "updated",
+                "app_id": app_id,
+                "env_vars": masked_app.get("env_vars", {})
+            })
+            return
+
+        # POST /apps/<app_id>/env/reveal
+        if path.startswith("/apps/") and path.endswith("/env/reveal"):
+            app_id = path[6:-11].strip()
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app or app.get("status") == "DELETED":
+                self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return
+
+            key = (body.get("key") or "").strip()
+            env_vars = app.get("env_vars", {})
+            if key not in env_vars:
+                self.send_json(404, {"error": f"Variable '{key}' not found"})
+                return
+
+            entry = env_vars[key]
+            val = entry.get("value") if isinstance(entry, dict) else str(entry)
+            is_sec = entry.get("is_secret", False) if isinstance(entry, dict) else False
+            self.send_json(200, {
+                "key": key,
+                "value": val,
+                "is_secret": is_sec
             })
             return
 
@@ -1471,25 +1958,56 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "status": "updated",
                 "app_id": app_id,
                 "route": validated_route,
-                "app": app
+                "app": mask_app_record(app)
             })
             return
 
-        if path.startswith("/apps/") and path.endswith("/deploy"):
-            app_id = path[6:-7].strip()
+        if path.startswith("/apps/") and (path.endswith("/deploy") or path.endswith("/redeploy")):
+            is_redeploy = path.endswith("/redeploy")
+            app_id = path[6:-9].strip() if is_redeploy else path[6:-7].strip()
             with APPS_LOCK:
                 apps_db = load_apps_db()
                 app = apps_db.get("apps", {}).get(app_id)
-                if not app:
+                if not app or app.get("status") == "DELETED":
                     self.send_json(404, {"error": f"Application '{app_id}' not found"})
                     return
+
+                source = app.get("source") or {"type": "manual"}
+                source_type = source.get("type", "manual")
+                now_iso = get_current_iso_timestamp()
+                commit_sha = "latest"
+
+                # If GitHub source app, fetch latest source
+                if source_type == "github":
+                    app["status"] = APP_STATE_FETCHING_SOURCE
+                    save_apps_db(apps_db)
+                    repo = source.get("repository")
+                    branch = source.get("branch", "main")
+                    root_dir = source.get("root_directory", ".")
+                    try:
+                        fetch_res = fetch_github_source(app_id, repo, branch, root_dir)
+                        if fetch_res.get("blueprint"):
+                            app["blueprint"] = fetch_res["blueprint"]
+                        commit_sha = fetch_res.get("commit", "latest")
+                        app["status"] = APP_STATE_CONFIGURING
+                        save_apps_db(apps_db)
+                    except Exception as e:
+                        app["status"] = APP_STATE_FAILED
+                        app["failure_reason"] = f"Failed to fetch GitHub source: {e}"
+                        app["error"] = app["failure_reason"]
+                        app["updated_at"] = now_iso
+                        save_apps_db(apps_db)
+                        self.send_json(400, {
+                            "error": app["failure_reason"],
+                            "status": APP_STATE_FAILED,
+                            "app": mask_app_record(app)
+                        })
+                        return
 
                 # Schedule onto Docker-capable node
                 nodes_db = load_nodes_db()
                 reqs = {"capabilities": ["container_runtime:docker"]}
                 decision = ResourceScheduler.select_node(reqs, nodes_db, self.heartbeat_timeout)
-
-                now_iso = get_current_iso_timestamp()
 
                 if not decision.get("selected_node"):
                     reason = "No Docker-capable node is currently available in the cluster."
@@ -1502,7 +2020,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     self.send_json(400, {
                         "error": reason,
                         "status": APP_STATE_FAILED,
-                        "app": app,
+                        "app": mask_app_record(app),
                         "scheduler": decision
                     })
                     return
@@ -1512,58 +2030,133 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 app["selected_node"] = selected_node
                 app["updated_at"] = now_iso
                 app["error"] = None
+
+                # Record deployment entry in history
+                dep_num = len(app.get("deployments", [])) + 1
+                dep_id = f"dep-{secrets.token_hex(4)}"
+                dep_record = {
+                    "deployment_id": dep_id,
+                    "number": dep_num,
+                    "commit": commit_sha,
+                    "branch": source.get("branch", "main") if source_type == "github" else "manual",
+                    "trigger": "redeploy" if is_redeploy else ("github" if source_type == "github" else "manual"),
+                    "status": "BUILDING" if source_type == "github" else "DEPLOYING",
+                    "started_at": now_iso,
+                    "finished_at": None,
+                    "duration_ms": None
+                }
+                app.setdefault("deployments", []).append(dep_record)
                 save_apps_db(apps_db)
 
-                # Create docker-deploy job
+                # Prepare environment variables unmasked for Docker container
+                container_env = dict(app.get("env", {}))
+                for k, v in (app.get("env_vars") or {}).items():
+                    if isinstance(v, dict):
+                        container_env[k] = v.get("value", "")
+                    else:
+                        container_env[k] = str(v)
+
                 job_id = f"job-{secrets.token_hex(6)}"
-                job_record = {
-                    "id": job_id,
-                    "job_id": job_id,
-                    "name": f"deploy-{app['name']}",
-                    "type": "docker-deploy",
-                    "parameters": {
-                        "app_id": app_id,
-                        "image": app["image"],
-                        "container_name": app.get("container_id") or f"ps-{app['name']}",
-                        "host_port": app["host_port"],
-                        "container_port": app.get("container_port", 8000),
-                        "env": app.get("env", {}),
-                        "cpu_limit": app.get("cpu_limit", "0.5"),
-                        "memory_limit": app.get("memory_limit", "256m")
-                    },
-                    "requirements": reqs,
-                    "target": selected_node,
-                    "target_node": selected_node,
-                    "assigned_node": selected_node,
-                    "scheduler": {
-                        "mode": "resource-aware-docker",
-                        "selected_node": selected_node,
-                        "score": decision["score"],
-                        "reason": decision["reason"]
-                    },
-                    "timeout": 120,
-                    "max_attempts": 2,
-                    "attempt": 1,
-                    "claimed_at": None,
-                    "lease_expires_at": None,
-                    "created_at": now_iso,
-                    "started_at": None,
-                    "finished_at": None,
-                    "status": JOB_STATE_QUEUED,
-                    "state": JOB_STATE_QUEUED,
-                    "retry_reason": None,
-                    "attempts_history": [],
-                    "result": None
-                }
+
+                if source_type == "github":
+                    # Build and deploy from source context
+                    src_context, _ = resolve_safe_app_storage_path(app_id, f"source/{source.get('root_directory', '.')}".rstrip("/."))
+                    dockerfile_name = "Dockerfile"
+                    if app.get("blueprint"):
+                        dockerfile_name = app["blueprint"].get("services", [{}])[0].get("dockerfile", "Dockerfile")
+                    
+                    job_record = {
+                        "id": job_id,
+                        "job_id": job_id,
+                        "name": f"build-deploy-{app['name']}",
+                        "type": "docker-build-deploy",
+                        "parameters": {
+                            "app_id": app_id,
+                            "app_name": app["name"],
+                            "source_dir": str(src_context),
+                            "dockerfile": dockerfile_name,
+                            "image_tag": f"personalserver/{app['name']}:v{dep_num}",
+                            "container_name": app.get("container_id") or f"ps-{app['name']}",
+                            "host_port": app["host_port"],
+                            "container_port": app.get("container_port", 8000),
+                            "env": container_env,
+                            "cpu_limit": app.get("cpu_limit", "0.5"),
+                            "memory_limit": app.get("memory_limit", "256m")
+                        },
+                        "requirements": reqs,
+                        "target": selected_node,
+                        "target_node": selected_node,
+                        "assigned_node": selected_node,
+                        "scheduler": {
+                            "mode": "resource-aware-docker",
+                            "selected_node": selected_node,
+                            "score": decision["score"],
+                            "reason": decision["reason"]
+                        },
+                        "timeout": 180,
+                        "max_attempts": 1,
+                        "attempt": 1,
+                        "claimed_at": None,
+                        "lease_expires_at": None,
+                        "created_at": now_iso,
+                        "started_at": None,
+                        "finished_at": None,
+                        "status": JOB_STATE_QUEUED,
+                        "state": JOB_STATE_QUEUED,
+                        "retry_reason": None,
+                        "attempts_history": [],
+                        "result": None
+                    }
+                else:
+                    # Direct image deployment
+                    job_record = {
+                        "id": job_id,
+                        "job_id": job_id,
+                        "name": f"deploy-{app['name']}",
+                        "type": "docker-deploy",
+                        "parameters": {
+                            "app_id": app_id,
+                            "image": app["image"],
+                            "container_name": app.get("container_id") or f"ps-{app['name']}",
+                            "host_port": app["host_port"],
+                            "container_port": app.get("container_port", 8000),
+                            "env": container_env,
+                            "cpu_limit": app.get("cpu_limit", "0.5"),
+                            "memory_limit": app.get("memory_limit", "256m")
+                        },
+                        "requirements": reqs,
+                        "target": selected_node,
+                        "target_node": selected_node,
+                        "assigned_node": selected_node,
+                        "scheduler": {
+                            "mode": "resource-aware-docker",
+                            "selected_node": selected_node,
+                            "score": decision["score"],
+                            "reason": decision["reason"]
+                        },
+                        "timeout": 120,
+                        "max_attempts": 2,
+                        "attempt": 1,
+                        "claimed_at": None,
+                        "lease_expires_at": None,
+                        "created_at": now_iso,
+                        "started_at": None,
+                        "finished_at": None,
+                        "status": JOB_STATE_QUEUED,
+                        "state": JOB_STATE_QUEUED,
+                        "retry_reason": None,
+                        "attempts_history": [],
+                        "result": None
+                    }
 
                 jobs_db = load_jobs_db()
                 jobs_db.setdefault("jobs", {})[job_id] = job_record
                 save_jobs_db(jobs_db)
 
-            print(f"[CONTROLLER] Queued docker-deploy job {job_id} for app '{app['name']}' to node '{selected_node}'")
+            print(f"[CONTROLLER] Queued {job_record['type']} job {job_id} for app '{app['name']}' to node '{selected_node}'")
             self.send_json(200, {
                 "status": APP_STATE_DEPLOYING,
-                "app": app,
+                "app": mask_app_record(app),
                 "job_id": job_id
             })
             return
@@ -1898,6 +2491,33 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     })
                 except Exception as e:
                     self.send_json(500, {"error": f"Failed to delete item: {e}"})
+                return
+
+            # DELETE /apps/<app_id>/env/<key>
+            parts = [p for p in path.strip("/").split("/") if p]
+            if len(parts) == 4 and parts[0] == "apps" and parts[2] == "env":
+                app_id = parts[1]
+                env_key = parts[3]
+                with APPS_LOCK:
+                    apps_db = load_apps_db()
+                    app = apps_db.get("apps", {}).get(app_id)
+                    if not app or app.get("status") == "DELETED":
+                        self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                        return
+
+                    if env_key in app.get("env_vars", {}):
+                        del app["env_vars"][env_key]
+                    if env_key in app.get("env", {}):
+                        del app["env"][env_key]
+                    app["updated_at"] = get_current_iso_timestamp()
+                    save_apps_db(apps_db)
+
+                self.send_json(200, {
+                    "status": "deleted",
+                    "key": env_key,
+                    "app_id": app_id,
+                    "env_vars": mask_app_record(app).get("env_vars", {})
+                })
                 return
 
             app_id = path[6:].strip()

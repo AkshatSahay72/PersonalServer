@@ -1060,14 +1060,17 @@ window.closeStorageProperties = function() {
 };
 
 // ==========================================
-// 5. Applications Logic
+// 5. Applications Logic (Phase 13: Source & Blueprint)
 // ==========================================
 
 let cachedApps = [];
+let currentActiveAppId = null;
+let currentActiveAppTab = "overview";
 let currentLogAppId = null;
 let currentAppFilesId = null;
 let currentAppFilesPath = "";
 let currentAppFilesItems = [];
+let detectedBlueprint = null;
 
 async function loadApps() {
   const tbody = document.getElementById("apps-tbody");
@@ -1093,42 +1096,54 @@ async function loadApps() {
     }
 
     if (cachedApps.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="6" class="cell-muted" style="text-align:center; padding: 20px;">No applications created yet. Use the form above to create one.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" class="cell-muted" style="text-align:center; padding: 20px;">No applications created yet. Click "+ Deploy from GitHub" above to deploy your first application.</td></tr>`;
       return;
     }
 
     tbody.innerHTML = cachedApps.map(app => {
       const statusPill = renderStatusPill(app.status);
-      const hostPort = app.port || "-";
+      const hostPort = app.port || app.host_port || "-";
       const contPort = app.container_port || "-";
       const portDisplay = hostPort !== "-" ? `${hostPort}:${contPort}` : `${contPort}`;
       const nodeDisplay = app.selected_node || app.target || "auto";
       const failureNote = app.failure_reason ? `<div class="cell-muted mono" style="font-size: 10px; color: var(--status-red);">${escapeHtml(app.failure_reason)}</div>` : '';
 
+      const isGithub = app.source && app.source.type === "github";
+      const sourceBadge = isGithub
+        ? `<span class="source-badge" title="GitHub: ${escapeHtml(app.source.repository)}@${escapeHtml(app.source.branch || 'main')}">GitHub: ${escapeHtml(app.source.repository?.split('/')[1] || app.source.repository || 'repo')}</span>`
+        : `<span class="source-badge source-badge-manual">Manual</span>`;
+
+      const routePath = app.route?.path || (app.route ? app.route.path : "-");
+      const routeDisplay = routePath && routePath !== "-"
+        ? `<a href="${routePath}/" target="_blank" class="mono text-online" style="font-weight: 500;" title="Open application route">${escapeHtml(routePath)}/</a>`
+        : `<span class="cell-muted mono">—</span>`;
+
       const canDeploy = ["CREATED", "STOPPED", "FAILED"].includes(app.status);
+      const canRedeploy = isGithub && ["RUNNING", "FAILED", "STOPPED"].includes(app.status);
       const canStop = ["RUNNING"].includes(app.status);
       const canRestart = ["RUNNING", "STOPPED"].includes(app.status);
 
       return `
         <tr>
           <td>
-            <span class="mono" style="font-weight: 600;">${escapeHtml(app.name)}</span>
+            <a href="javascript:void(0)" onclick="openAppDetails('${app.app_id}')" class="mono" style="font-weight: 600;">${escapeHtml(app.name)}</a>
             <div class="cell-muted mono" style="font-size: 10px;">${escapeHtml(app.app_id)}</div>
           </td>
+          <td>${sourceBadge}</td>
           <td>
             ${statusPill}
             ${failureNote}
           </td>
+          <td>${routeDisplay}</td>
           <td class="mono">${escapeHtml(nodeDisplay)}</td>
-          <td class="mono cell-muted" title="${escapeHtml(app.image)}">${escapeHtml(app.image)}</td>
           <td class="mono">${portDisplay}</td>
           <td style="text-align: right;">
-            <div style="display: inline-flex; gap: 4px;">
-              ${canDeploy ? `<button class="btn btn-sm btn-primary" onclick="deployApp('${app.app_id}')">Deploy</button>` : ''}
+            <div style="display: inline-flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end;">
+              <button class="btn btn-sm" onclick="openAppDetails('${app.app_id}')">Details</button>
+              ${canRedeploy ? `<button class="btn btn-sm btn-primary" onclick="redeployApp('${app.app_id}')">Redeploy</button>` : ''}
+              ${(!canRedeploy && canDeploy) ? `<button class="btn btn-sm btn-primary" onclick="deployApp('${app.app_id}')">Deploy</button>` : ''}
               ${canStop ? `<button class="btn btn-sm" onclick="stopApp('${app.app_id}')">Stop</button>` : ''}
               ${canRestart ? `<button class="btn btn-sm" onclick="restartApp('${app.app_id}')">Restart</button>` : ''}
-              <button class="btn btn-sm" onclick="viewAppFiles('${app.app_id}')" title="Inspect application project files">Files</button>
-              <button class="btn btn-sm" onclick="viewAppLogs('${app.app_id}')">Logs</button>
               <button class="btn btn-sm btn-danger" onclick="deleteApp('${app.app_id}')">Delete</button>
             </div>
           </td>
@@ -1136,10 +1151,17 @@ async function loadApps() {
       `;
     }).join("");
 
+    if (currentActiveAppId) {
+      const currentApp = cachedApps.find(a => a.app_id === currentActiveAppId);
+      if (currentApp) {
+        renderAppDetailsTabs(currentApp);
+      }
+    }
+
     updateLastRefreshed();
   } catch (err) {
     console.error("Failed to load apps:", err);
-    tbody.innerHTML = `<tr><td colspan="6" class="text-offline">Error loading applications: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="text-offline">Error loading applications: ${err.message}</td></tr>`;
   }
 }
 
@@ -1152,18 +1174,212 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-// Create Application
+// -----------------------------------------------------------------------------
+// Deploy from GitHub Flow
+// -----------------------------------------------------------------------------
+
+window.showGithubDeploy = function() {
+  const ghContainer = document.getElementById("github-deploy-container");
+  const manualContainer = document.getElementById("manual-deploy-container");
+  if (manualContainer) manualContainer.style.display = "none";
+  if (ghContainer) {
+    ghContainer.style.display = "block";
+    ghContainer.scrollIntoView({ behavior: "smooth" });
+  }
+};
+
+window.hideGithubDeploy = function() {
+  const ghContainer = document.getElementById("github-deploy-container");
+  if (ghContainer) ghContainer.style.display = "none";
+};
+
+window.toggleManualDeploy = function() {
+  const manualContainer = document.getElementById("manual-deploy-container");
+  const ghContainer = document.getElementById("github-deploy-container");
+  if (ghContainer) ghContainer.style.display = "none";
+  if (manualContainer) {
+    manualContainer.style.display = manualContainer.style.display === "none" ? "block" : "none";
+    if (manualContainer.style.display === "block") {
+      manualContainer.scrollIntoView({ behavior: "smooth" });
+    }
+  }
+};
+
+document.getElementById("btn-show-github-deploy")?.addEventListener("click", showGithubDeploy);
+document.getElementById("btn-toggle-manual-deploy")?.addEventListener("click", toggleManualDeploy);
+
+// Inspect GitHub Repo & Detect Blueprint / Dockerfile
+document.getElementById("gh-inspect-btn")?.addEventListener("click", async () => {
+  const repoInput = document.getElementById("gh-repo");
+  const branchInput = document.getElementById("gh-branch");
+  const rootDirInput = document.getElementById("gh-root-dir");
+  const banner = document.getElementById("gh-detection-banner");
+  const appNameInput = document.getElementById("gh-app-name");
+  const routeInput = document.getElementById("gh-route");
+  const dockerfileInput = document.getElementById("gh-dockerfile");
+
+  const repo = repoInput.value.trim();
+  const branch = branchInput.value.trim() || "main";
+  const rootDir = rootDirInput.value.trim() || ".";
+
+  if (!repo || !repo.includes("/")) {
+    showCustomAlert({ title: "Invalid Repository", message: "Please specify repository in 'owner/repository' format.", isError: true });
+    return;
+  }
+
+  banner.style.display = "block";
+  banner.style.backgroundColor = "rgba(88, 166, 255, 0.1)";
+  banner.style.border = "1px solid rgba(88, 166, 255, 0.3)";
+  banner.style.color = "var(--text-main)";
+  banner.textContent = `Inspecting repository ${repo} on branch ${branch}...`;
+
+  try {
+    const res = await apiFetch("/api/apps/github/inspect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repository: repo, branch, root_directory: rootDir })
+    });
+
+    detectedBlueprint = res.blueprint;
+    const repoName = repo.split("/")[1].toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+
+    if (res.has_blueprint && res.blueprint) {
+      const svc = res.blueprint.services[0] || {};
+      appNameInput.value = svc.name || repoName;
+      routeInput.value = svc.route || `/${svc.name || repoName}`;
+      rootDirInput.value = svc.rootDir || rootDir;
+      dockerfileInput.value = svc.dockerfile || "Dockerfile";
+
+      banner.style.backgroundColor = "rgba(63, 185, 80, 0.12)";
+      banner.style.border = "1px solid rgba(63, 185, 80, 0.35)";
+      banner.style.color = "var(--status-green)";
+      banner.textContent = `✓ Detected PersonalServer Blueprint (personalserver.yaml) for '${svc.name}'. Pre-configured services and environment.`;
+
+      // Pre-fill environment variables from blueprint
+      const envList = document.getElementById("gh-env-list");
+      envList.innerHTML = "";
+      if (Array.isArray(svc.envVars)) {
+        svc.envVars.forEach(ev => {
+          const key = typeof ev === 'object' ? ev.key : ev;
+          addGithubEnvRow(key, "", true);
+        });
+      }
+    } else {
+      appNameInput.value = repoName;
+      routeInput.value = `/${repoName}`;
+      dockerfileInput.value = "Dockerfile";
+
+      banner.style.backgroundColor = "rgba(210, 153, 34, 0.12)";
+      banner.style.border = "1px solid rgba(210, 153, 34, 0.35)";
+      banner.style.color = "var(--status-yellow)";
+      banner.textContent = `✓ Detected Docker configuration (Dockerfile). Automatic Docker build will be configured.`;
+    }
+  } catch (err) {
+    banner.style.backgroundColor = "rgba(248, 81, 73, 0.12)";
+    banner.style.border = "1px solid rgba(248, 81, 73, 0.35)";
+    banner.style.color = "var(--status-red)";
+    banner.textContent = `Inspection notice: ${err.message}`;
+  }
+});
+
+function addGithubEnvRow(key = "", value = "", isSecret = true) {
+  const container = document.getElementById("gh-env-list");
+  if (!container) return;
+
+  const rowId = `gh-env-row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
+  const div = document.createElement("div");
+  div.id = rowId;
+  div.style.display = "flex";
+  div.style.gap = "8px";
+  div.style.alignItems = "center";
+
+  div.innerHTML = `
+    <input type="text" class="form-input mono gh-env-k" placeholder="KEY_NAME" value="${escapeHtml(key)}" style="flex: 1; min-width: 140px;" required pattern="^[a-zA-Z_][a-zA-Z0-9_]*$">
+    <input type="password" class="form-input mono gh-env-v" placeholder="Value..." value="${escapeHtml(value)}" style="flex: 2; min-width: 180px;">
+    <label class="modal-label mono" style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap;">
+      <input type="checkbox" class="gh-env-sec" ${isSecret ? 'checked' : ''}> Secret
+    </label>
+    <button type="button" class="btn btn-sm btn-danger" onclick="document.getElementById('${rowId}')?.remove()">✕</button>
+  `;
+  container.appendChild(div);
+}
+
+document.getElementById("gh-add-env-btn")?.addEventListener("click", () => addGithubEnvRow());
+
+// GitHub Source Deploy Form Submit
+document.getElementById("app-github-deploy-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const repo = document.getElementById("gh-repo").value.trim();
+  const branch = document.getElementById("gh-branch").value.trim() || "main";
+  const name = document.getElementById("gh-app-name").value.trim();
+  const rootDir = document.getElementById("gh-root-dir").value.trim() || ".";
+  const dockerfile = document.getElementById("gh-dockerfile").value.trim() || "Dockerfile";
+  const routePath = document.getElementById("gh-route").value.trim();
+
+  // Collect environment variables
+  const envVars = {};
+  const rows = document.querySelectorAll("#gh-env-list > div");
+  rows.forEach(r => {
+    const k = r.querySelector(".gh-env-k")?.value.trim();
+    const v = r.querySelector(".gh-env-v")?.value || "";
+    const isSec = r.querySelector(".gh-env-sec")?.checked ?? true;
+    if (k) {
+      envVars[k] = { value: v, is_secret: isSec };
+    }
+  });
+
+  const payload = {
+    name,
+    source: {
+      type: "github",
+      repository: repo,
+      branch,
+      root_directory: rootDir
+    },
+    route: {
+      enabled: true,
+      type: "path",
+      path: routePath,
+      strip_prefix: true,
+      public_access: true
+    },
+    env_vars: envVars,
+    blueprint: detectedBlueprint
+  };
+
+  try {
+    const createRes = await apiFetch("/api/apps", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    hideGithubDeploy();
+    loadApps();
+
+    // Trigger deployment immediately
+    if (createRes.app_id) {
+      deployApp(createRes.app_id);
+    }
+  } catch (err) {
+    showCustomAlert({ title: "Deployment Error", message: err.message, isError: true });
+  }
+});
+
+// Create Application (Manual)
 document.getElementById("app-create-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const nameInput = document.getElementById("app-name");
   const imageInput = document.getElementById("app-image");
   const portInput = document.getElementById("app-container-port");
+  const routeInput = document.getElementById("app-route-input");
   const targetSelect = document.getElementById("app-target");
 
   const name = nameInput.value.trim();
   const image = imageInput.value.trim();
   const containerPort = parseInt(portInput.value, 10);
   const target = targetSelect.value || "auto";
+  const routePath = routeInput?.value.trim() || `/${name.toLowerCase()}`;
 
   try {
     await apiFetch("/api/apps", {
@@ -1173,17 +1389,246 @@ document.getElementById("app-create-form")?.addEventListener("submit", async (e)
         name,
         image,
         container_port: containerPort,
-        target
+        target,
+        source: { type: "manual" },
+        route: {
+          enabled: true,
+          type: "path",
+          path: routePath,
+          strip_prefix: true,
+          public_access: true
+        }
       })
     });
     nameInput.value = "";
     imageInput.value = "";
     portInput.value = "8000";
+    if (routeInput) routeInput.value = "";
+    toggleManualDeploy();
     loadApps();
   } catch (err) {
     showCustomAlert({ title: "Create Application Failed", message: err.message, isError: true });
   }
 });
+
+// -----------------------------------------------------------------------------
+// Multi-Tab Application Details Management Drawer
+// -----------------------------------------------------------------------------
+
+window.openAppDetails = function(appId, tab = "overview") {
+  currentActiveAppId = appId;
+  currentActiveAppTab = tab;
+
+  const panel = document.getElementById("app-details-panel");
+  const app = cachedApps.find(a => a.app_id === appId);
+  if (!app) return;
+
+  const titleEl = document.getElementById("app-panel-title");
+  const statusPill = document.getElementById("app-panel-status-pill");
+  const redeployBtn = document.getElementById("app-panel-redeploy-btn");
+
+  if (titleEl) titleEl.textContent = `Application: ${app.name} (${app.app_id})`;
+  if (statusPill) statusPill.innerHTML = renderStatusPill(app.status);
+
+  if (redeployBtn) {
+    const isGithub = app.source && app.source.type === "github";
+    redeployBtn.style.display = isGithub ? "inline-flex" : "none";
+    redeployBtn.onclick = () => redeployApp(appId);
+  }
+
+  panel.style.display = "block";
+  switchAppTab(tab);
+  panel.scrollIntoView({ behavior: "smooth" });
+};
+
+window.closeAppDetails = function() {
+  currentActiveAppId = null;
+  const panel = document.getElementById("app-details-panel");
+  if (panel) panel.style.display = "none";
+};
+
+window.switchAppTab = function(tabName) {
+  currentActiveAppTab = tabName;
+
+  document.querySelectorAll(".app-tabs-header .tab-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.getAttribute("data-tab") === tabName);
+  });
+
+  document.querySelectorAll("#app-details-panel .tab-pane").forEach(pane => {
+    pane.classList.toggle("active", pane.id === `app-tab-${tabName}`);
+  });
+
+  if (!currentActiveAppId) return;
+  const app = cachedApps.find(a => a.app_id === currentActiveAppId);
+  if (!app) return;
+
+  if (tabName === "overview") renderAppOverview(app);
+  else if (tabName === "deployments") renderAppDeployments(app);
+  else if (tabName === "logs") viewAppLogs(app.app_id);
+  else if (tabName === "files") viewAppFiles(app.app_id, "");
+  else if (tabName === "env") renderAppEnv(app);
+};
+
+function renderAppDetailsTabs(app) {
+  if (currentActiveAppTab === "overview") renderAppOverview(app);
+  else if (currentActiveAppTab === "deployments") renderAppDeployments(app);
+  else if (currentActiveAppTab === "env") renderAppEnv(app);
+}
+
+function renderAppOverview(app) {
+  const container = document.getElementById("app-overview-kv");
+  if (!container) return;
+
+  const isGithub = app.source && app.source.type === "github";
+  const sourceStr = isGithub 
+    ? `GitHub: ${escapeHtml(app.source.repository)} (branch: ${escapeHtml(app.source.branch || 'main')}, dir: ${escapeHtml(app.source.root_directory || '.')})`
+    : `Manual Docker Image (${escapeHtml(app.image)})`;
+
+  const routePath = app.route?.path || "-";
+  const publicUrl = routePath !== "-" ? `https://akshatsahay.space${routePath}/` : "-";
+
+  container.innerHTML = `
+    <div class="sys-kv-row"><span class="sys-kv-k">Application ID</span><span class="sys-kv-v">${escapeHtml(app.app_id)}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Name</span><span class="sys-kv-v">${escapeHtml(app.name)}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Source</span><span class="sys-kv-v">${sourceStr}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Status</span><span class="sys-kv-v">${renderStatusPill(app.status)}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Assigned Node</span><span class="sys-kv-v">${escapeHtml(app.selected_node || 'Pending scheduler')}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Host / Container Port</span><span class="sys-kv-v">${app.host_port || app.port || '-'}:${app.container_port || 8000}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Public Route</span><span class="sys-kv-v">${routePath !== '-' ? `<a href="${publicUrl}" target="_blank" class="text-online">${publicUrl}</a>` : 'Disabled'}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Container ID</span><span class="sys-kv-v">${escapeHtml(app.container_id || f"ps-{app.name}")}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Resource Limits</span><span class="sys-kv-v">${escapeHtml(app.cpu_limit || '0.5')} CPU · ${escapeHtml(app.memory_limit || '256m')} RAM</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Created At</span><span class="sys-kv-v cell-muted">${escapeHtml(app.created_at || '-')}</span></div>
+  `;
+}
+
+function renderAppDeployments(app) {
+  const tbody = document.getElementById("app-deployments-tbody");
+  if (!tbody) return;
+
+  const deps = app.deployments || [];
+  if (deps.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" class="cell-muted" style="text-align: center; padding: 20px;">No deployment history recorded for this application.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = deps.slice().reverse().map(d => {
+    const statusPill = renderStatusPill(d.status);
+    const durStr = d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "-";
+    return `
+      <tr>
+        <td class="mono" style="font-weight: 600;">#${d.number || 1}</td>
+        <td class="mono cell-muted">${escapeHtml(d.commit || 'latest')}</td>
+        <td class="mono">${escapeHtml(d.branch || 'main')}</td>
+        <td class="mono cell-muted">${escapeHtml(d.trigger || 'manual')}</td>
+        <td>${statusPill}</td>
+        <td class="mono">${durStr}</td>
+        <td class="cell-muted">${escapeHtml(d.started_at || '-')}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function renderAppEnv(app) {
+  const tbody = document.getElementById("app-env-tbody");
+  if (!tbody) return;
+
+  const envVars = app.env_vars || {};
+  const keys = Object.keys(envVars);
+
+  if (keys.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="3" class="cell-muted" style="text-align: center; padding: 20px;">No environment variables configured.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = keys.map(k => {
+    const item = envVars[k];
+    const isSecret = typeof item === 'object' ? Boolean(item.is_secret) : false;
+    const valDisplay = typeof item === 'object' ? item.value : String(item);
+    const escapedKey = k.replace(/'/g, "\\'");
+
+    return `
+      <tr id="env-row-${k}">
+        <td class="mono" style="font-weight: 600;">${escapeHtml(k)}</td>
+        <td class="mono">
+          <span id="env-val-${k}" class="cell-muted">${escapeHtml(valDisplay)}</span>
+          ${isSecret ? '<span class="source-badge source-badge-manual" style="margin-left: 6px; font-size: 9px;">SECRET</span>' : ''}
+        </td>
+        <td style="text-align: right;">
+          <div style="display: inline-flex; gap: 4px;">
+            ${isSecret ? `<button class="btn btn-sm" onclick="revealAppEnv('${app.app_id}', '${escapedKey}')" title="Reveal secret value">Reveal</button>` : ''}
+            <button class="btn btn-sm btn-danger" onclick="deleteAppEnv('${app.app_id}', '${escapedKey}')" title="Delete variable">Delete</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+// Add Environment Variable
+document.getElementById("app-env-add-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!currentActiveAppId) return;
+
+  const keyInput = document.getElementById("env-new-key");
+  const valInput = document.getElementById("env-new-value");
+  const secInput = document.getElementById("env-new-is-secret");
+
+  const key = keyInput.value.trim();
+  const value = valInput.value;
+  const is_secret = secInput.checked;
+
+  try {
+    await apiFetch(`/api/apps/${currentActiveAppId}/env`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, value, is_secret })
+    });
+    keyInput.value = "";
+    valInput.value = "";
+    secInput.checked = true;
+    loadApps();
+  } catch (err) {
+    showCustomAlert({ title: "Failed to Save Variable", message: err.message, isError: true });
+  }
+});
+
+window.revealAppEnv = async function(appId, key) {
+  try {
+    const res = await apiFetch(`/api/apps/${appId}/env/reveal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key })
+    });
+    const valEl = document.getElementById(`env-val-${key}`);
+    if (valEl) {
+      valEl.textContent = res.value;
+      valEl.className = "mono text-online";
+    }
+  } catch (err) {
+    showCustomAlert({ title: "Reveal Error", message: err.message, isError: true });
+  }
+};
+
+window.deleteAppEnv = async function(appId, key) {
+  const confirmed = await showCustomConfirm({
+    title: "Delete Variable",
+    message: `Remove environment variable "${key}" from this application?`,
+    confirmText: "Delete",
+    isDanger: true
+  });
+  if (!confirmed) return;
+
+  try {
+    await apiFetch(`/api/apps/${appId}/env/${encodeURIComponent(key)}`, { method: "DELETE" });
+    loadApps();
+  } catch (err) {
+    showCustomAlert({ title: "Delete Error", message: err.message, isError: true });
+  }
+};
+
+// -----------------------------------------------------------------------------
+// Lifecycle Deployment Actions
+// -----------------------------------------------------------------------------
 
 window.deployApp = async function(appId) {
   try {
@@ -1194,6 +1639,19 @@ window.deployApp = async function(appId) {
     loadApps();
   } catch (err) {
     showCustomAlert({ title: "Deploy Error", message: err.message, isError: true });
+    loadApps();
+  }
+};
+
+window.redeployApp = async function(appId) {
+  try {
+    const res = await apiFetch(`/api/apps/${appId}/redeploy`, { method: "POST" });
+    if (res.app && res.app.status === "FAILED") {
+      showCustomAlert({ title: "Redeploy Rejected", message: res.app.failure_reason, isError: true });
+    }
+    loadApps();
+  } catch (err) {
+    showCustomAlert({ title: "Redeploy Error", message: err.message, isError: true });
     loadApps();
   }
 };
@@ -1223,7 +1681,7 @@ window.deleteApp = async function(appId) {
   const name = app ? app.name : appId;
   const confirmed = await showCustomConfirm({
     title: "Delete Application",
-    message: `Permanently delete application "${name}" (${appId})?\n\nThis will remove the container and release host port ${app?.port || ''}.`,
+    message: `Permanently delete application "${name}" (${appId})?\n\nThis will remove the container and release host port ${app?.port || app?.host_port || ''}.`,
     confirmText: "Delete",
     isDanger: true
   });
@@ -1231,6 +1689,7 @@ window.deleteApp = async function(appId) {
 
   try {
     await apiFetch(`/api/apps/${appId}`, { method: "DELETE" });
+    if (currentActiveAppId === appId) closeAppDetails();
     if (currentLogAppId === appId) closeAppLogs();
     if (currentAppFilesId === appId) closeAppFiles();
     loadApps();
@@ -1242,34 +1701,24 @@ window.deleteApp = async function(appId) {
 
 window.viewAppLogs = async function(appId) {
   currentLogAppId = appId;
-  const panel = document.getElementById("app-logs-panel");
-  const title = document.getElementById("app-logs-title");
   const stdout = document.getElementById("app-logs-stdout");
-
-  const app = cachedApps.find(a => a.app_id === appId);
-  const appName = app ? app.name : appId;
-
-  title.textContent = `Application Logs: ${appName} (${appId})`;
-  stdout.textContent = "Loading logs...";
-  panel.style.display = "block";
-  panel.scrollIntoView({ behavior: "smooth" });
+  if (stdout) stdout.textContent = "Loading logs...";
 
   try {
     const res = await apiFetch(`/api/apps/${appId}/logs`);
-    stdout.textContent = res.logs || "(No log output recorded)";
+    if (stdout) stdout.textContent = res.logs || "(No log output recorded)";
   } catch (err) {
-    stdout.textContent = `Error fetching logs: ${err.message}`;
+    if (stdout) stdout.textContent = `Error fetching logs: ${err.message}`;
   }
 };
 
 document.getElementById("app-logs-refresh-btn")?.addEventListener("click", () => {
-  if (currentLogAppId) viewAppLogs(currentLogAppId);
+  if (currentActiveAppId) viewAppLogs(currentActiveAppId);
+  else if (currentLogAppId) viewAppLogs(currentLogAppId);
 });
 
 window.closeAppLogs = function() {
   currentLogAppId = null;
-  const panel = document.getElementById("app-logs-panel");
-  if (panel) panel.style.display = "none";
 };
 
 // ==========================================
@@ -1280,7 +1729,6 @@ window.viewAppFiles = async function(appId, path = "") {
   currentAppFilesId = appId;
   currentAppFilesPath = path;
 
-  const panel = document.getElementById("app-files-panel");
   const tbody = document.getElementById("app-files-tbody");
   const rootCrumb = document.getElementById("app-files-root-crumb");
   const upBtn = document.getElementById("app-files-up-btn");
@@ -1305,9 +1753,7 @@ window.viewAppFiles = async function(appId, path = "") {
 
   renderAppFilesBreadcrumbs(appName, path);
 
-  panel.style.display = "block";
-  panel.scrollIntoView({ behavior: "smooth" });
-  tbody.innerHTML = `<tr><td colspan="4" class="cell-muted" style="text-align: center; padding: 24px;">Loading project files...</td></tr>`;
+  if (tbody) tbody.innerHTML = `<tr><td colspan="4" class="cell-muted" style="text-align: center; padding: 24px;">Loading project files...</td></tr>`;
 
   try {
     const res = await apiFetch(`/api/apps/${appId}/files?path=${encodeURIComponent(path)}`);
@@ -1321,7 +1767,7 @@ window.viewAppFiles = async function(appId, path = "") {
       leftStats.textContent = `${filesCount} file${filesCount === 1 ? '' : 's'} · ${foldersCount} folder${foldersCount === 1 ? '' : 's'}`;
     }
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="4" class="text-offline" style="text-align: center; padding: 20px;">Unable to load files: ${err.message}</td></tr>`;
+    if (tbody) tbody.innerHTML = `<tr><td colspan="4" class="text-offline" style="text-align: center; padding: 20px;">Unable to load files: ${err.message}</td></tr>`;
   }
 };
 
@@ -1393,8 +1839,6 @@ function renderAppFilesTable() {
 
 window.closeAppFiles = function() {
   currentAppFilesId = null;
-  const panel = document.getElementById("app-files-panel");
-  if (panel) panel.style.display = "none";
 };
 
 window.handleAppCreateFolder = async function() {
