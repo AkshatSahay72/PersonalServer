@@ -6,9 +6,6 @@ Cluster controller for multi-node inventory, authenticated registration,
 heartbeat liveness monitoring, node removal, resource-aware workload scheduling,
 persistent job lifecycle, lease-based failure detection, and automatic recovery.
 """
-import re
-import shutil
-import urllib.request
 import sys
 import os
 import json
@@ -20,11 +17,12 @@ import hmac
 import shutil
 import threading
 import re
+import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib import request
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
@@ -533,6 +531,12 @@ def fetch_github_source(app_id, repository, branch="main", root_directory="."):
                         dest_path = (target_source_dir / rel_path).resolve()
                         dest_path.relative_to(target_source_dir)
                         tar.extract(member, path=target_source_dir)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise RuntimeError(f"Repository '{repository}' or branch '{branch}' not found on GitHub (404).")
+            raise RuntimeError(f"GitHub returned HTTP {e.code}: {e.reason}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Failed to connect to GitHub: {e.reason}")
         except Exception as e:
             raise RuntimeError(f"Failed to fetch GitHub repository '{repository}' on branch '{branch}': {e}")
 
@@ -548,29 +552,33 @@ def fetch_github_source(app_id, repository, branch="main", root_directory="."):
     if not bp_file.exists():
         bp_file = resolved_root / "personalserver.yml"
 
-    if bp_file.exists():
+    is_blueprint_file = bp_file.exists()
+    dockerfile_file = resolved_root / "Dockerfile"
+    dockerfile_found = dockerfile_file.exists()
+
+    if is_blueprint_file:
         try:
             blueprint = parse_and_validate_blueprint(bp_file.read_text(encoding="utf-8"))
         except Exception as e:
             raise ValueError(f"Invalid blueprint file {bp_file.name}: {e}")
+    elif dockerfile_found:
+        app_name = repository.split("/")[-1].lower().replace(".", "-")
+        blueprint = {
+            "version": "1.0",
+            "services": [
+                {
+                    "type": "web",
+                    "name": app_name,
+                    "runtime": "docker",
+                    "rootDir": root_directory or ".",
+                    "dockerfile": "Dockerfile",
+                    "route": f"/{app_name}",
+                    "envVars": []
+                }
+            ]
+        }
     else:
-        dockerfile_file = resolved_root / "Dockerfile"
-        if dockerfile_file.exists():
-            app_name = repository.split("/")[-1].lower().replace(".", "-")
-            blueprint = {
-                "version": "1.0",
-                "services": [
-                    {
-                        "type": "web",
-                        "name": app_name,
-                        "runtime": "docker",
-                        "rootDir": root_directory or ".",
-                        "dockerfile": "Dockerfile",
-                        "route": f"/{app_name}",
-                        "envVars": []
-                    }
-                ]
-            }
+        raise ValueError("No 'personalserver.yaml' blueprint or 'Dockerfile' found in repository.")
 
     return {
         "status": "fetched",
@@ -579,7 +587,9 @@ def fetch_github_source(app_id, repository, branch="main", root_directory="."):
         "root_directory": root_directory,
         "commit": commit_sha[:8],
         "source_dir": str(target_source_dir),
-        "blueprint": blueprint
+        "blueprint": blueprint,
+        "has_blueprint": is_blueprint_file,
+        "dockerfile_found": dockerfile_found
     }
 
 
@@ -2022,6 +2032,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 if temp_dir.exists():
                     shutil.rmtree(temp_dir, ignore_errors=True)
                 bp = res.get("blueprint")
+                has_bp = res.get("has_blueprint", False)
                 self.send_json(200, {
                     "status": "ok",
                     "repository": repo,
@@ -2029,7 +2040,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     "root_directory": root_dir,
                     "commit": res.get("commit", "main"),
                     "blueprint": bp,
-                    "has_blueprint": bp is not None,
+                    "has_blueprint": has_bp,
+                    "dockerfile_found": res.get("dockerfile_found", False),
                     "env_vars_needed": bp.get("services", [{}])[0].get("envVars", []) if bp else []
                 })
             except Exception as e:
