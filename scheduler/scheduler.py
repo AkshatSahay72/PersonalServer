@@ -22,6 +22,31 @@ STATE_UNKNOWN = "UNKNOWN"
 
 DEFAULT_HEARTBEAT_TIMEOUT = 60  # seconds
 
+ARCH_MAP = {
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "arm64v8": "arm64",
+    "linux/arm64": "arm64",
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "x64": "amd64",
+    "linux/amd64": "amd64",
+    "armv7": "armv7",
+    "armv7l": "armv7",
+    "armhf": "armv7",
+    "i386": "386",
+    "x86": "386",
+    "386": "386"
+}
+
+
+def normalize_architecture(arch):
+    """Normalize node or image architecture string to canonical form."""
+    if not arch or not isinstance(arch, str):
+        return ""
+    clean = arch.strip().lower()
+    return ARCH_MAP.get(clean, clean.split("/")[-1])
+
 
 def parse_memory_mb(mem_str):
     """
@@ -281,8 +306,15 @@ class ResourceScheduler:
                 "rejected": {...}
             }
         """
+        # Support flexible parameter ordering if caller passed nodes_db first
+        if isinstance(job_requirements, dict) and "nodes" in job_requirements and (nodes_db is None or not isinstance(nodes_db, dict) or "nodes" not in nodes_db):
+            job_requirements, nodes_db = nodes_db, job_requirements
+
         reqs = job_requirements or {}
         nodes = (nodes_db or {}).get("nodes", {})
+        if not nodes and isinstance(nodes_db, dict) and any(isinstance(v, dict) and ("status" in v or "capabilities" in v) for v in nodes_db.values()):
+            # nodes_db was passed directly as dict of node_id -> node
+            nodes = nodes_db
 
         if not nodes:
             return {
@@ -338,18 +370,46 @@ class ResourceScheduler:
             if isinstance(req_caps, str):
                 req_caps = [req_caps]
             node_caps = node.get("capabilities", {})
-            missing_caps = [c for c in req_caps if not node_caps.get(c, False)]
+            if isinstance(node_caps, list):
+                node_caps_set = set(node_caps)
+                has_cap = lambda c: c in node_caps_set
+            elif isinstance(node_caps, dict):
+                has_cap = lambda c: bool(node_caps.get(c, False))
+            else:
+                has_cap = lambda c: False
+
+            missing_caps = [c for c in req_caps if not has_cap(c)]
             if missing_caps:
                 rejected[node_id] = f"Missing required capabilities: {missing_caps}"
                 continue
 
+            # Support any_capabilities (e.g. ['container_runtime:docker', 'container_runtime:udocker'])
+            req_any_caps = reqs.get("any_capabilities")
+            if req_any_caps and isinstance(req_any_caps, list):
+                if not any(has_cap(c) for c in req_any_caps):
+                    rejected[node_id] = f"Missing any of required capabilities: {req_any_caps}"
+                    continue
+
             # ------------------------------------------------------------------
             # 4. Architecture & Platform Filtering
             # ------------------------------------------------------------------
+            node_raw_arch = node.get("architecture") or node.get("system", {}).get("arch") or node.get("system", {}).get("architecture", "")
             req_arch = reqs.get("architecture")
-            if req_arch and node.get("architecture", "").lower() != req_arch.lower():
-                rejected[node_id] = f"Architecture mismatch: node is '{node.get('architecture')}', required '{req_arch}'"
-                continue
+            if req_arch:
+                norm_req = normalize_architecture(req_arch)
+                norm_node = normalize_architecture(node_raw_arch)
+                if norm_req and norm_node and norm_req != norm_node:
+                    rejected[node_id] = f"Architecture mismatch: node is '{node_raw_arch}', required '{req_arch}'"
+                    continue
+
+            # Image multi-architecture support check
+            supp_archs = reqs.get("supported_architectures")
+            if supp_archs and isinstance(supp_archs, list):
+                norm_supp = {normalize_architecture(a) for a in supp_archs if a}
+                norm_node = normalize_architecture(node_raw_arch)
+                if norm_node and norm_supp and norm_node not in norm_supp:
+                    rejected[node_id] = "Image does not support this node architecture."
+                    continue
 
             req_platform = reqs.get("platform")
             if req_platform and node.get("platform", "").lower() != req_platform.lower():

@@ -56,6 +56,41 @@ def is_docker_daemon_ready():
         return False
 
 
+def is_udocker_ready():
+    try:
+        res = subprocess.run(["udocker", "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def detect_container_runtime(preferred="auto"):
+    """Detects available container runtime on current node: 'docker', 'udocker', or None."""
+    if preferred == "docker" and is_docker_daemon_ready():
+        return "docker"
+    if preferred == "udocker" and is_udocker_ready():
+        return "udocker"
+    if is_docker_daemon_ready():
+        return "docker"
+    if is_udocker_ready():
+        return "udocker"
+    return None
+
+
+def is_image_cached(image: str, runtime: str = "docker") -> bool:
+    """Checks if container image exists locally on current node."""
+    try:
+        if runtime == "docker":
+            res = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            return res.returncode == 0
+        elif runtime == "udocker":
+            res = subprocess.run(["udocker", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            return res.returncode == 0
+    except Exception:
+        pass
+    return False
+
+
 def validate_docker_identifier(val, name="Identifier"):
     if not val or not isinstance(val, str):
         raise ValueError(f"Invalid {name}: Value must be a non-empty string.")
@@ -82,6 +117,14 @@ class JobExecutor:
     @staticmethod
     def is_allowed(job_type):
         return job_type in ALLOWLISTED_WORKLOADS
+
+    @staticmethod
+    def detect_container_runtime(preferred="auto"):
+        return detect_container_runtime(preferred)
+
+    @staticmethod
+    def is_image_cached(image: str, runtime: str = "docker") -> bool:
+        return is_image_cached(image, runtime)
 
     @staticmethod
     def execute(job):
@@ -200,17 +243,22 @@ class JobExecutor:
                 if not (1 <= host_port <= 65535) or not (1 <= container_port <= 65535):
                     raise ValueError(f"Invalid port configuration: host_port={host_port}, container_port={container_port}")
 
-                if not is_docker_daemon_ready():
+                runtime = detect_container_runtime()
+                if not runtime:
                     return {
                         "job_id": job_id,
                         "status": JOB_STATE_FAILED,
                         "exit_code": 1,
                         "stdout": "",
-                        "stderr": "Docker runtime error: Docker daemon is unavailable or not responding on this node.",
+                        "stderr": "Container runtime error: Neither Docker daemon nor udocker is available on this node.",
                         "duration_ms": 0,
                         "started_at": started_iso,
                         "finished_at": started_iso
                     }
+
+                t_stage_start = time.time()
+                pull_ms = 0
+                image_cached = False
 
                 if job_type == "docker-build-deploy" or source_dir:
                     src_path = Path(source_dir).resolve()
@@ -252,50 +300,85 @@ class JobExecutor:
                     image = build_tag
                 else:
                     image = validate_docker_identifier(image or "python:3.11-slim", "Docker Image")
-                    # Check if image exists locally first, otherwise pull image
-                    image_inspect = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    if image_inspect.returncode != 0:
-                        pull_res = subprocess.run(["docker", "pull", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
-                        if pull_res.returncode != 0:
-                            return {
-                                "job_id": job_id,
-                                "status": JOB_STATE_FAILED,
-                                "exit_code": pull_res.returncode,
-                                "stdout": truncate_output(pull_res.stdout),
-                                "stderr": f"Failed to pull image '{image}': {pull_res.stderr.strip()}",
-                                "duration_ms": int((time.time() - start_time) * 1000),
-                                "started_at": started_iso,
-                                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                            }
+                    # Image Caching: Check if image exists locally first
+                    if runtime == "docker":
+                        image_inspect = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        if image_inspect.returncode == 0:
+                            image_cached = True
+                            pull_ms = 0
+                        else:
+                            t_pull0 = time.time()
+                            pull_res = subprocess.run(["docker", "pull", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
+                            pull_ms = int((time.time() - t_pull0) * 1000)
+                            if pull_res.returncode != 0:
+                                return {
+                                    "job_id": job_id,
+                                    "status": JOB_STATE_FAILED,
+                                    "exit_code": pull_res.returncode,
+                                    "stdout": truncate_output(pull_res.stdout),
+                                    "stderr": f"Failed to pull image '{image}': {pull_res.stderr.strip()}",
+                                    "duration_ms": int((time.time() - start_time) * 1000),
+                                    "started_at": started_iso,
+                                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                }
+                    elif runtime == "udocker":
+                        inspect_res = subprocess.run(["udocker", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        if inspect_res.returncode == 0:
+                            image_cached = True
+                            pull_ms = 0
+                        else:
+                            t_pull0 = time.time()
+                            pull_res = subprocess.run(["udocker", "pull", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
+                            pull_ms = int((time.time() - t_pull0) * 1000)
+                            if pull_res.returncode != 0:
+                                return {
+                                    "job_id": job_id,
+                                    "status": JOB_STATE_FAILED,
+                                    "exit_code": pull_res.returncode,
+                                    "stdout": truncate_output(pull_res.stdout),
+                                    "stderr": f"Failed to pull image '{image}' with udocker: {pull_res.stderr.strip()}",
+                                    "duration_ms": int((time.time() - start_time) * 1000),
+                                    "started_at": started_iso,
+                                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                }
 
                 # Clean up existing container with same name if any
-                subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if runtime == "docker":
+                    subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    run_args = [
+                        "docker", "run", "-d",
+                        "--name", container_name,
+                        "-p", f"127.0.0.1:{host_port}:{container_port}",
+                        "--restart", "unless-stopped"
+                    ]
+                    mem_limit = params.get("memory_limit", "256m")
+                    if mem_limit:
+                        run_args.extend(["--memory", str(mem_limit)])
+                    cpu_limit = params.get("cpu_limit", "0.5")
+                    if cpu_limit:
+                        run_args.extend(["--cpus", str(cpu_limit)])
+                    env_vars = params.get("env", {})
+                    if isinstance(env_vars, dict):
+                        for k, v in env_vars.items():
+                            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(k)):
+                                run_args.extend(["-e", f"{k}={v}"])
+                    run_args.append(image)
+                    cmd = run_args
 
-                # Construct safe run arguments (no shell=True, no host root mounts)
-                run_args = [
-                    "docker", "run", "-d",
-                    "--name", container_name,
-                    "-p", f"127.0.0.1:{host_port}:{container_port}",
-                    "--restart", "unless-stopped"
-                ]
-
-                # Conservative resource limits where specified
-                mem_limit = params.get("memory_limit", "256m")
-                if mem_limit:
-                    run_args.extend(["--memory", str(mem_limit)])
-                cpu_limit = params.get("cpu_limit", "0.5")
-                if cpu_limit:
-                    run_args.extend(["--cpus", str(cpu_limit)])
-
-                # Environment variables: Passed safely as discrete command arguments
-                env_vars = params.get("env", {})
-                if isinstance(env_vars, dict):
-                    for k, v in env_vars.items():
-                        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(k)):
-                            run_args.extend(["-e", f"{k}={v}"])
-
-                run_args.append(image)
-                cmd = run_args
+                elif runtime == "udocker":
+                    subprocess.run(["udocker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["udocker", "create", f"--name={container_name}", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                    run_args = [
+                        "udocker", "run", "--nobanner",
+                        f"--publish={host_port}:{container_port}"
+                    ]
+                    env_vars = params.get("env", {})
+                    if isinstance(env_vars, dict):
+                        for k, v in env_vars.items():
+                            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(k)):
+                                run_args.extend(["-e", f"{k}={v}"])
+                    run_args.append(container_name)
+                    cmd = run_args
 
             except Exception as e:
                 return {
@@ -323,18 +406,19 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            if not is_docker_daemon_ready():
+            runtime = detect_container_runtime()
+            if not runtime:
                 return {
                     "job_id": job_id,
                     "status": JOB_STATE_FAILED,
                     "exit_code": 1,
                     "stdout": "",
-                    "stderr": "Docker daemon is unavailable on this node.",
+                    "stderr": "No container runtime is available on this node.",
                     "duration_ms": 0,
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["docker", "stop", container_name]
+            cmd = ["docker" if runtime == "docker" else "udocker", "stop" if runtime == "docker" else "rm", container_name]
 
         elif job_type == "docker-restart":
             try:
@@ -350,18 +434,19 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            if not is_docker_daemon_ready():
+            runtime = detect_container_runtime()
+            if not runtime:
                 return {
                     "job_id": job_id,
                     "status": JOB_STATE_FAILED,
                     "exit_code": 1,
                     "stdout": "",
-                    "stderr": "Docker daemon is unavailable on this node.",
+                    "stderr": "No container runtime is available on this node.",
                     "duration_ms": 0,
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["docker", "restart", container_name]
+            cmd = ["docker" if runtime == "docker" else "udocker", "restart" if runtime == "docker" else "run", container_name]
 
         elif job_type == "docker-remove":
             try:
@@ -377,18 +462,19 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            if not is_docker_daemon_ready():
+            runtime = detect_container_runtime()
+            if not runtime:
                 return {
                     "job_id": job_id,
                     "status": JOB_STATE_FAILED,
                     "exit_code": 1,
                     "stdout": "",
-                    "stderr": "Docker daemon is unavailable on this node.",
+                    "stderr": "No container runtime is available on this node.",
                     "duration_ms": 0,
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["docker", "rm", "-f", container_name]
+            cmd = ["docker" if runtime == "docker" else "udocker", "rm", "-f", container_name]
 
         elif job_type == "docker-logs":
             try:
@@ -404,18 +490,19 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            if not is_docker_daemon_ready():
+            runtime = detect_container_runtime()
+            if not runtime:
                 return {
                     "job_id": job_id,
                     "status": JOB_STATE_FAILED,
                     "exit_code": 1,
                     "stdout": "",
-                    "stderr": "Docker daemon is unavailable on this node.",
+                    "stderr": "No container runtime is available on this node.",
                     "duration_ms": 0,
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["docker", "logs", "--tail", "100", container_name]
+            cmd = ["docker", "logs", "--tail", "100", container_name] if runtime == "docker" else ["udocker", "ps"]
 
         # Execute process with strict timeout and output capture
         status = JOB_STATE_RUNNING
@@ -475,6 +562,8 @@ class JobExecutor:
             "started_at": started_iso,
             "finished_at": finished_iso
         }
+        if "timings" in locals() and timings:
+            result["timings"] = timings
 
         # Save result to node-local runtime storage
         try:

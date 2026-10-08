@@ -437,6 +437,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         headers = {
             "User-Agent": "PersonalServer-WebGateway/1.0"
         }
+        content_type = self.headers.get("Content-Type")
+        if content_type:
+            headers["Content-Type"] = content_type
+        if body_bytes is not None:
+            headers["Content-Length"] = str(len(body_bytes))
+
         auth_hdr = self.headers.get("Authorization") or self.headers.get("X-Auth-Token")
         if not auth_hdr:
             auth_token = get_controller_auth_token()
@@ -445,9 +451,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         if auth_hdr:
             headers["Authorization"] = auth_hdr if auth_hdr.startswith("Bearer ") else f"Bearer {auth_hdr}"
 
+        timeout_sec = 35 if ("/apps" in subpath or "/jobs" in subpath) else 10
         req = urllib.request.Request(target_url, data=body_bytes, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as response:
                 resp_data = response.read()
                 self.send_response(response.status)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
@@ -1145,6 +1152,11 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         content_len = int(self.headers.get("Content-Length", 0))
         body_bytes = self.rfile.read(content_len) if content_len > 0 else None
         self.proxy_to_router("PATCH", self.path, body_bytes=body_bytes)
+
+    def do_OPTIONS(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+        self.proxy_to_router("OPTIONS", self.path, body_bytes=body_bytes)
 
     def do_HEAD(self):
         parsed = urllib.parse.urlparse(self.path)

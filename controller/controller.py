@@ -30,6 +30,18 @@ sys.path.insert(0, str(BASE_DIR))
 # Import ResourceScheduler
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness, extract_node_telemetry
 from config.platform_config import get_platform_config
+from controller.image_inspector import (
+    validate_image_reference,
+    detect_image_architectures,
+    detect_application_port,
+    is_architecture_compatible,
+    normalize_architecture
+)
+from controller.env_manager import (
+    parse_env_file_content,
+    sanitize_env_vars_input,
+    is_secret_variable
+)
 
 CONFIG_DIR = BASE_DIR / "config"
 SECRETS_DIR = CONFIG_DIR / "secrets"
@@ -1737,6 +1749,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if current_st not in (STATE_DRAINING, STATE_DEBOARDING):
                 node_entry["status"] = STATE_ONLINE
             node_entry["last_seen"] = now
+            if self.client_address and self.client_address[0] not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                node_entry["ip"] = self.client_address[0]
             node_entry["last_heartbeat"] = {
                 "timestamp": body.get("timestamp", now),
                 "services": body.get("services", {}),
@@ -1988,6 +2002,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                             last_dep["status"] = "SUCCESS" if job_status == JOB_STATE_SUCCEEDED else "FAILED"
                             last_dep["finished_at"] = now_iso
                             last_dep["duration_ms"] = body.get("duration_ms", 0)
+                            if body.get("timings"):
+                                last_dep.setdefault("stage_timings", {}).update(body["timings"])
+                                last_dep["stage_timings"]["total_ms"] = body.get("duration_ms", 0) + last_dep["stage_timings"].get("scheduling_ms", 0)
 
                     elif job.get("type") == "docker-stop" and job_status == JOB_STATE_SUCCEEDED:
                         app["status"] = APP_STATE_STOPPED
@@ -2130,16 +2147,36 @@ class ControllerHandler(BaseHTTPRequestHandler):
                         "root_directory": root_dir
                     }
                 else:
-                    source = {"type": "manual"}
-                    if not image or not re.match(r'^[a-zA-Z0-9_./:-]+$', image):
-                        self.send_json(400, {"error": "Invalid Docker image reference."})
+                    # Container Image Deployment
+                    raw_img = (image or source.get("image") or "").strip()
+                    if not raw_img:
+                        self.send_json(400, {"error": "Missing container image reference."})
                         return
+                    try:
+                        parsed_img = validate_image_reference(raw_img)
+                        image = parsed_img["raw"]
+                    except ValueError as e:
+                        self.send_json(400, {"error": str(e)})
+                        return
+
+                    # Discover supported architectures and exposed port
+                    supp_archs = detect_image_architectures(image)
+                    detected_port = detect_application_port(image, explicit_port=body.get("container_port"))
+                    port = detected_port
+
+                    source = {
+                        "type": "image",
+                        "image": image,
+                        "supported_architectures": supp_archs
+                    }
 
                 route_data = body.get("route")
                 if not route_data and validated_blueprint:
                     bp_route = validated_blueprint.get("services", [{}])[0].get("route")
                     if bp_route:
                         route_data = {"enabled": True, "type": "path", "path": bp_route, "strip_prefix": True, "public_access": True}
+                elif not route_data:
+                    route_data = {"enabled": True, "type": "path", "path": f"/{name.lower()}", "strip_prefix": True, "public_access": True}
 
                 try:
                     validated_route = validate_app_route(route_data, apps_db)
@@ -2187,6 +2224,40 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "status": "created",
                 "app_id": app_id,
                 "app": mask_app_record(app_record)
+            })
+            return
+
+        # POST /apps/env/parse - Parse .env file server-side without saving
+        if path == "/apps/env/parse":
+            content_str = body.get("content") or ""
+            parsed = parse_env_file_content(content_str)
+            self.send_json(200, {
+                "status": "ok",
+                "env_vars": parsed,
+                "count": len(parsed)
+            })
+            return
+
+        # POST /apps/<app_id>/env/import - Import .env content into existing app
+        if path.startswith("/apps/") and path.endswith("/env/import"):
+            app_id = path[6:-11].strip()
+            content_str = body.get("content") or ""
+            parsed = parse_env_file_content(content_str)
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app or app.get("status") == "DELETED":
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+                app.setdefault("env_vars", {}).update(parsed)
+                for k, v in parsed.items():
+                    app.setdefault("env", {})[k] = v.get("value", "")
+                app["updated_at"] = get_current_iso_timestamp()
+                save_apps_db(apps_db)
+            self.send_json(200, {
+                "status": "imported",
+                "count": len(parsed),
+                "app": mask_app_record(app)
             })
             return
 
@@ -2316,13 +2387,28 @@ class ControllerHandler(BaseHTTPRequestHandler):
                         })
                         return
 
-                # Schedule onto Docker-capable node
+                # Schedule onto container-capable node (Docker or udocker) with architecture matching
+                t_sched_start = time.time()
                 nodes_db = load_nodes_db()
-                reqs = {"capabilities": ["container_runtime:docker"]}
+                reqs = {
+                    "any_capabilities": ["container_runtime:docker", "container_runtime:udocker", "container_runtime"]
+                }
+                if source_type == "image" or app.get("image"):
+                    img_to_check = app.get("image") or source.get("image", "")
+                    supp_archs = source.get("supported_architectures") or detect_image_architectures(img_to_check)
+                    if supp_archs:
+                        reqs["supported_architectures"] = supp_archs
+
                 decision = ResourceScheduler.select_node(reqs, nodes_db, self.heartbeat_timeout)
+                sched_ms = int((time.time() - t_sched_start) * 1000)
 
                 if not decision.get("selected_node"):
-                    reason = "No Docker-capable node is currently available in the cluster."
+                    # Check if failure was caused by architecture mismatch
+                    rejections = list(decision.get("rejected", {}).values())
+                    if any("Image does not support this node architecture" in r for r in rejections):
+                        reason = "Image does not support this node architecture."
+                    else:
+                        reason = f"No container-capable node is currently available in the cluster: {decision.get('reason', '')}".strip()
                     app["status"] = APP_STATE_FAILED
                     app["failure_reason"] = reason
                     app["error"] = reason
@@ -2351,11 +2437,20 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     "number": dep_num,
                     "commit": commit_sha,
                     "branch": source.get("branch", "main") if source_type == "github" else "manual",
-                    "trigger": "redeploy" if is_redeploy else ("github" if source_type == "github" else "manual"),
+                    "trigger": "redeploy" if is_redeploy else (source_type),
                     "status": "BUILDING" if source_type == "github" else "DEPLOYING",
                     "started_at": now_iso,
                     "finished_at": None,
-                    "duration_ms": None
+                    "duration_ms": None,
+                    "stage_timings": {
+                        "scheduling_ms": sched_ms,
+                        "fetch_source_ms": 0,
+                        "build_ms": 0,
+                        "pull_image_ms": 0,
+                        "start_container_ms": 0,
+                        "health_check_ms": 0,
+                        "total_ms": sched_ms
+                    }
                 }
                 app.setdefault("deployments", []).append(dep_record)
                 save_apps_db(apps_db)

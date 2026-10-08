@@ -482,101 +482,147 @@
           <div class="section-header" style="display: flex; justify-content: space-between; align-items: center;">
             <span class="section-title">Application Deployment</span>
             <div style="display: flex; gap: 8px;">
-              <button class="btn btn-sm btn-primary" id="btn-show-github-deploy">+ Deploy from GitHub</button>
-              <button class="btn btn-sm" id="btn-toggle-manual-deploy">Advanced / Manual</button>
+              <button class="btn btn-sm btn-primary" id="btn-show-deploy" onclick="showDeployContainer()">+ Deploy Application</button>
             </div>
           </div>
 
-          <!-- Deploy from GitHub Form (Render-like Source Deployment) -->
-          <div id="github-deploy-container" style="display: none; padding: 14px 16px; border-top: 1px solid var(--border-color);">
-            <form id="app-github-deploy-form">
-              <!-- Step 1: Repository -->
-              <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">Step 1: GitHub Repository</div>
-              <div class="form-grid" style="margin-bottom: 12px;">
-                <div class="form-cell" style="grid-column: span 2;">
-                  <label for="gh-repo">Repository (owner/repo)</label>
-                  <input type="text" id="gh-repo" class="form-input mono" placeholder="AkshatSahay72/RecallFlow" required pattern="[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+">
-                </div>
-                <div class="form-cell">
-                  <label for="gh-branch">Branch</label>
-                  <input type="text" id="gh-branch" class="form-input mono" value="main" required>
-                </div>
-                <div class="form-cell form-btn-cell">
-                  <button type="button" class="btn btn-sm" id="gh-inspect-btn" style="margin-top: 18px;">Inspect / Detect</button>
-                </div>
-              </div>
-
-              <!-- Detection Banner -->
-              <div id="gh-detection-banner" class="mono" style="display: none; padding: 8px 12px; margin-bottom: 12px; border-radius: var(--radius); font-size: 11px;"></div>
-
-              <!-- Step 2: Configuration & Route -->
-              <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">Step 2: Configuration & Route</div>
-              <div class="form-grid" style="margin-bottom: 12px;">
-                <div class="form-cell">
-                  <label for="gh-app-name">Application Name</label>
-                  <input type="text" id="gh-app-name" class="form-input mono" placeholder="recallflow" required pattern="[a-zA-Z0-9_-]+">
-                </div>
-                <div class="form-cell">
-                  <label for="gh-root-dir">Root Directory</label>
-                  <input type="text" id="gh-root-dir" class="form-input mono" value="." required>
-                </div>
-                <div class="form-cell">
-                  <label for="gh-dockerfile">Dockerfile</label>
-                  <input type="text" id="gh-dockerfile" class="form-input mono" value="Dockerfile" required>
-                </div>
-                <div class="form-cell">
-                  <label for="gh-route">Public Route Path</label>
-                  <input type="text" id="gh-route" class="form-input mono" placeholder="/recallflow" required pattern="^/[a-zA-Z0-9_-]+$">
+          <!-- Unified PaaS Application Deployment Container -->
+          <div id="unified-deploy-container" style="display: none; padding: 16px 20px; border-top: 1px solid var(--border-color);">
+            <form id="app-unified-deploy-form">
+              <!-- Source Selection -->
+              <div style="margin-bottom: 14px;">
+                <label style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); display: block; margin-bottom: 6px;">Deployment Source</label>
+                <div style="display: flex; gap: 20px; align-items: center;">
+                  <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px;">
+                    <input type="radio" name="deploy-source-type" value="image" checked onchange="toggleDeploySourceType()">
+                    <span>Container Image (Docker / udocker)</span>
+                  </label>
+                  <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px;">
+                    <input type="radio" name="deploy-source-type" value="github" onchange="toggleDeploySourceType()">
+                    <span>GitHub Repository</span>
+                  </label>
                 </div>
               </div>
 
-              <!-- Step 3: Environment Variables -->
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted);">Step 3: Environment Variables</div>
-                <button type="button" class="btn btn-sm" id="gh-add-env-btn">+ Add Variable</button>
+              <!-- Container Image Fields -->
+              <div id="source-image-fields" style="margin-bottom: 14px;">
+                <div class="form-grid">
+                  <div class="form-cell" style="grid-column: span 2;">
+                    <label for="deploy-image">Container Image Reference</label>
+                    <input type="text" id="deploy-image" class="form-input mono" placeholder="e.g. akshat/exambuddy:latest or python:3.11-slim" oninput="onImageInputChange()">
+                  </div>
+                  <div class="form-cell">
+                    <label for="deploy-app-name">Application Name</label>
+                    <input type="text" id="deploy-app-name" class="form-input mono" placeholder="exambuddy" required pattern="[a-zA-Z0-9_-]+">
+                  </div>
+                  <div class="form-cell">
+                    <label for="deploy-route">Public Path</label>
+                    <input type="text" id="deploy-route" class="form-input mono" placeholder="/exambuddy" required pattern="^/[a-zA-Z0-9_-]+$">
+                  </div>
+                </div>
               </div>
-              <div id="gh-env-list" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px;"></div>
 
-              <!-- Step 4: Deploy Action -->
-              <div style="display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--border-subtle); padding-top: 12px;">
-                <button type="button" class="btn btn-sm" onclick="hideGithubDeploy()">Cancel</button>
-                <button type="submit" class="btn btn-primary" id="gh-deploy-submit-btn">Deploy from GitHub</button>
+              <!-- GitHub Fields (shown when GitHub radio selected) -->
+              <div id="source-github-fields" style="display: none; margin-bottom: 14px;">
+                <div class="form-grid" style="margin-bottom: 10px;">
+                  <div class="form-cell" style="grid-column: span 2;">
+                    <label for="gh-repo">Repository (owner/repo)</label>
+                    <input type="text" id="gh-repo" class="form-input mono" placeholder="AkshatSahay72/ExamBuddy">
+                  </div>
+                  <div class="form-cell">
+                    <label for="gh-branch">Branch</label>
+                    <input type="text" id="gh-branch" class="form-input mono" value="main">
+                  </div>
+                  <div class="form-cell form-btn-cell">
+                    <button type="button" class="btn btn-sm" id="gh-inspect-btn" style="margin-top: 18px;" onclick="inspectGithubRepo()">Inspect / Detect</button>
+                  </div>
+                </div>
+                <div id="gh-detection-banner" class="mono" style="display: none; padding: 8px 12px; margin-bottom: 10px; border-radius: var(--radius); font-size: 11px;"></div>
+                <div class="form-grid">
+                  <div class="form-cell">
+                    <label for="gh-root-dir">Root Directory</label>
+                    <input type="text" id="gh-root-dir" class="form-input mono" value=".">
+                  </div>
+                  <div class="form-cell">
+                    <label for="gh-dockerfile">Dockerfile</label>
+                    <input type="text" id="gh-dockerfile" class="form-input mono" value="Dockerfile">
+                  </div>
+                </div>
+              </div>
+
+              <!-- Port Configuration -->
+              <div style="margin-bottom: 14px;">
+                <div class="form-grid">
+                  <div class="form-cell">
+                    <label for="deploy-port">Application Port</label>
+                    <input type="number" id="deploy-port" class="form-input mono" placeholder="Auto-detect (e.g. 5000)" min="1" max="65535">
+                    <span class="cell-muted" style="font-size: 11px;">Leave empty to auto-detect from EXPOSE or personalserver.yaml</span>
+                  </div>
+                  <div class="form-cell">
+                    <label for="deploy-runtime">Runtime</label>
+                    <select id="deploy-runtime" class="form-input mono">
+                      <option value="auto">Auto (Docker on Node 03 / udocker on Node 02)</option>
+                      <option value="docker">Docker Daemon</option>
+                      <option value="udocker">udocker (Userspace Container)</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Environment Variables Section -->
+              <div style="margin-bottom: 14px; background: var(--bg-card-subtle, rgba(255,255,255,0.02)); padding: 12px; border-radius: var(--radius); border: 1px solid var(--border-subtle);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                  <div>
+                    <span style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted);">Environment Variables</span>
+                    <span class="cell-muted" style="font-size: 11px; margin-left: 8px;">Secrets are masked in logs and container output</span>
+                  </div>
+                  <div style="display: flex; gap: 8px;">
+                    <button type="button" class="btn btn-sm" onclick="showEnvImportModal()">Import .env</button>
+                    <button type="button" class="btn btn-sm btn-primary" onclick="addEnvVariableRow()">+ Add Variable</button>
+                  </div>
+                </div>
+                <div id="unified-env-list" style="display: flex; flex-direction: column; gap: 6px;"></div>
+              </div>
+
+              <!-- Collapsible Advanced Settings -->
+              <details style="margin-bottom: 16px;">
+                <summary style="font-size: 12px; cursor: pointer; color: var(--text-muted); font-weight: 500;">Advanced Resource Limits</summary>
+                <div class="form-grid" style="margin-top: 10px;">
+                  <div class="form-cell">
+                    <label for="deploy-cpu">CPU Limit (cores)</label>
+                    <input type="text" id="deploy-cpu" class="form-input mono" value="0.5">
+                  </div>
+                  <div class="form-cell">
+                    <label for="deploy-mem">Memory Limit</label>
+                    <input type="text" id="deploy-mem" class="form-input mono" value="256m">
+                  </div>
+                </div>
+              </details>
+
+              <!-- Actions -->
+              <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border-subtle); padding-top: 14px;">
+                <button type="button" class="btn btn-sm" onclick="hideDeployContainer()">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="btn-submit-unified-deploy">Deploy Application</button>
               </div>
             </form>
           </div>
+        </div>
 
-          <!-- Manual Docker App Form (Advanced) -->
-          <div id="manual-deploy-container" style="display: none; padding: 14px 16px; border-top: 1px solid var(--border-color);">
-            <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;">Advanced: Manual Docker Container Deployment</div>
-            <form id="app-create-form" class="job-form">
-              <div class="form-grid">
-                <div class="form-cell">
-                  <label for="app-name">Name</label>
-                  <input type="text" id="app-name" class="form-input mono" placeholder="web-api" required pattern="[a-zA-Z0-9_-]+">
-                </div>
-                <div class="form-cell">
-                  <label for="app-image">Docker Image</label>
-                  <input type="text" id="app-image" class="form-input mono" placeholder="python:3.11-slim" required>
-                </div>
-                <div class="form-cell">
-                  <label for="app-container-port">Container Port</label>
-                  <input type="number" id="app-container-port" class="form-input mono" value="8000" min="1" max="65535" required>
-                </div>
-                <div class="form-cell">
-                  <label for="app-route-input">Public Route</label>
-                  <input type="text" id="app-route-input" class="form-input mono" placeholder="/web-api" pattern="^/[a-zA-Z0-9_-]+$">
-                </div>
-                <div class="form-cell">
-                  <label for="app-target">Target</label>
-                  <select id="app-target" class="form-input mono">
-                    <option value="auto">Auto (Scheduler)</option>
-                  </select>
-                </div>
-                <div class="form-cell form-btn-cell">
-                  <button type="submit" class="btn btn-primary">Create Application</button>
-                </div>
-              </div>
-            </form>
+        <!-- .env Import Modal Dialog -->
+        <div id="modal-env-import" class="modal-backdrop" style="display: none;">
+          <div class="modal-box" style="max-width: 520px;">
+            <div class="modal-header">
+              <span class="modal-title">Import .env File</span>
+              <button class="modal-close-btn" onclick="hideEnvImportModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+              <p class="cell-muted" style="font-size: 12px; margin-bottom: 10px;">Paste the contents of your .env file below. Variables will be parsed securely on the server, and sensitive keys will be flagged automatically as secrets.</p>
+              <textarea id="env-import-textarea" class="form-input mono" rows="8" placeholder="PORT=5000&#10;DATABASE_URL=sqlite:///app.db&#10;SECRET_KEY=my-super-secret-key" style="resize: vertical; font-size: 12px;"></textarea>
+            </div>
+            <div class="modal-footer" style="display: flex; justify-content: flex-end; gap: 8px;">
+              <button type="button" class="btn btn-sm" onclick="hideEnvImportModal()">Cancel</button>
+              <button type="button" class="btn btn-sm btn-primary" onclick="submitEnvImport()">Parse & Import</button>
+            </div>
           </div>
         </div>
 

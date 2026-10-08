@@ -1471,60 +1471,198 @@ function escapeHtml(str) {
 // Deploy from GitHub Flow
 // -----------------------------------------------------------------------------
 
-window.showGithubDeploy = function() {
-  const ghContainer = document.getElementById("github-deploy-container");
-  const manualContainer = document.getElementById("manual-deploy-container");
-  if (manualContainer) manualContainer.style.display = "none";
-  if (ghContainer) {
-    ghContainer.style.display = "block";
-    ghContainer.scrollIntoView({ behavior: "smooth" });
+// -----------------------------------------------------------------------------
+// Unified Application Deployment Flow (Image / GitHub)
+// -----------------------------------------------------------------------------
+
+window.showDeployContainer = function() {
+  const container = document.getElementById("unified-deploy-container");
+  if (container) {
+    container.style.display = "block";
+    container.scrollIntoView({ behavior: "smooth" });
   }
 };
 
-window.hideGithubDeploy = function() {
-  const ghContainer = document.getElementById("github-deploy-container");
-  if (ghContainer) ghContainer.style.display = "none";
+window.hideDeployContainer = function() {
+  const container = document.getElementById("unified-deploy-container");
+  if (container) container.style.display = "none";
 };
 
+// Backwards-compatible aliases
+window.showGithubDeploy = window.showDeployContainer;
+window.hideGithubDeploy = window.hideDeployContainer;
 window.toggleManualDeploy = function() {
-  const manualContainer = document.getElementById("manual-deploy-container");
-  const ghContainer = document.getElementById("github-deploy-container");
-  if (ghContainer) ghContainer.style.display = "none";
-  if (manualContainer) {
-    manualContainer.style.display = manualContainer.style.display === "none" ? "block" : "none";
-    if (manualContainer.style.display === "block") {
-      manualContainer.scrollIntoView({ behavior: "smooth" });
+  const container = document.getElementById("unified-deploy-container");
+  if (container) {
+    container.style.display = container.style.display === "none" ? "block" : "none";
+    if (container.style.display === "block") container.scrollIntoView({ behavior: "smooth" });
+  }
+};
+
+window.toggleDeploySourceType = function() {
+  const sourceType = document.querySelector('input[name="deploy-source-type"]:checked')?.value || "image";
+  const imageFields = document.getElementById("source-image-fields");
+  const ghFields = document.getElementById("source-github-fields");
+  const imgInput = document.getElementById("deploy-image");
+  const ghRepoInput = document.getElementById("gh-repo");
+
+  if (sourceType === "image") {
+    if (imageFields) imageFields.style.display = "block";
+    if (ghFields) ghFields.style.display = "none";
+    if (imgInput) imgInput.required = true;
+    if (ghRepoInput) ghRepoInput.required = false;
+  } else {
+    if (imageFields) imageFields.style.display = "none";
+    if (ghFields) ghFields.style.display = "block";
+    if (imgInput) imgInput.required = false;
+    if (ghRepoInput) ghRepoInput.required = true;
+  }
+};
+
+window.onImageInputChange = function() {
+  const imgInput = document.getElementById("deploy-image");
+  const nameInput = document.getElementById("deploy-app-name");
+  const routeInput = document.getElementById("deploy-route");
+  if (!imgInput || !nameInput) return;
+
+  const raw = imgInput.value.trim();
+  if (!raw) return;
+
+  // Extract repo name e.g. akshat/exambuddy:latest -> exambuddy, nginx:alpine -> nginx
+  let name = raw.split("/").pop().split(":")[0].toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  if (name && (!nameInput.value || nameInput.dataset.autofilled === "true")) {
+    nameInput.value = name;
+    nameInput.dataset.autofilled = "true";
+    if (routeInput && (!routeInput.value || routeInput.dataset.autofilled === "true")) {
+      routeInput.value = `/${name}`;
+      routeInput.dataset.autofilled = "true";
     }
   }
 };
 
-document.getElementById("btn-show-github-deploy")?.addEventListener("click", showGithubDeploy);
-document.getElementById("btn-toggle-manual-deploy")?.addEventListener("click", toggleManualDeploy);
+function isProbableSecret(key) {
+  if (!key) return false;
+  const upper = key.toUpperCase();
+  const secretKeywords = ["SECRET", "KEY", "TOKEN", "PASSWORD", "PASS", "AUTH", "CREDENTIAL", "PRIVATE", "DATABASE_URL"];
+  return secretKeywords.some(kw => upper.includes(kw));
+}
+
+window.addEnvVariableRow = function(key = "", value = "", isSecret = null) {
+  const container = document.getElementById("unified-env-list");
+  if (!container) return;
+
+  if (isSecret === null) {
+    isSecret = isProbableSecret(key);
+  }
+
+  const rowId = `unified-env-row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
+  const div = document.createElement("div");
+  div.id = rowId;
+  div.className = "unified-env-row";
+  div.style.display = "flex";
+  div.style.gap = "8px";
+  div.style.alignItems = "center";
+  div.style.marginBottom = "6px";
+
+  const inputType = isSecret ? "password" : "text";
+
+  div.innerHTML = `
+    <input type="text" class="form-input mono env-row-key" placeholder="VARIABLE_NAME" value="${escapeHtml(key)}" style="flex: 1; min-width: 140px;" required pattern="^[a-zA-Z_][a-zA-Z0-9_]*$">
+    <div style="flex: 2; min-width: 180px; position: relative; display: flex; align-items: center;">
+      <input type="${inputType}" class="form-input mono env-row-val" placeholder="Value..." value="${escapeHtml(value)}" style="width: 100%; padding-right: 32px;">
+      <button type="button" class="btn btn-sm" onclick="toggleEnvRowVisibility('${rowId}')" title="Show/Hide" style="position: absolute; right: 2px; padding: 2px 6px; font-size: 11px; background: transparent; border: none; color: var(--text-muted); cursor: pointer;">👁</button>
+    </div>
+    <label class="modal-label mono" style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap; margin: 0; font-size: 11px;">
+      <input type="checkbox" class="env-row-sec" ${isSecret ? 'checked' : ''} onchange="onEnvRowSecretChange('${rowId}')"> Secret
+    </label>
+    <button type="button" class="btn btn-sm btn-danger" onclick="document.getElementById('${rowId}')?.remove()" title="Remove variable">✕</button>
+  `;
+  container.appendChild(div);
+};
+
+window.toggleEnvRowVisibility = function(rowId) {
+  const row = document.getElementById(rowId);
+  if (!row) return;
+  const input = row.querySelector(".env-row-val");
+  if (!input) return;
+  input.type = input.type === "password" ? "text" : "password";
+};
+
+window.onEnvRowSecretChange = function(rowId) {
+  const row = document.getElementById(rowId);
+  if (!row) return;
+  const chk = row.querySelector(".env-row-sec");
+  const input = row.querySelector(".env-row-val");
+  if (chk && input) {
+    input.type = chk.checked ? "password" : "text";
+  }
+};
+
+window.showEnvImportModal = function() {
+  const modal = document.getElementById("modal-env-import");
+  if (modal) modal.style.display = "flex";
+};
+
+window.hideEnvImportModal = function() {
+  const modal = document.getElementById("modal-env-import");
+  if (modal) modal.style.display = "none";
+};
+
+window.submitEnvImport = async function() {
+  const textarea = document.getElementById("env-import-textarea");
+  if (!textarea) return;
+  const content = textarea.value;
+  if (!content.trim()) {
+    hideEnvImportModal();
+    return;
+  }
+
+  try {
+    const res = await apiFetch("/api/apps/env/parse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content })
+    });
+
+    if (res.env_vars) {
+      for (const [k, v] of Object.entries(res.env_vars)) {
+        addEnvVariableRow(k, v.value, v.is_secret);
+      }
+      textarea.value = "";
+      hideEnvImportModal();
+    }
+  } catch (err) {
+    showCustomAlert({ title: "Import Failed", message: err.message, isError: true });
+  }
+};
 
 // Inspect GitHub Repo & Detect Blueprint / Dockerfile
-document.getElementById("gh-inspect-btn")?.addEventListener("click", async () => {
+window.inspectGithubRepo = async function() {
   const repoInput = document.getElementById("gh-repo");
   const branchInput = document.getElementById("gh-branch");
   const rootDirInput = document.getElementById("gh-root-dir");
   const banner = document.getElementById("gh-detection-banner");
-  const appNameInput = document.getElementById("gh-app-name");
-  const routeInput = document.getElementById("gh-route");
+  const appNameInput = document.getElementById("deploy-app-name");
+  const routeInput = document.getElementById("deploy-route");
+  const portInput = document.getElementById("deploy-port");
   const dockerfileInput = document.getElementById("gh-dockerfile");
 
-  const repo = repoInput.value.trim();
-  const branch = branchInput.value.trim() || "main";
-  const rootDir = rootDirInput.value.trim() || ".";
+  const repo = repoInput ? repoInput.value.trim() : "";
+  const branch = branchInput ? branchInput.value.trim() || "main" : "main";
+  const rootDir = rootDirInput ? rootDirInput.value.trim() || "." : ".";
 
   if (!repo || !repo.includes("/")) {
     showCustomAlert({ title: "Invalid Repository", message: "Please specify repository in 'owner/repository' format.", isError: true });
     return;
   }
 
-  banner.style.display = "block";
-  banner.style.backgroundColor = "rgba(88, 166, 255, 0.1)";
-  banner.style.border = "1px solid rgba(88, 166, 255, 0.3)";
-  banner.style.color = "var(--text-main)";
-  banner.textContent = `Inspecting repository ${repo} on branch ${branch}...`;
+  if (banner) {
+    banner.style.display = "block";
+    banner.style.backgroundColor = "rgba(88, 166, 255, 0.1)";
+    banner.style.border = "1px solid rgba(88, 166, 255, 0.3)";
+    banner.style.color = "var(--text-main)";
+    banner.textContent = `Inspecting repository ${repo} on branch ${branch}...`;
+  }
 
   try {
     const res = await apiFetch("/api/apps/github/inspect", {
@@ -1537,98 +1675,75 @@ document.getElementById("gh-inspect-btn")?.addEventListener("click", async () =>
     const repoName = repo.split("/")[1].toLowerCase().replace(/[^a-z0-9_-]/g, '-');
 
     if (res.has_blueprint && res.blueprint) {
-      const svc = res.blueprint.services[0] || {};
-      appNameInput.value = svc.name || repoName;
-      routeInput.value = svc.route || `/${svc.name || repoName}`;
-      rootDirInput.value = svc.rootDir || rootDir;
-      dockerfileInput.value = svc.dockerfile || "Dockerfile";
+      const svc = res.blueprint.services?.[0] || {};
+      if (appNameInput) appNameInput.value = svc.name || repoName;
+      if (routeInput) routeInput.value = svc.route || `/${svc.name || repoName}`;
+      if (rootDirInput) rootDirInput.value = svc.rootDir || rootDir;
+      if (dockerfileInput) dockerfileInput.value = svc.dockerfile || "Dockerfile";
+      if (svc.port && portInput) portInput.value = svc.port;
 
-      banner.style.backgroundColor = "rgba(63, 185, 80, 0.12)";
-      banner.style.border = "1px solid rgba(63, 185, 80, 0.35)";
-      banner.style.color = "var(--status-green)";
-      banner.textContent = `✓ Detected PersonalServer Blueprint (personalserver.yaml) for '${svc.name}'. Pre-configured services and environment.`;
+      if (banner) {
+        banner.style.backgroundColor = "rgba(63, 185, 80, 0.12)";
+        banner.style.border = "1px solid rgba(63, 185, 80, 0.35)";
+        banner.style.color = "var(--status-green)";
+        banner.textContent = `✓ Detected PersonalServer Blueprint (personalserver.yaml) for '${svc.name}'. Pre-configured services and environment.`;
+      }
 
-      // Pre-fill environment variables from blueprint
-      const envList = document.getElementById("gh-env-list");
-      envList.innerHTML = "";
       if (Array.isArray(svc.envVars)) {
         svc.envVars.forEach(ev => {
           const key = typeof ev === 'object' ? ev.key : ev;
-          addGithubEnvRow(key, "", true);
+          addEnvVariableRow(key, "", true);
         });
       }
     } else {
-      appNameInput.value = repoName;
-      routeInput.value = `/${repoName}`;
-      dockerfileInput.value = "Dockerfile";
+      if (appNameInput) appNameInput.value = repoName;
+      if (routeInput) routeInput.value = `/${repoName}`;
+      if (dockerfileInput) dockerfileInput.value = "Dockerfile";
+      if (res.detected_port && portInput) portInput.value = res.detected_port;
 
-      banner.style.backgroundColor = "rgba(210, 153, 34, 0.12)";
-      banner.style.border = "1px solid rgba(210, 153, 34, 0.35)";
-      banner.style.color = "var(--status-yellow)";
-      banner.textContent = `✓ Detected Docker configuration (Dockerfile). Automatic Docker build will be configured.`;
+      if (banner) {
+        banner.style.backgroundColor = "rgba(210, 153, 34, 0.12)";
+        banner.style.border = "1px solid rgba(210, 153, 34, 0.35)";
+        banner.style.color = "var(--status-yellow)";
+        banner.textContent = `✓ Detected Docker configuration (${res.dockerfile_path || 'Dockerfile'}). Port ${res.detected_port || 5000} auto-detected.`;
+      }
     }
   } catch (err) {
-    banner.style.backgroundColor = "rgba(248, 81, 73, 0.12)";
-    banner.style.border = "1px solid rgba(248, 81, 73, 0.35)";
-    banner.style.color = "var(--status-red)";
-    banner.textContent = `Inspection notice: ${err.message}`;
+    if (banner) {
+      banner.style.backgroundColor = "rgba(248, 81, 73, 0.12)";
+      banner.style.border = "1px solid rgba(248, 81, 73, 0.35)";
+      banner.style.color = "var(--status-red)";
+      banner.textContent = `Inspection notice: ${err.message}`;
+    }
   }
-});
+};
 
-function addGithubEnvRow(key = "", value = "", isSecret = true) {
-  const container = document.getElementById("gh-env-list");
-  if (!container) return;
-
-  const rowId = `gh-env-row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
-  const div = document.createElement("div");
-  div.id = rowId;
-  div.style.display = "flex";
-  div.style.gap = "8px";
-  div.style.alignItems = "center";
-
-  div.innerHTML = `
-    <input type="text" class="form-input mono gh-env-k" placeholder="KEY_NAME" value="${escapeHtml(key)}" style="flex: 1; min-width: 140px;" required pattern="^[a-zA-Z_][a-zA-Z0-9_]*$">
-    <input type="password" class="form-input mono gh-env-v" placeholder="Value..." value="${escapeHtml(value)}" style="flex: 2; min-width: 180px;">
-    <label class="modal-label mono" style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap;">
-      <input type="checkbox" class="gh-env-sec" ${isSecret ? 'checked' : ''}> Secret
-    </label>
-    <button type="button" class="btn btn-sm btn-danger" onclick="document.getElementById('${rowId}')?.remove()">✕</button>
-  `;
-  container.appendChild(div);
-}
-
-document.getElementById("gh-add-env-btn")?.addEventListener("click", () => addGithubEnvRow());
-
-// GitHub Source Deploy Form Submit
-document.getElementById("app-github-deploy-form")?.addEventListener("submit", async (e) => {
+// Unified Application Deploy Form Submit
+document.getElementById("app-unified-deploy-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const repo = document.getElementById("gh-repo").value.trim();
-  const branch = document.getElementById("gh-branch").value.trim() || "main";
-  const name = document.getElementById("gh-app-name").value.trim();
-  const rootDir = document.getElementById("gh-root-dir").value.trim() || ".";
-  const dockerfile = document.getElementById("gh-dockerfile").value.trim() || "Dockerfile";
-  const routePath = document.getElementById("gh-route").value.trim();
+  const sourceType = document.querySelector('input[name="deploy-source-type"]:checked')?.value || "image";
+  const name = document.getElementById("deploy-app-name").value.trim();
+  const routePath = document.getElementById("deploy-route").value.trim() || `/${name.toLowerCase()}`;
+  const runtime = document.getElementById("deploy-runtime")?.value || "auto";
+  const cpuLimit = document.getElementById("deploy-cpu")?.value.trim() || "0.5";
+  const memLimit = document.getElementById("deploy-mem")?.value.trim() || "256m";
+  const rawPort = document.getElementById("deploy-port")?.value.trim();
+  const containerPort = rawPort ? parseInt(rawPort, 10) : null;
 
-  // Collect environment variables
+  // Collect environment variables from unified list
   const envVars = {};
-  const rows = document.querySelectorAll("#gh-env-list > div");
+  const rows = document.querySelectorAll("#unified-env-list .unified-env-row");
   rows.forEach(r => {
-    const k = r.querySelector(".gh-env-k")?.value.trim();
-    const v = r.querySelector(".gh-env-v")?.value || "";
-    const isSec = r.querySelector(".gh-env-sec")?.checked ?? true;
+    const k = r.querySelector(".env-row-key")?.value.trim();
+    const v = r.querySelector(".env-row-val")?.value || "";
+    const isSec = r.querySelector(".env-row-sec")?.checked ?? isProbableSecret(k);
     if (k) {
       envVars[k] = { value: v, is_secret: isSec };
     }
   });
 
-  const payload = {
+  let payload = {
     name,
-    source: {
-      type: "github",
-      repository: repo,
-      branch,
-      root_directory: rootDir
-    },
     route: {
       enabled: true,
       type: "path",
@@ -1637,70 +1752,64 @@ document.getElementById("app-github-deploy-form")?.addEventListener("submit", as
       public_access: true
     },
     env_vars: envVars,
-    blueprint: detectedBlueprint
+    target: "auto",
+    runtime: runtime,
+    cpu_limit: cpuLimit,
+    memory_limit: memLimit
   };
 
+  if (containerPort) {
+    payload.container_port = containerPort;
+  }
+
+  if (sourceType === "image") {
+    const image = document.getElementById("deploy-image").value.trim();
+    if (!image) {
+      showCustomAlert({ title: "Image Required", message: "Please enter a container image reference.", isError: true });
+      return;
+    }
+    payload.image = image;
+    payload.source = { type: "image", image };
+  } else {
+    const repo = document.getElementById("gh-repo").value.trim();
+    const branch = document.getElementById("gh-branch").value.trim() || "main";
+    const rootDir = document.getElementById("gh-root-dir").value.trim() || ".";
+    payload.source = {
+      type: "github",
+      repository: repo,
+      branch,
+      root_directory: rootDir
+    };
+    payload.blueprint = detectedBlueprint;
+  }
+
   try {
+    const submitBtn = document.getElementById("btn-submit-unified-deploy");
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Deploying...";
+    }
+
     const createRes = await apiFetch("/api/apps", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
 
-    hideGithubDeploy();
+    hideDeployContainer();
     loadApps();
 
-    // Trigger deployment immediately
     if (createRes.app_id) {
       deployApp(createRes.app_id);
     }
   } catch (err) {
     showCustomAlert({ title: "Deployment Error", message: err.message, isError: true });
-  }
-});
-
-// Create Application (Manual)
-document.getElementById("app-create-form")?.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const nameInput = document.getElementById("app-name");
-  const imageInput = document.getElementById("app-image");
-  const portInput = document.getElementById("app-container-port");
-  const routeInput = document.getElementById("app-route-input");
-  const targetSelect = document.getElementById("app-target");
-
-  const name = nameInput.value.trim();
-  const image = imageInput.value.trim();
-  const containerPort = parseInt(portInput.value, 10);
-  const target = targetSelect.value || "auto";
-  const routePath = routeInput?.value.trim() || `/${name.toLowerCase()}`;
-
-  try {
-    await apiFetch("/api/apps", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name,
-        image,
-        container_port: containerPort,
-        target,
-        source: { type: "manual" },
-        route: {
-          enabled: true,
-          type: "path",
-          path: routePath,
-          strip_prefix: true,
-          public_access: true
-        }
-      })
-    });
-    nameInput.value = "";
-    imageInput.value = "";
-    portInput.value = "8000";
-    if (routeInput) routeInput.value = "";
-    toggleManualDeploy();
-    loadApps();
-  } catch (err) {
-    showCustomAlert({ title: "Create Application Failed", message: err.message, isError: true });
+  } finally {
+    const submitBtn = document.getElementById("btn-submit-unified-deploy");
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Deploy Application";
+    }
   }
 });
 
@@ -1807,6 +1916,15 @@ function renderAppDeployments(app) {
   tbody.innerHTML = deps.slice().reverse().map(d => {
     const statusPill = renderStatusPill(d.status);
     const durStr = d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "-";
+    let stageBreakdown = "";
+    if (d.stage_timings && typeof d.stage_timings === 'object') {
+      const parts = Object.entries(d.stage_timings)
+        .filter(([_, v]) => typeof v === 'number' && v > 0)
+        .map(([k, v]) => `${k.replace(/_ms$/, '')}: ${v}ms`);
+      if (parts.length > 0) {
+        stageBreakdown = `<div style="font-size: 10px; color: var(--text-muted); margin-top: 3px; font-family: var(--font-mono);">${parts.join(" · ")}</div>`;
+      }
+    }
     return `
       <tr>
         <td class="mono" style="font-weight: 600;">#${d.number || 1}</td>
@@ -1814,7 +1932,7 @@ function renderAppDeployments(app) {
         <td class="mono">${escapeHtml(d.branch || 'main')}</td>
         <td class="mono cell-muted">${escapeHtml(d.trigger || 'manual')}</td>
         <td>${statusPill}</td>
-        <td class="mono">${durStr}</td>
+        <td class="mono">${durStr}${stageBreakdown}</td>
         <td class="cell-muted">${escapeHtml(d.started_at || '-')}</td>
       </tr>
     `;

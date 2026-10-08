@@ -196,11 +196,14 @@ class ApplicationRouter:
 
         # Verify selected node is ONLINE in cluster registry
         node_record = nodes_db.get("nodes", {}).get(selected_node)
-        if not node_record or node_record.get("status") != "ONLINE":
+        if not node_record or str(node_record.get("status", "")).upper() != "ONLINE":
             return 504, {"error": "Application host node is temporarily unreachable", "status": 504}, {}
 
-        # Target IP resolution: local loopback if running on local node, or node IP
+        # Target IP resolution: local loopback if running on local node, or node IP / Tailscale IP
         target_host = "127.0.0.1"
+        node_ip = node_record.get("ip") or node_record.get("tailscale_ip") or node_record.get("host")
+        if node_ip and node_ip not in ("127.0.0.1", "localhost", "0.0.0.0"):
+            target_host = node_ip
         return 200, f"http://{target_host}:{host_port}", {}
 
 
@@ -220,11 +223,16 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
-        self.end_headers()
+        apps_db = load_apps_registry()
+        app, route_prefix, remainder, is_redirect, err_msg = ApplicationRouter.match_route(self.path, apps_db)
+        if app:
+            self.handle_proxy_request("OPTIONS")
+        else:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+            self.end_headers()
 
     def do_GET(self):
         self.handle_proxy_request("GET")
