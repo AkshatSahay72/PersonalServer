@@ -30,18 +30,32 @@ sys.path.insert(0, str(BASE_DIR))
 # Import ResourceScheduler
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness, extract_node_telemetry
 from config.platform_config import get_platform_config
-from controller.image_inspector import (
-    validate_image_reference,
-    detect_image_architectures,
-    detect_application_port,
-    is_architecture_compatible,
-    normalize_architecture
-)
-from controller.env_manager import (
-    parse_env_file_content,
-    sanitize_env_vars_input,
-    is_secret_variable
-)
+try:
+    from controller.image_inspector import (
+        validate_image_reference,
+        detect_image_architectures,
+        detect_application_port,
+        is_architecture_compatible,
+        normalize_architecture
+    )
+    from controller.env_manager import (
+        parse_env_file_content,
+        sanitize_env_vars_input,
+        is_secret_variable
+    )
+except (ImportError, ModuleNotFoundError):
+    from image_inspector import (
+        validate_image_reference,
+        detect_image_architectures,
+        detect_application_port,
+        is_architecture_compatible,
+        normalize_architecture
+    )
+    from env_manager import (
+        parse_env_file_content,
+        sanitize_env_vars_input,
+        is_secret_variable
+    )
 
 CONFIG_DIR = BASE_DIR / "config"
 SECRETS_DIR = CONFIG_DIR / "secrets"
@@ -1694,6 +1708,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "resources": resources,
                 "capabilities": capabilities,
                 "auth_token": node_auth_token,
+                "ip": self.client_address[0] if (self.client_address and self.client_address[0] not in ("127.0.0.1", "localhost", "0.0.0.0")) else None,
                 "status": STATE_ONLINE,
                 "registered_at": now,
                 "last_seen": now,
@@ -1751,6 +1766,17 @@ class ControllerHandler(BaseHTTPRequestHandler):
             node_entry["last_seen"] = now
             if self.client_address and self.client_address[0] not in ("127.0.0.1", "localhost", "0.0.0.0"):
                 node_entry["ip"] = self.client_address[0]
+            elif not node_entry.get("ip"):
+                if node_id == "server-f8b1485ecf458f74":
+                    node_entry["ip"] = "100.120.251.42"
+                elif node_id == "server-95bad5ff01424d4c8d184330d6d2e394":
+                    node_entry["ip"] = "100.73.52.72"
+                elif node_id == "server-5387a86bf36116b1":
+                    node_entry["ip"] = "100.85.108.5"
+
+            if "capabilities" in body and isinstance(body["capabilities"], dict):
+                node_entry.setdefault("capabilities", {}).update(body["capabilities"])
+
             node_entry["last_heartbeat"] = {
                 "timestamp": body.get("timestamp", now),
                 "services": body.get("services", {}),

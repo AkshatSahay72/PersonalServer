@@ -348,7 +348,7 @@ class JobExecutor:
                     run_args = [
                         "docker", "run", "-d",
                         "--name", container_name,
-                        "-p", f"127.0.0.1:{host_port}:{container_port}",
+                        "-p", f"0.0.0.0:{host_port}:{container_port}",
                         "--restart", "unless-stopped"
                     ]
                     mem_limit = params.get("memory_limit", "256m")
@@ -368,17 +368,98 @@ class JobExecutor:
                 elif runtime == "udocker":
                     subprocess.run(["udocker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     subprocess.run(["udocker", "create", f"--name={container_name}", image], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                    
+                    pid_file_path = RUNTIME_DIR / f"{container_name}.pid"
+                    log_file_path = RUNTIME_DIR / f"{container_name}.log"
+                    if pid_file_path.exists():
+                        try:
+                            old_pid = int(pid_file_path.read_text().strip())
+                            os.kill(old_pid, 9)
+                        except Exception:
+                            pass
+                        pid_file_path.unlink(missing_ok=True)
+
+                    # Auto-tune unprivileged listening ports for udocker userspace containers
+                    try:
+                        inspect_root = subprocess.run(
+                            ["udocker", "inspect", "-p", container_name],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                            timeout=5
+                        )
+                        if inspect_root.returncode == 0:
+                            root_dir = Path(inspect_root.stdout.strip())
+                            nginx_conf = root_dir / "etc" / "nginx" / "conf.d" / "default.conf"
+                            if nginx_conf.exists() and nginx_conf.is_file():
+                                conf_text = nginx_conf.read_text(encoding="utf-8")
+                                if "listen" in conf_text:
+                                    conf_text = re.sub(r'listen\s+80;', f'listen {host_port};', conf_text)
+                                    nginx_conf.write_text(conf_text, encoding="utf-8")
+                    except Exception:
+                        pass
+
                     run_args = [
                         "udocker", "run", "--nobanner",
                         f"--publish={host_port}:{container_port}"
                     ]
-                    env_vars = params.get("env", {})
-                    if isinstance(env_vars, dict):
-                        for k, v in env_vars.items():
-                            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(k)):
-                                run_args.extend(["-e", f"{k}={v}"])
+                    env_vars = dict(params.get("env") or {})
+                    env_vars.setdefault("PORT", str(host_port))
+                    for k, v in env_vars.items():
+                        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(k)):
+                            run_args.extend(["-e", f"{k}={v}"])
                     run_args.append(container_name)
-                    cmd = run_args
+
+                    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                    with open(log_file_path, "w", encoding="utf-8") as log_f:
+                        bg_proc = subprocess.Popen(
+                            run_args,
+                            stdout=log_f,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True
+                        )
+                    pid_file_path.write_text(str(bg_proc.pid), encoding="utf-8")
+
+                    # Wait briefly to ensure it didn't immediately fail
+                    time.sleep(1.5)
+                    poll_res = bg_proc.poll()
+                    if poll_res is not None and poll_res != 0:
+                        err_out = ""
+                        try:
+                            if log_file_path.exists():
+                                err_out = log_file_path.read_text(encoding="utf-8")
+                        except Exception:
+                            pass
+                        return {
+                            "job_id": job_id,
+                            "status": JOB_STATE_FAILED,
+                            "exit_code": poll_res,
+                            "stdout": "",
+                            "stderr": f"udocker container exited immediately with code {poll_res}:\n{truncate_output(err_out)}",
+                            "duration_ms": int((time.time() - start_time) * 1000),
+                            "started_at": started_iso,
+                            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        }
+
+                    return {
+                        "job_id": job_id,
+                        "status": JOB_STATE_SUCCEEDED,
+                        "exit_code": 0,
+                        "stdout": f"Container {container_name} started via udocker (PID {bg_proc.pid})",
+                        "stderr": "",
+                        "duration_ms": int((time.time() - start_time) * 1000),
+                        "started_at": started_iso,
+                        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "metadata": {
+                            "runtime": "udocker",
+                            "container_name": container_name,
+                            "pid": bg_proc.pid,
+                            "host_port": host_port,
+                            "container_port": container_port,
+                            "image_cached": image_cached,
+                            "pull_duration_ms": pull_ms
+                        }
+                    }
 
             except Exception as e:
                 return {
@@ -418,7 +499,32 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["docker" if runtime == "docker" else "udocker", "stop" if runtime == "docker" else "rm", container_name]
+            if runtime == "udocker":
+                pid_file_path = RUNTIME_DIR / f"{container_name}.pid"
+                if pid_file_path.exists():
+                    try:
+                        pid = int(pid_file_path.read_text().strip())
+                        os.kill(pid, 15)
+                        time.sleep(1)
+                        try:
+                            os.kill(pid, 9)
+                        except Exception:
+                            pass
+                        pid_file_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                subprocess.run(["udocker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_SUCCEEDED,
+                    "exit_code": 0,
+                    "stdout": f"udocker container {container_name} stopped",
+                    "stderr": "",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
+            cmd = ["docker", "stop", container_name]
 
         elif job_type == "docker-restart":
             try:
@@ -474,7 +580,29 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["docker" if runtime == "docker" else "udocker", "rm", "-f", container_name]
+            if runtime == "udocker":
+                pid_file_path = RUNTIME_DIR / f"{container_name}.pid"
+                log_file_path = RUNTIME_DIR / f"{container_name}.log"
+                if pid_file_path.exists():
+                    try:
+                        pid = int(pid_file_path.read_text().strip())
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+                    pid_file_path.unlink(missing_ok=True)
+                log_file_path.unlink(missing_ok=True)
+                subprocess.run(["udocker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_SUCCEEDED,
+                    "exit_code": 0,
+                    "stdout": f"udocker container {container_name} removed",
+                    "stderr": "",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
+            cmd = ["docker", "rm", "-f", container_name]
 
         elif job_type == "docker-logs":
             try:
@@ -502,7 +630,25 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["docker", "logs", "--tail", "100", container_name] if runtime == "docker" else ["udocker", "ps"]
+            if runtime == "udocker":
+                log_file_path = RUNTIME_DIR / f"{container_name}.log"
+                log_content = ""
+                if log_file_path.exists():
+                    try:
+                        log_content = log_file_path.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_SUCCEEDED,
+                    "exit_code": 0,
+                    "stdout": truncate_output(log_content) or f"udocker container {container_name} is active",
+                    "stderr": "",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
+            cmd = ["docker", "logs", "--tail", "100", container_name]
 
         # Execute process with strict timeout and output capture
         status = JOB_STATE_RUNNING

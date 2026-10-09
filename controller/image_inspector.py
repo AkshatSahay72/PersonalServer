@@ -171,14 +171,15 @@ def detect_application_port(
     image_ref: Optional[str] = None,
     dockerfile_content: Optional[str] = None,
     explicit_port: Optional[int] = None,
-    blueprint_port: Optional[int] = None
+    blueprint_port: Optional[int] = None,
+    app_name: Optional[str] = None
 ) -> int:
     """
     Determines application container listening port by priority:
     1. Explicit port override (from request/UI)
     2. Blueprint / personalserver.yaml port
     3. Dockerfile EXPOSE / ENV PORT inspection
-    4. Image name heuristic
+    4. Image name & app name heuristic (ExamBuddy -> 5000)
     5. Safe default 8000
     """
     if explicit_port and isinstance(explicit_port, (int, str)):
@@ -219,20 +220,19 @@ def detect_application_port(
             except ValueError:
                 pass
 
-    # Image name heuristics
-    if image_ref:
-        img_lower = image_ref.lower()
-        if "exambuddy" in img_lower:
-            return 5000
-        if "nginx" in img_lower:
-            return 80
-        if "httpd" in img_lower or "apache" in img_lower:
-            return 80
-        if "redis" in img_lower:
-            return 6379
-        if "postgres" in img_lower:
-            return 5432
-        if "mongo" in img_lower:
-            return 27017
+    # Image & App name heuristics
+    combined_name = f"{image_ref or ''} {app_name or ''}".lower()
+    if "exambuddy" in combined_name:
+        return 5000
+    if "nginx" in combined_name:
+        return 80
+    if "httpd" in combined_name or "apache" in combined_name:
+        return 80
+    if "redis" in combined_name:
+        return 6379
+    if "postgres" in combined_name:
+        return 5432
+    if "mongo" in combined_name:
+        return 27017
 
     return 8000

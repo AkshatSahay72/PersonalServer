@@ -200,10 +200,27 @@ class ApplicationRouter:
             return 504, {"error": "Application host node is temporarily unreachable", "status": 504}, {}
 
         # Target IP resolution: local loopback if running on local node, or node IP / Tailscale IP
+        local_node_id = None
+        try:
+            reg_f = RUNTIME_DIR / "registration.json"
+            if reg_f.exists():
+                with open(reg_f, "r", encoding="utf-8") as f:
+                    local_node_id = json.load(f).get("node_id")
+        except Exception:
+            pass
+
         target_host = "127.0.0.1"
-        node_ip = node_record.get("ip") or node_record.get("tailscale_ip") or node_record.get("host")
-        if node_ip and node_ip not in ("127.0.0.1", "localhost", "0.0.0.0"):
-            target_host = node_ip
+        if selected_node != local_node_id:
+            node_ip = node_record.get("ip") or node_record.get("tailscale_ip") or node_record.get("host")
+            if not node_ip:
+                # Tailscale fallback mapping for registered cluster nodes
+                if selected_node == "server-f8b1485ecf458f74":
+                    node_ip = "100.120.251.42"
+                elif selected_node == "server-95bad5ff01424d4c8d184330d6d2e394":
+                    node_ip = "100.73.52.72"
+            if node_ip and node_ip not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                target_host = node_ip
+
         return 200, f"http://{target_host}:{host_port}", {}
 
 

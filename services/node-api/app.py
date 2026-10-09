@@ -36,8 +36,8 @@ AUTH_TOKEN_FILE = SECRETS_DIR / "auth.token"
 STORAGE_ROOT = (BASE_DIR / "storage").resolve()
 STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 
-DEFAULT_CONTROLLER_URL = "http://100.120.251.42:8000"
-DEFAULT_ROUTER_URL = "http://100.120.251.42:8088"
+DEFAULT_CONTROLLER_URL = "http://127.0.0.1:8000"
+DEFAULT_ROUTER_URL = "http://127.0.0.1:8088"
 
 
 class ProxyRedirectHandler(urllib.request.HTTPRedirectHandler):

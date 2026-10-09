@@ -134,6 +134,8 @@ def discover_hardware(base_dir=BASE_DIR):
     }
     if is_docker_available():
         capabilities["container_runtime:docker"] = True
+    if is_udocker_available():
+        capabilities["container_runtime:udocker"] = True
 
     return {
         "name": hostname,
@@ -156,6 +158,23 @@ def is_docker_available():
     try:
         res = subprocess.run(
             ["docker", "info"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+            text=True
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def is_udocker_available():
+    """
+    Checks if udocker userspace container runtime is available on this node.
+    """
+    try:
+        res = subprocess.run(
+            ["udocker", "version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=3,
@@ -298,10 +317,11 @@ def get_system_metrics():
                 load_average = []
 
         # Linux /proc/stat for true CPU utilization percentage if accessible
-        if Path("/proc/stat").exists():
-            try:
+        try:
+            stat_path = Path("/proc/stat")
+            if stat_path.exists():
                 def _read_cpu_stat():
-                    with open("/proc/stat", "r") as f:
+                    with open(stat_path, "r") as f:
                         for line in f:
                             if line.startswith("cpu "):
                                 parts = [float(x) for x in line.split()[1:]]
@@ -317,14 +337,15 @@ def get_system_metrics():
                         idle_delta = id2 - id1
                         tot_delta = tot2 - tot1
                         cpu_percent = round((1.0 - (idle_delta / tot_delta)) * 100, 1)
-            except Exception:
-                pass
+        except (Exception, OSError):
+            pass
 
         # Linux /proc/meminfo parsing
-        if Path("/proc/meminfo").exists():
-            try:
+        try:
+            mem_path = Path("/proc/meminfo")
+            if mem_path.exists():
                 meminfo = {}
-                with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                with open(mem_path, "r", encoding="utf-8") as f:
                     for line in f:
                         parts = line.split()
                         if len(parts) >= 2 and parts[1].isdigit():
@@ -339,8 +360,8 @@ def get_system_metrics():
                 used_mem_mb = round(total_mem_mb - avail_mem_mb, 1)
                 if total_mem_mb > 0:
                     mem_pct = round((used_mem_mb / total_mem_mb) * 100, 1)
-            except Exception:
-                pass
+        except (Exception, OSError):
+            pass
 
         if total_mem_mb <= 0:
             mem_raw = run_cmd("free -h")
@@ -758,10 +779,18 @@ def cmd_heartbeat(args=None):
     workload_metrics = get_workload_metrics()
     now = get_current_iso_timestamp()
 
+    node_config = load_node_config() or {}
+    caps = dict(node_config.get("capabilities", {}))
+    if is_docker_available():
+        caps["container_runtime:docker"] = True
+    if is_udocker_available():
+        caps["container_runtime:udocker"] = True
+
     payload_data = {
         "node_id": node_id,
         "status": "online",
         "timestamp": now,
+        "capabilities": caps,
         "services": services_state,
         "workloads": workload_metrics,
         "system": {
