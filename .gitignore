@@ -1,7 +1,12 @@
 # Local node configuration
 config/node.json
+config/node.conf
+config/controller.json
 config/network.json
 config/services.json
+
+# Scratch & temporary test scripts
+scratch/
 
 # Secrets
 config/secrets/*
