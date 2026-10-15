@@ -27,6 +27,7 @@ backups/
 *.pid
 *.bak
 
+
 # Python bytecode & cache
 __pycache__/
 *.py[cod]
@@ -37,6 +38,7 @@ __pycache__/
 # Ephemeral application sandboxes
 storage/applications/*/
 !storage/applications/.gitkeep
+storage/
 
 # IDE and OS files
 .vscode/
