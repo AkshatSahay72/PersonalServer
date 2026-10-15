@@ -1482,6 +1482,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
         self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path.startswith("/api/"):
+            path = path[4:]
         query = urllib.parse.parse_qs(parsed.query)
 
         # GET /health or GET /status
@@ -2117,6 +2119,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
         self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path.startswith("/api/"):
+            path = path[4:]
         query = urllib.parse.parse_qs(parsed.query)
         body = self.read_json_body()
         if body and isinstance(body, dict):

@@ -367,6 +367,15 @@ async function loadDashboard() {
           if (document.getElementById("sys-metric-uptime")) document.getElementById("sys-metric-uptime").textContent = sys.uptime ? formatDuration(sys.uptime) : (primary.last_seen ? timeAgo(primary.last_seen) : 'active');
         }
       }
+    } else {
+      const tbody = document.getElementById("dash-nodes-tbody");
+      if (tbody) {
+        tbody.innerHTML = `<tr><td colspan="6" class="cell-muted" style="color: var(--status-red);">Failed to load cluster nodes: ${clusterData.reason?.message || "Endpoint unavailable"}</td></tr>`;
+      }
+      const sumClusterMain = document.getElementById("sum-card-cluster-main");
+      if (sumClusterMain) sumClusterMain.textContent = "Unavailable";
+      const sumClusterSub = document.getElementById("sum-card-cluster-sub");
+      if (sumClusterSub) sumClusterSub.textContent = "Cluster API offline";
     }
 
     // Jobs Summary & Recent Jobs Table
@@ -401,6 +410,15 @@ async function loadDashboard() {
           `;
         }).join("");
       }
+    } else {
+      const jobsTbody = document.getElementById("dash-jobs-tbody");
+      if (jobsTbody) {
+        jobsTbody.innerHTML = `<tr><td colspan="4" class="cell-muted" style="color: var(--status-red);">Failed to load recent jobs: ${jobsData.reason?.message || "Endpoint unavailable"}</td></tr>`;
+      }
+      const sumJobsMain = document.getElementById("sum-card-jobs-main");
+      if (sumJobsMain) sumJobsMain.textContent = "Unavailable";
+      const sumJobsSub = document.getElementById("sum-card-jobs-sub");
+      if (sumJobsSub) sumJobsSub.textContent = "Jobs API offline";
     }
 
     // Storage Summary
@@ -973,7 +991,11 @@ async function triggerManualHAFailover() {
   }
 
   try {
-    const res = await apiFetch("/api/ha/failover", { method: "POST" });
+    const res = await apiFetch("/api/ha/failover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
     if (res.status === "failed") {
       showToast(`Failover notice: ${res.error || 'No standby controller available'}`, "warning");
     } else {
@@ -1010,7 +1032,13 @@ async function loadNodes() {
       apiFetch("/api/cluster"),
       apiFetch("/api/cluster/utilization")
     ]);
-    const data = clusterRes.status === "fulfilled" ? clusterRes.value : { nodes: [] };
+    if (clusterRes.status !== "fulfilled") {
+      tbody.innerHTML = `<tr><td colspan="10" class="cell-muted" style="color: var(--status-red);">Failed to load cluster nodes: ${clusterRes.reason?.message || "Endpoint unavailable"}</td></tr>`;
+      const countHdr = document.getElementById("nodes-count-header");
+      if (countHdr) countHdr.textContent = "0 online · Unavailable";
+      return;
+    }
+    const data = clusterRes.value || { nodes: [] };
     cachedUtilMap = (utilRes.status === "fulfilled" && utilRes.value?.nodes) ? utilRes.value.nodes : {};
 
     cachedNodes = (data.nodes || []).filter(n => n.status !== "REMOVED");
@@ -1364,7 +1392,25 @@ window.openNodeDiagnosticsModal = async function(nodeId) {
   if (modal) modal.style.display = "flex";
 
   try {
-    const res = await apiFetch(`/api/nodes/${nodeId}/diagnostics`);
+    let res;
+    try {
+      res = await apiFetch(`/api/nodes/${nodeId}/diagnostics`);
+    } catch (e) {
+      if (node.last_heartbeat) {
+        res = {
+          status: (node.status || "").toLowerCase(),
+          live: false,
+          error: `Live agent diagnostics route unavailable (${e.message}). Displaying cached heartbeat telemetry.`,
+          battery: node.last_heartbeat?.battery || node.last_heartbeat?.system?.battery,
+          network: node.last_heartbeat?.network || node.last_heartbeat?.system?.network,
+          cpu: node.last_heartbeat?.cpu_details || node.last_heartbeat?.system?.cpu_details,
+          thermals: node.last_heartbeat?.thermals || node.last_heartbeat?.system?.thermals,
+          timestamp: node.last_seen || node.last_heartbeat?.timestamp
+        };
+      } else {
+        throw e;
+      }
+    }
     const diag = res.diagnostics || res;
 
     const isOffline = diag.status === "offline" || (node.status || "").toUpperCase() === "OFFLINE";
