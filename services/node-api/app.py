@@ -46,6 +46,7 @@ STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 
 DEFAULT_CONTROLLER_URL = os.environ.get("PERSONALSERVER_CONTROLLER_URL", "http://127.0.0.1:8000")
 DEFAULT_ROUTER_URL = os.environ.get("PERSONALSERVER_ROUTER_URL", "http://127.0.0.1:8088")
+_CACHED_ACTIVE_CONTROLLER_URL = None
 
 
 class ProxyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -474,8 +475,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             return None
 
     def proxy_to_controller(self, method, subpath, query_str="", body_bytes=None):
+        global _CACHED_ACTIVE_CONTROLLER_URL
         config = load_config()
-        controller_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+        configured_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+        controller_url = _CACHED_ACTIVE_CONTROLLER_URL or configured_url
         target_url = f"{controller_url}{subpath}"
         if query_str:
             target_url += f"?{query_str}"
@@ -510,14 +513,39 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(resp_data)
+                return
         except urllib.error.HTTPError as e:
             err_body = e.read()
+            # If controller rejected with 503 because it is in STANDBY mode, follow leader redirect
+            if e.code == 503:
+                try:
+                    err_json = json.loads(err_body.decode("utf-8"))
+                    new_leader_url = err_json.get("leader_url")
+                    if new_leader_url and new_leader_url.rstrip("/") != controller_url:
+                        _CACHED_ACTIVE_CONTROLLER_URL = new_leader_url.rstrip("/")
+                        retry_target = f"{_CACHED_ACTIVE_CONTROLLER_URL}{subpath}"
+                        if query_str:
+                            retry_target += f"?{query_str}"
+                        retry_req = urllib.request.Request(retry_target, data=body_bytes, headers=headers, method=method)
+                        with urllib.request.urlopen(retry_req, timeout=timeout_sec) as retry_resp:
+                            retry_data = retry_resp.read()
+                            self.send_response(retry_resp.status)
+                            self.send_header("Content-Type", retry_resp.headers.get("Content-Type", "application/json"))
+                            self.send_header("Content-Length", str(len(retry_data)))
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            self.end_headers()
+                            self.wfile.write(retry_data)
+                            return
+                except Exception:
+                    pass
+
             self.send_response(e.code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(err_body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(err_body)
+            return
         except Exception as initial_err:
             # Trigger HA master auto-discovery across candidate controller URLs
             try:
@@ -526,11 +554,14 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 candidates = [u.strip().rstrip("/") for u in env_candidates.split(",") if u.strip()]
                 if controller_url not in candidates:
                     candidates.append(controller_url)
+                if configured_url not in candidates:
+                    candidates.append(configured_url)
                 if DEFAULT_CONTROLLER_URL not in candidates:
                     candidates.append(DEFAULT_CONTROLLER_URL)
 
                 active_url, leader_info = find_active_leader(candidates, exclude_url=controller_url)
                 if active_url:
+                    _CACHED_ACTIVE_CONTROLLER_URL = active_url
                     retry_target = f"{active_url}{subpath}"
                     if query_str:
                         retry_target += f"?{query_str}"
@@ -923,8 +954,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             return
 
         # 8a2. Node Diagnostics: GET /api/nodes/<node_id>/diagnostics or /nodes/<node_id>/diagnostics
-        if (path.startswith("/api/nodes/") or path.startswith("/nodes/")) and path.endswith("/diagnostics"):
-            parts = path.strip("/").split("/")
+        norm_path = path.rstrip("/")
+        if (norm_path.startswith("/api/nodes/") or norm_path.startswith("/nodes/")) and norm_path.endswith("/diagnostics"):
+            parts = norm_path.strip("/").split("/")
             nid = parts[-2]
             config = load_config()
             local_id = config.get("NODE_ID", config.get("node_id", ""))
@@ -936,8 +968,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     self.send_json(200, {"node_id": local_id or nid, "diagnostics": diag_res})
                     return
                 except Exception as e:
-                    pass
-            subpath = path[4:] if path.startswith("/api/") else path
+                    self.send_json(500, {"error": f"Diagnostics error: {e}"})
+                    return
+            subpath = norm_path[4:] if norm_path.startswith("/api/") else norm_path
             self.proxy_to_controller("GET", subpath, parsed.query)
             return
 

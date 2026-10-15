@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PersonalServer - Server Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=1.5.0">
+  <link rel="stylesheet" href="/static/style.css?v=1.6.2">
 </head>
 <body>
   <div class="app-layout">
@@ -72,10 +72,13 @@
           </div>
         </div>
         <div class="topbar-actions mono">
-          <div class="topbar-meta-item">
-            <span class="cell-muted">HA Master:</span>
-            <span id="topbar-ha-status" class="ha-badge ha-badge-leader" title="Cluster High Availability Master">👑 Master (Leader)</span>
-          </div>
+          <button type="button" id="topbar-ha-btn" class="topbar-ha-btn mono" onclick="openHADetailsModal()" title="View High Availability Cluster Details" aria-haspopup="dialog" aria-label="High Availability Cluster Status">
+            <span class="ha-status-dot ha-dot-unknown" id="ha-header-dot"></span>
+            <span class="ha-header-label">Leader: <strong id="ha-header-leader">-</strong></span>
+            <span class="ha-header-term" id="ha-header-term">Term: -</span>
+            <span class="ha-header-status-badge ha-status-unknown" id="ha-header-status">Checking...</span>
+          </button>
+          <span id="topbar-ha-status" style="display:none"></span>
           <div class="topbar-meta-item">
             <span class="cell-muted">Cluster:</span>
             <span id="topbar-cluster-status" class="text-online">2 online</span>
@@ -245,15 +248,15 @@
         <div class="ha-banner section-card" id="ha-cluster-banner" style="margin-bottom: 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
             <div style="display: flex; align-items: center; gap: 10px;">
-              <span class="ha-badge ha-badge-leader" id="ha-banner-role">👑 Master (Leader)</span>
+              <span class="ha-badge ha-badge-standby" id="ha-banner-role">Checking...</span>
               <div>
-                <span class="mono" style="font-weight: 600; font-size: 0.92rem;" id="ha-banner-title">High Availability Active</span>
-                <div class="cell-muted mono" style="font-size: 0.78rem;" id="ha-banner-sub">Leader: <span id="ha-banner-leader-id" style="color:#e6edf3;">node-pc</span> · Term: <span id="ha-banner-term">1</span> · Auto-failover ready</div>
+                <span class="mono" style="font-weight: 600; font-size: 0.92rem;" id="ha-banner-title">High Availability Cluster</span>
+                <div class="cell-muted mono" style="font-size: 0.78rem;" id="ha-banner-sub">Leader: <span id="ha-banner-leader-id" style="color:#e6edf3;">-</span> · Term: <span id="ha-banner-term">-</span> · <span id="ha-banner-status-desc">Checking cluster status...</span></div>
               </div>
             </div>
             <div style="display: flex; gap: 8px; align-items: center;">
-              <span class="badge badge-success mono" id="ha-banner-standbys">1 Standby Synced</span>
-              <button class="btn btn-sm btn-secondary" id="ha-failover-btn" onclick="triggerManualHAFailover()" title="Simulate Master failure or transfer leadership">⚡ Simulate Failover</button>
+              <span class="badge badge-secondary mono" id="ha-banner-standbys">- Standbys</span>
+              <button class="btn btn-sm btn-secondary" id="ha-failover-btn" onclick="triggerManualHAFailover()" title="Simulate Master failure or transfer leadership">Simulate Failover</button>
             </div>
           </div>
         </div>
@@ -291,7 +294,7 @@
           <div class="section-header">
             <span class="section-title" id="node-detail-title">Node Details</span>
             <div style="display: flex; gap: 8px; align-items: center;">
-              <button class="btn btn-sm btn-primary" id="node-detail-diag-btn" onclick="runNodeDetailDiagnostics()">⚡ Live Diagnostics &amp; Speed</button>
+              <button class="btn btn-sm btn-primary" id="node-detail-diag-btn" onclick="runNodeDetailDiagnostics()">Live Diagnostics &amp; Speed</button>
               <span id="node-lifecycle-actions" style="display: inline-flex; gap: 6px;"></span>
               <button class="btn btn-sm" onclick="closeNodeDetail()">Close</button>
             </div>
@@ -307,10 +310,23 @@
 
       <!-- 3. JOBS VIEW -->
       <section id="view-jobs" class="page-view">
-        <!-- Submit Job Form -->
-        <div class="section-card">
+        <!-- Jobs Section Header / Controls -->
+        <div class="view-header-bar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <div>
+            <h2 style="margin: 0; font-size: 16px; font-weight: 600;">Workload Jobs</h2>
+            <div class="cell-muted" style="font-size: 12px;">Execution history, scheduling lifecycle, and safe workload cancellation</div>
+          </div>
+          <div class="jobs-header-actions">
+            <button id="toggle-submit-job-btn" class="btn btn-sm btn-primary" onclick="toggleSubmitJobCard()">+ Submit Workload</button>
+            <button class="btn btn-sm" onclick="loadJobs()" title="Refresh Jobs">⟳ Refresh</button>
+          </div>
+        </div>
+
+        <!-- Submit Job Form (Collapsible, accessible without dominating the page) -->
+        <div id="job-submit-card" class="section-card" style="display: none; margin-bottom: 16px;">
           <div class="section-header">
             <span class="section-title">Submit Workload Job</span>
+            <button class="btn btn-sm" onclick="toggleSubmitJobCard(false)">Cancel</button>
           </div>
           <form id="job-submit-form" class="job-form">
             <div class="form-grid">
@@ -327,7 +343,7 @@
                 </select>
               </div>
               <div class="form-cell">
-                <label for="job-target">Target</label>
+                <label for="job-target">Target Node</label>
                 <select id="job-target" class="form-input mono">
                   <option value="auto">Auto (Scheduler)</option>
                 </select>
@@ -341,30 +357,71 @@
                 <input type="text" id="job-params" class="form-input mono" placeholder='{"message": "ping"}'>
               </div>
               <div class="form-cell form-btn-cell">
-                <button type="submit" class="btn btn-primary">Submit Job</button>
+                <button type="submit" class="btn btn-primary">Dispatch Job</button>
               </div>
             </div>
           </form>
         </div>
 
-        <!-- Jobs History -->
+        <!-- Jobs Execution History -->
         <div class="section-card">
           <div class="section-header">
             <span class="section-title">Execution History</span>
             <span class="mono cell-muted" id="jobs-count-header">0 total jobs</span>
           </div>
-          <div class="table-container">
+
+          <!-- Filter & Search Toolbar -->
+          <div class="jobs-toolbar">
+            <div class="jobs-search-wrap">
+              <input type="text" id="jobs-search-input" class="form-input form-input-sm mono" placeholder="Search by Job ID, workload or node...">
+            </div>
+            <select id="jobs-filter-status" class="form-input form-input-sm jobs-filter-select">
+              <option value="all">All Statuses</option>
+              <option value="QUEUED">Queued</option>
+              <option value="CLAIMED">Claimed</option>
+              <option value="RUNNING">Running</option>
+              <option value="RECOVERING">Recovering</option>
+              <option value="SUCCEEDED">Succeeded</option>
+              <option value="FAILED">Failed</option>
+              <option value="CANCELLED">Cancelled</option>
+              <option value="TIMEOUT">Timeout</option>
+              <option value="REJECTED">Rejected</option>
+            </select>
+            <select id="jobs-filter-type" class="form-input form-input-sm jobs-filter-select">
+              <option value="all">All Workloads</option>
+              <option value="system-info">system-info</option>
+              <option value="health-check">health-check</option>
+              <option value="node-status">node-status</option>
+              <option value="echo">echo</option>
+              <option value="python-script">python-script</option>
+              <option value="failing-test">failing-test</option>
+              <option value="timeout-test">timeout-test</option>
+              <option value="docker-deploy">docker-deploy</option>
+            </select>
+            <select id="jobs-filter-node" class="form-input form-input-sm mono jobs-filter-select">
+              <option value="all">All Nodes</option>
+            </select>
+            <select id="jobs-sort-by" class="form-input form-input-sm jobs-filter-select">
+              <option value="recent">Recent First</option>
+              <option value="oldest">Oldest First</option>
+              <option value="duration">Longest Duration</option>
+            </select>
+            <button id="jobs-reset-filters-btn" class="btn btn-sm" onclick="resetJobFilters()">Reset</button>
+          </div>
+
+          <!-- Table Container -->
+          <div class="table-container" style="overflow-x: auto;">
             <table class="data-table">
               <thead>
                 <tr>
-                  <th style="width: 130px;">Job ID</th>
+                  <th style="width: 140px;">Job ID</th>
                   <th>Workload</th>
-                  <th>Assigned Node</th>
+                  <th>Target Node</th>
                   <th style="width: 110px;">Status</th>
                   <th>Attempt</th>
                   <th>Duration</th>
-                  <th>Created</th>
-                  <th style="width: 70px; text-align: right;">Action</th>
+                  <th>Submitted</th>
+                  <th style="width: 130px; text-align: right;">Actions</th>
                 </tr>
               </thead>
               <tbody id="jobs-tbody">
@@ -372,20 +429,51 @@
               </tbody>
             </table>
           </div>
+
+          <!-- Pagination Bar -->
+          <div class="jobs-pagination">
+            <div id="jobs-pagination-info" class="mono">Showing 0-0 of 0 jobs</div>
+            <div class="jobs-page-size-wrap">
+              <span>Show:</span>
+              <select id="jobs-page-size-select" class="form-input form-input-sm mono" onchange="changeJobPageSize(this.value)">
+                <option value="10">10</option>
+                <option value="25" selected>25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </div>
+            <div class="jobs-pagination-controls">
+              <button id="jobs-prev-btn" class="btn btn-sm" onclick="changeJobPage(-1)" disabled>Previous</button>
+              <span id="jobs-page-number" class="mono" style="padding: 0 4px;">Page 1 of 1</span>
+              <button id="jobs-next-btn" class="btn btn-sm" onclick="changeJobPage(1)" disabled>Next</button>
+            </div>
+          </div>
         </div>
 
         <!-- Job Details Panel -->
-        <div id="job-detail-panel" class="section-card" style="display:none">
+        <div id="job-detail-panel" class="section-card" style="display:none; margin-top: 16px;">
           <div class="section-header">
-            <span class="section-title" id="job-detail-title">Job Details</span>
-            <button class="btn btn-sm" onclick="closeJobDetail()">Close</button>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="section-title" id="job-detail-title">Job Details</span>
+              <span id="job-detail-status-pill"></span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <button id="job-detail-cancel-btn" class="btn btn-sm btn-cancel-job" style="display:none;" onclick="cancelJobFromDetail()">Cancel Job</button>
+              <button class="btn btn-sm" onclick="closeJobDetail()">Close</button>
+            </div>
           </div>
           <div class="detail-content">
             <div class="detail-grid mono" id="job-detail-summary">
               <!-- Dynamic -->
             </div>
-            <div class="code-header mono">Execution Output:</div>
-            <pre id="job-detail-stdout" class="log-box mono"></pre>
+            <div style="margin-top: 12px;">
+              <div class="code-header mono">Workload Parameters:</div>
+              <pre id="job-detail-params" class="log-box mono" style="max-height: 120px;"></pre>
+            </div>
+            <div style="margin-top: 12px;">
+              <div class="code-header mono">Execution Output:</div>
+              <pre id="job-detail-stdout" class="log-box mono" style="max-height: 280px;"></pre>
+            </div>
           </div>
         </div>
       </section>
@@ -513,17 +601,51 @@
 
       <!-- 5. APPLICATIONS VIEW -->
       <section id="view-apps" class="page-view">
-        <!-- Application Deployment Card -->
-        <div class="section-card">
-          <div class="section-header" style="display: flex; justify-content: space-between; align-items: center;">
-            <span class="section-title">Application Deployment</span>
-            <div style="display: flex; gap: 8px;">
-              <button class="btn btn-sm btn-primary" id="btn-show-deploy" onclick="showDeployContainer()">+ Deploy Application</button>
-            </div>
+        <!-- Applications Header Row -->
+        <div class="apps-header-row">
+          <div>
+            <h2 class="apps-page-title">Applications</h2>
+            <p class="apps-page-desc">Manage, deploy, and route containerized services and Git repositories across cluster nodes.</p>
           </div>
+          <div class="apps-header-actions">
+            <button class="btn btn-sm" id="btn-refresh-apps" onclick="loadApps()" title="Refresh applications">Refresh</button>
+            <button class="btn btn-sm btn-primary" id="btn-show-deploy" onclick="showDeployContainer()">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="margin-right: 4px; vertical-align: -1px;"><path d="M8 2a.75.75 0 0 1 .75.75v4.5h4.5a.75.75 0 0 1 0 1.5h-4.5v4.5a.75.75 0 0 1-1.5 0v-4.5h-4.5a.75.75 0 0 1 0-1.5h4.5v-4.5A.75.75 0 0 1 8 2Z"/></svg>
+              Deploy Application
+            </button>
+          </div>
+        </div>
 
-          <!-- Unified PaaS Application Deployment Container -->
-          <div id="unified-deploy-container" style="display: none; padding: 16px 20px; border-top: 1px solid var(--border-color);">
+        <!-- 4-Metric Infrastructure Summary Strip -->
+        <div class="apps-metrics-strip">
+          <div class="apps-metric-card">
+            <div class="apps-metric-label">Total Services</div>
+            <div class="apps-metric-value" id="apps-metric-total">0</div>
+          </div>
+          <div class="apps-metric-card">
+            <div class="apps-metric-label">Running</div>
+            <div class="apps-metric-value text-online" id="apps-metric-running">0</div>
+          </div>
+          <div class="apps-metric-card">
+            <div class="apps-metric-label">Stopped / Inactive</div>
+            <div class="apps-metric-value cell-muted" id="apps-metric-stopped">0</div>
+          </div>
+          <div class="apps-metric-card">
+            <div class="apps-metric-label">Failed / Degraded</div>
+            <div class="apps-metric-value text-offline" id="apps-metric-failed">0</div>
+          </div>
+        </div>
+
+        <!-- Unified PaaS Application Deployment Drawer -->
+        <div id="unified-deploy-container" class="section-card deploy-drawer" style="display: none;">
+          <div class="section-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="section-title">Deploy New Application</span>
+              <span class="cell-muted" style="font-size: 11px;">Container Image or Git Repository</span>
+            </div>
+            <button type="button" class="btn btn-sm" onclick="hideDeployContainer()">Cancel</button>
+          </div>
+          <div style="padding: 16px 20px;">
             <form id="app-unified-deploy-form">
               <!-- Source Selection -->
               <div style="margin-bottom: 14px;">
@@ -662,29 +784,40 @@
           </div>
         </div>
 
-        <!-- Applications Table -->
-        <div class="section-card">
-          <div class="section-header">
-            <span class="section-title">Applications</span>
-            <span class="mono cell-muted" id="apps-count-header">0 applications</span>
+        <!-- Applications Main Container -->
+        <div class="section-card apps-list-card">
+          <div class="section-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="section-title">Deployed Services</span>
+              <span class="mono cell-muted" id="apps-count-header">0 applications</span>
+            </div>
+            <div class="apps-filter-wrap">
+              <input type="text" id="apps-filter-input" class="form-input mono" placeholder="Filter applications..." oninput="filterAppsList(this.value)">
+            </div>
           </div>
-          <div class="table-container">
-            <table class="data-table">
+
+          <!-- Desktop Table Container -->
+          <div class="table-container apps-table-container">
+            <table class="data-table apps-table">
               <thead>
                 <tr>
-                  <th>Application</th>
-                  <th>Source</th>
-                  <th style="width: 110px;">Status</th>
-                  <th>Route / Endpoint</th>
-                  <th>Node</th>
-                  <th style="width: 110px;">Port</th>
-                  <th style="width: 280px; text-align: right;">Actions</th>
+                  <th style="width: 25%;">Application</th>
+                  <th style="width: 13%;">Status</th>
+                  <th style="width: 18%;">Source</th>
+                  <th style="width: 16%;">Route &amp; Endpoint</th>
+                  <th style="width: 14%;">Target &amp; Port</th>
+                  <th style="width: 14%; text-align: right;">Actions</th>
                 </tr>
               </thead>
               <tbody id="apps-tbody">
-                <tr><td colspan="7" class="cell-muted">Loading applications...</td></tr>
+                <tr><td colspan="6" class="cell-muted">Loading applications...</td></tr>
               </tbody>
             </table>
+          </div>
+
+          <!-- Mobile Cards Container -->
+          <div id="apps-cards-container" class="apps-cards-container">
+            <!-- Rendered dynamically for mobile viewports -->
           </div>
         </div>
 
@@ -904,7 +1037,7 @@
   <div id="node-diag-modal-backdrop" class="modal-backdrop" style="display:none">
     <div class="modal-frame" style="max-width: 760px; width: 92%;" role="dialog" aria-modal="true">
       <div class="modal-header">
-        <span class="modal-title mono" id="diag-modal-title">⚡ Live Node Diagnostics</span>
+        <span class="modal-title mono" id="diag-modal-title">Node Diagnostics</span>
         <button type="button" class="modal-close-btn" onclick="closeNodeDiagModal()" title="Close (Esc)">✕</button>
       </div>
       <div class="modal-body" style="max-height: 75vh; overflow-y: auto;">
@@ -917,11 +1050,70 @@
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-sm" onclick="closeNodeDiagModal()">Close</button>
-        <button type="button" class="btn btn-sm btn-primary" id="diag-modal-rerun-btn" onclick="rerunCurrentNodeDiag()">⚡ Re-run Test</button>
+        <button type="button" class="btn btn-sm btn-primary" id="diag-modal-rerun-btn" onclick="rerunCurrentNodeDiag()">Run Test</button>
       </div>
     </div>
   </div>
 
-  <script src="/static/app.js?v=1.6.0"></script>
+  <!-- High Availability (HA) Cluster Details Modal -->
+  <div id="ha-details-modal-backdrop" class="modal-backdrop" style="display:none">
+    <div class="modal-frame" style="max-width: 620px; width: 92%;" role="dialog" aria-modal="true" aria-labelledby="ha-modal-title">
+      <div class="modal-header">
+        <span class="modal-title mono" id="ha-modal-title">Cluster High Availability</span>
+        <button type="button" class="modal-close-btn" onclick="closeHADetailsModal()" title="Close (Esc)">✕</button>
+      </div>
+      <div class="modal-body" style="max-height: 75vh; overflow-y: auto;">
+        <div id="ha-modal-status-banner" style="margin-bottom: 14px; padding: 12px 14px; border-radius: 6px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-subtle);">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="ha-status-dot" id="ha-modal-dot" style="width: 10px; height: 10px;"></span>
+            <div>
+              <div style="font-weight: 600; font-size: 14px;" id="ha-modal-status-text">Active Leader</div>
+              <div class="mono cell-muted" style="font-size: 11px;" id="ha-modal-status-sub">Authoritative Controller via /api/ha/status</div>
+            </div>
+          </div>
+          <span class="ha-header-status-badge" id="ha-modal-badge">Active</span>
+        </div>
+
+        <div class="ha-modal-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-bottom: 14px;">
+          <div class="summary-col" style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 6px; border: 1px solid var(--border-subtle);">
+            <div class="summary-label">Current Leader Node</div>
+            <div class="summary-value mono" id="ha-modal-leader-id" style="font-size: 13px; word-break: break-all;">-</div>
+            <div class="summary-sub mono" id="ha-modal-leader-name">-</div>
+          </div>
+          <div class="summary-col" style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 6px; border: 1px solid var(--border-subtle);">
+            <div class="summary-label">Election Term &amp; Version</div>
+            <div class="summary-value mono" id="ha-modal-term" style="font-size: 13px;">Term -</div>
+            <div class="summary-sub mono" id="ha-modal-version">State Version -</div>
+          </div>
+          <div class="summary-col" style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 6px; border: 1px solid var(--border-subtle);">
+            <div class="summary-label">Leader Lease &amp; Health</div>
+            <div class="summary-value mono" id="ha-modal-lease" style="font-size: 13px;">Valid</div>
+            <div class="summary-sub mono" id="ha-modal-lease-time">-</div>
+          </div>
+          <div class="summary-col" style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 6px; border: 1px solid var(--border-subtle);">
+            <div class="summary-label">Synchronized Standbys</div>
+            <div class="summary-value mono" id="ha-modal-standbys" style="font-size: 13px;">0 Standbys</div>
+            <div class="summary-sub mono" id="ha-modal-partition-safe">Partition Safe: True</div>
+          </div>
+        </div>
+
+        <div id="ha-modal-standbys-wrap" style="margin-bottom: 12px;">
+          <div class="summary-label" style="margin-bottom: 6px;">Standby Controllers &amp; Peers</div>
+          <div id="ha-modal-standbys-list" class="mono" style="font-size: 11px; background: rgba(0,0,0,0.25); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 8px 10px; max-height: 120px; overflow-y: auto;">
+            None registered
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+        <button type="button" class="btn btn-sm btn-secondary" id="ha-modal-view-node-btn" onclick="viewLeaderNodeFromModal()">View Leader Node</button>
+        <div style="display: flex; gap: 8px;">
+          <button type="button" class="btn btn-sm" onclick="closeHADetailsModal()">Close</button>
+          <button type="button" class="btn btn-sm btn-outline-warning" id="ha-modal-failover-btn" onclick="triggerFailoverFromModal()">Simulate Failover</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=1.6.2"></script>
 </body>
 </html>

@@ -14,6 +14,7 @@ import time
 import subprocess
 import urllib.request
 import urllib.error
+import threading
 from pathlib import Path
 
 from config.structured_logger import redact_sensitive_text, extract_correlation_id
@@ -145,6 +146,70 @@ def truncate_output(text, max_bytes=MAX_OUTPUT_BYTES):
 class JobExecutor:
     """Executes validated workloads under PersonalServer user permissions."""
 
+    _ACTIVE_JOBS = {}
+    _ACTIVE_JOBS_LOCK = threading.Lock()
+
+    @classmethod
+    def terminate_active_job(cls, job_id: str, reason: str = "Cancelled by operator") -> dict:
+        """
+        Safely and cooperatively terminates an actively executing child process or container for job_id.
+        """
+        with cls._ACTIVE_JOBS_LOCK:
+            info = cls._ACTIVE_JOBS.get(job_id)
+            if not info:
+                return {
+                    "supported": True,
+                    "terminated": False,
+                    "found": False,
+                    "message": f"Job '{job_id}' is not actively executing on this worker."
+                }
+            info["cancelled"] = True
+            info["cancel_reason"] = reason
+            proc = info.get("proc")
+            container_name = info.get("container_name")
+
+        terminated_any = False
+        if proc:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+                    terminated_any = True
+            except Exception as e:
+                return {"supported": True, "terminated": False, "error": f"Failed to terminate process: {e}"}
+
+        if container_name:
+            try:
+                runtime = detect_container_runtime()
+                if runtime == "docker":
+                    subprocess.run(["docker", "stop", "-t", "2", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    terminated_any = True
+                elif runtime == "udocker":
+                    pid_file = RUNTIME_DIR / f"{container_name}.pid"
+                    if pid_file.exists():
+                        try:
+                            pid = int(pid_file.read_text().strip())
+                            os.kill(pid, 9)
+                        except Exception:
+                            pass
+                        pid_file.unlink(missing_ok=True)
+                    subprocess.run(["udocker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    terminated_any = True
+            except Exception:
+                pass
+
+        return {
+            "supported": True,
+            "terminated": terminated_any,
+            "job_id": job_id,
+            "message": f"Active workload for job '{job_id}' terminated."
+        }
+
     @staticmethod
     def is_allowed(job_type):
         return job_type in ALLOWLISTED_WORKLOADS
@@ -191,6 +256,17 @@ class JobExecutor:
         started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time))
         corr_id = job.get("correlation_id") or extract_correlation_id(body=job)
         attempt = int(job.get("attempt", 1))
+
+        with JobExecutor._ACTIVE_JOBS_LOCK:
+            JobExecutor._ACTIVE_JOBS[job_id] = {
+                "proc": None,
+                "type": job_type,
+                "job": job,
+                "container_name": None,
+                "started_at": start_time,
+                "cancelled": False,
+                "cancel_reason": None
+            }
 
         cmd = []
         custom_script = None
@@ -428,6 +504,9 @@ class JobExecutor:
                 app_id = params.get("app_id", "app")
                 app_name = validate_docker_identifier(params.get("app_name") or params.get("name") or "app", "Application Name")
                 container_name = validate_docker_identifier(params.get("container_name") or f"ps-{app_name}", "Container Name")
+                with JobExecutor._ACTIVE_JOBS_LOCK:
+                    if job_id in JobExecutor._ACTIVE_JOBS:
+                        JobExecutor._ACTIVE_JOBS[job_id]["container_name"] = container_name
 
                 image = params.get("image")
                 source_dir = params.get("source_dir") or params.get("build_context")
@@ -886,12 +965,30 @@ class JobExecutor:
                 text=True,
                 cwd=str(BASE_DIR)
             )
+            with JobExecutor._ACTIVE_JOBS_LOCK:
+                if job_id in JobExecutor._ACTIVE_JOBS:
+                    JobExecutor._ACTIVE_JOBS[job_id]["proc"] = proc
+                    if JobExecutor._ACTIVE_JOBS[job_id]["cancelled"]:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+
             raw_stdout, raw_stderr = proc.communicate(timeout=timeout_sec)
             exit_code = proc.returncode
             stdout_str = truncate_output(raw_stdout)
             stderr_str = truncate_output(raw_stderr)
 
-            if exit_code == 0:
+            with JobExecutor._ACTIVE_JOBS_LOCK:
+                job_entry = JobExecutor._ACTIVE_JOBS.get(job_id)
+                was_cancelled = bool(job_entry and job_entry.get("cancelled"))
+                cancel_reason = job_entry.get("cancel_reason") if job_entry else None
+
+            if was_cancelled:
+                status = JOB_STATE_CANCELLED
+                exit_code = -15
+                stderr_str = f"Job was cancelled: {cancel_reason or 'Cancelled by operator request'}"
+            elif exit_code == 0:
                 status = JOB_STATE_SUCCEEDED
                 # Container verification & health checks for docker-deploy
                 if job_type in ("docker-deploy", "docker-build-deploy") and locals().get("runtime") == "docker":
@@ -999,6 +1096,9 @@ class JobExecutor:
             job_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+        with JobExecutor._ACTIVE_JOBS_LOCK:
+            JobExecutor._ACTIVE_JOBS.pop(job_id, None)
 
         return result
 

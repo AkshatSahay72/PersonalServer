@@ -77,6 +77,7 @@ function navigate() {
 
   loadSession();
   loadPlatformConfig();
+  updateHAStatus();
   if (hash === "dashboard") loadDashboard();
   else if (hash === "nodes") loadNodes();
   else if (hash === "jobs") loadJobs();
@@ -104,6 +105,7 @@ function toggleMobileNav(force) {
   const isOpen = force !== undefined ? force : !sidebar.classList.contains("open");
   sidebar.classList.toggle("open", isOpen);
   if (backdrop) backdrop.classList.toggle("active", isOpen);
+  document.body.classList.toggle("drawer-open", isOpen);
   if (mobileToggle) {
     mobileToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
   }
@@ -122,6 +124,12 @@ document.querySelectorAll(".sidebar .nav-link").forEach(link => {
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && sidebar?.classList.contains("open")) {
+    toggleMobileNav(false);
+  }
+});
+
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 768 && sidebar?.classList.contains("open")) {
     toggleMobileNav(false);
   }
 });
@@ -184,22 +192,18 @@ function getFileIcon(filename, isDir) {
 
 function renderStatusPill(state) {
   const s = (state || "").toUpperCase();
-  if (s === "ONLINE" || s === "SUCCEEDED") {
-    return `<span class="text-online">${s}</span>`;
+  if (s === "ONLINE" || s === "SUCCEEDED" || s === "RUNNING") {
+    return `<span class="node-status-badge status-online"><span class="status-dot"></span>${s}</span>`;
   } else if (s === "DRAINING" || s === "DEBOARDING") {
-    return `<span class="text-warning">${s}</span>`;
-  } else if (s === "RUNNING") {
-    return `<span class="text-online">RUNNING</span>`;
+    return `<span class="node-status-badge status-draining"><span class="status-dot"></span>${s}</span>`;
   } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING" || s === "DEPLOYING" || s === "REMOVING") {
-    return `<span class="text-warning">${s}</span>`;
+    return `<span class="node-status-badge status-draining"><span class="status-dot"></span>${s}</span>`;
   } else if (s === "STOPPED" || s === "CREATED" || s === "REMOVED") {
-    return `<span class="cell-muted">${s}</span>`;
-  } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED") {
-    return `<span class="text-offline">${s}</span>`;
-  } else if (s === "OFFLINE") {
-    return `<span class="text-offline">OFFLINE</span>`;
+    return `<span class="cell-muted mono">${s}</span>`;
+  } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED" || s === "OFFLINE") {
+    return `<span class="node-status-badge status-offline"><span class="status-dot"></span>${s}</span>`;
   }
-  return `<span class="cell-muted">${s || "UNKNOWN"}</span>`;
+  return `<span class="cell-muted mono">${s || "UNKNOWN"}</span>`;
 }
 
 function updateLastRefreshed() {
@@ -428,68 +432,567 @@ async function loadDashboard() {
 
 // High Availability (HA) Status & Failover Controller
 let cachedHAStatus = null;
+let isUpdatingHA = false;
+let lastHAUpdateTimestamp = 0;
 
-async function updateHAStatus() {
-  try {
-    const ha = await apiFetch("/api/ha/status");
-    cachedHAStatus = ha;
+function resolveLeaderInfo(ha) {
+  if (!ha || typeof ha !== "object") {
+    return {
+      rawLeaderId: null,
+      leaderName: "Unknown",
+      isRegistered: false,
+      isOnline: false,
+      isVerified: false,
+      displayText: "Leader status unknown",
+      statusText: "Unknown",
+      dotClass: "ha-dot-unknown",
+      badgeClass: "ha-status-unknown"
+    };
+  }
 
-    const topbarHa = document.getElementById("topbar-ha-status");
-    if (topbarHa) {
-      if (ha.role === "leader") {
-        topbarHa.className = "ha-badge ha-badge-leader";
-        topbarHa.textContent = `👑 Master (${ha.node_id || "Active"})`;
-      } else if (ha.role === "standby") {
-        topbarHa.className = "ha-badge ha-badge-standby";
-        topbarHa.textContent = `🛡️ Standby (${ha.leader_id || "Master"})`;
-      } else {
-        topbarHa.className = "ha-badge";
-        topbarHa.textContent = `⚡ HA (${ha.role || "Standby"})`;
-      }
-      topbarHa.title = `Term: ${ha.term} · State Version: ${ha.state_version} · Standbys: ${ha.standbys_count || 0}`;
-    }
+  const rawLeaderId = ha.role === "leader" 
+    ? (ha.node_id || ha.leader_id) 
+    : (ha.leader_id || ha.node_id);
 
-    // Update banner in Nodes view if present
-    const bannerRole = document.getElementById("ha-banner-role");
-    if (bannerRole) {
-      bannerRole.textContent = ha.role === "leader" ? "👑 Master (Leader)" : "🛡️ Standby Controller";
-      bannerRole.className = ha.role === "leader" ? "ha-badge ha-badge-leader" : "ha-badge ha-badge-standby";
-    }
-    const bannerLeader = document.getElementById("ha-banner-leader-id");
-    if (bannerLeader) bannerLeader.textContent = ha.leader_id || ha.node_id || "None";
-    const bannerTerm = document.getElementById("ha-banner-term");
-    if (bannerTerm) bannerTerm.textContent = ha.term || "1";
-    const bannerStandbys = document.getElementById("ha-banner-standbys");
-    if (bannerStandbys) {
-      const cnt = ha.standbys_count || (ha.standbys ? ha.standbys.length : 0);
-      bannerStandbys.textContent = `${cnt} Standby${cnt === 1 ? '' : 's'} Synced`;
-    }
+  if (!rawLeaderId || rawLeaderId === "None" || rawLeaderId === "unknown" || rawLeaderId === "-") {
+    const isElecting = ha.role === "candidate" || ha.role === "promoting" || ha.lease_valid === false;
+    return {
+      rawLeaderId: null,
+      leaderName: isElecting ? "Electing..." : (ha.role === "fenced" ? "Fenced" : "None"),
+      isRegistered: false,
+      isOnline: false,
+      isVerified: false,
+      displayText: isElecting ? "Electing..." : (ha.role === "fenced" ? "Fenced" : "Leader status unknown"),
+      statusText: isElecting ? "Election" : (ha.role === "fenced" ? "Fenced" : (ha.role || "Unknown")),
+      dotClass: isElecting ? "ha-dot-election" : (ha.role === "fenced" ? "ha-dot-fenced" : "ha-dot-unknown"),
+      badgeClass: isElecting ? "ha-status-election" : (ha.role === "fenced" ? "ha-status-fenced" : "ha-status-unknown")
+    };
+  }
 
-    const sumHaMain = document.getElementById("sum-card-ha-main");
-    if (sumHaMain) {
-      sumHaMain.textContent = ha.role === "leader" ? "Active Master" : "Standby Controller";
-      sumHaMain.style.color = ha.role === "leader" ? "#3fb950" : "#d29922";
+  // Look up in cluster node registry
+  let regNode = null;
+  if (Array.isArray(cachedNodes) && cachedNodes.length > 0) {
+    regNode = cachedNodes.find(n => n.node_id === rawLeaderId || n.id === rawLeaderId || n.name === rawLeaderId || n.hostname === rawLeaderId);
+  }
+
+  const backendName = ha.leader_name;
+  let leaderName = rawLeaderId;
+  let isRegistered = false;
+  let isOnline = false;
+
+  if (regNode) {
+    isRegistered = true;
+    leaderName = regNode.name || regNode.hostname || regNode.node_id;
+    isOnline = (regNode.status || "").toUpperCase() === "ONLINE";
+  } else if (backendName && backendName !== rawLeaderId) {
+    leaderName = backendName;
+    isRegistered = ha.leader_registered !== false;
+    isOnline = ha.leader_online === true;
+  } else if (ha.leader_registered === true) {
+    isRegistered = true;
+    isOnline = ha.leader_online === true;
+    if (ha.leader_name) leaderName = ha.leader_name;
+  }
+
+  // Determine state & classes
+  let statusText = "Unknown";
+  let dotClass = "ha-dot-unknown";
+  let badgeClass = "ha-status-unknown";
+  let displayText = leaderName;
+  let isVerified = false;
+
+  if (ha.role === "fenced") {
+    statusText = "Fenced";
+    dotClass = "ha-dot-fenced";
+    badgeClass = "ha-status-fenced";
+    displayText = "Fenced";
+  } else if (ha.role === "candidate" || ha.role === "promoting" || ha.lease_valid === false) {
+    statusText = "Election";
+    dotClass = "ha-dot-election";
+    badgeClass = "ha-status-election";
+    displayText = "Electing...";
+  } else if (ha.role === "disabled") {
+    statusText = "Standalone";
+    dotClass = "ha-dot-unknown";
+    badgeClass = "ha-status-unknown";
+    displayText = leaderName || "Single Node";
+  } else if (!isRegistered) {
+    // Unregistered node ID (e.g. "node-pc" or unknown ID in state)
+    statusText = "Unverified";
+    dotClass = "ha-dot-unknown";
+    badgeClass = "ha-status-unknown";
+    displayText = `Leader status unknown (${rawLeaderId})`;
+  } else if (!isOnline) {
+    // Registered node in state, but currently offline (e.g. Windows PC is offline)
+    statusText = "Unverified";
+    dotClass = "ha-dot-unknown";
+    badgeClass = "ha-status-unknown";
+    displayText = `${leaderName} (Offline · Unverified)`;
+  } else if (ha.role === "leader") {
+    statusText = "Active";
+    dotClass = "ha-dot-active";
+    badgeClass = "ha-status-active";
+    displayText = leaderName;
+    isVerified = true;
+  } else if (ha.role === "standby") {
+    statusText = "Standby";
+    dotClass = "ha-dot-standby";
+    badgeClass = "ha-status-standby";
+    displayText = leaderName;
+    isVerified = true;
+  } else {
+    statusText = ha.role || "Unknown";
+    displayText = leaderName;
+  }
+
+  return {
+    rawLeaderId,
+    leaderName,
+    isRegistered,
+    isOnline,
+    isVerified,
+    displayText,
+    statusText,
+    dotClass,
+    badgeClass
+  };
+}
+
+function resolveNodeDisplayName(nodeId) {
+  if (!nodeId || nodeId === "None" || nodeId === "unknown" || nodeId === "-") return "None";
+  if (Array.isArray(cachedNodes) && cachedNodes.length > 0) {
+    const match = cachedNodes.find(n => n.node_id === nodeId || n.id === nodeId || n.hostname === nodeId || n.name === nodeId);
+    if (match) {
+      return match.name || match.hostname || match.node_id;
     }
-    const sumHaSub = document.getElementById("sum-card-ha-sub");
-    if (sumHaSub) {
-      sumHaSub.textContent = `Term ${ha.term} · Version ${ha.state_version}`;
+  }
+  return nodeId;
+}
+
+function renderHAHeader(ha) {
+  const dotEl = document.getElementById("ha-header-dot");
+  const leaderEl = document.getElementById("ha-header-leader");
+  const termEl = document.getElementById("ha-header-term");
+  const statusEl = document.getElementById("ha-header-status");
+  const btnEl = document.getElementById("topbar-ha-btn");
+
+  const info = resolveLeaderInfo(ha);
+
+  if (dotEl) dotEl.className = `ha-status-dot ${info.dotClass}`;
+  if (leaderEl) leaderEl.textContent = info.displayText;
+  if (termEl) termEl.textContent = `Term: ${ha.term !== undefined ? ha.term : '-'}`;
+  if (statusEl) {
+    statusEl.className = `ha-header-status-badge ${info.badgeClass}`;
+    statusEl.textContent = info.statusText;
+  }
+
+  if (btnEl) {
+    const standbysCount = ha.standbys_count !== undefined ? ha.standbys_count : (ha.standbys ? ha.standbys.length : 0);
+    const leaseRemaining = ha.lease_remaining_sec !== undefined ? `${ha.lease_remaining_sec}s remaining` : (ha.lease_valid ? "Valid" : "Expired");
+    const verifiedDesc = info.isVerified ? "Verified Active" : (info.isRegistered ? (info.isOnline ? "Active" : "Unverified (Offline Node)") : "Unregistered Controller ID");
+    btnEl.title = `High Availability Cluster Status\nLeader: ${info.leaderName} (${info.rawLeaderId || 'N/A'})\nLeadership State: ${verifiedDesc}\nTerm: ${ha.term || 1} · State Version: ${ha.state_version || 0}\nStatus: ${info.statusText} · Lease: ${leaseRemaining}\nStandbys: ${standbysCount} synced\nClick to view full cluster HA details`;
+    btnEl.setAttribute("aria-label", `Leader: ${info.leaderName}, Term: ${ha.term || 1}, Status: ${info.statusText}`);
+  }
+
+  // Backward-compatible fallback element
+  const legacyEl = document.getElementById("topbar-ha-status");
+  if (legacyEl) {
+    legacyEl.className = `ha-badge ${info.badgeClass}`;
+    legacyEl.textContent = `Leader: ${info.displayText} · ${info.statusText}`;
+    legacyEl.title = `Term: ${ha.term} · State Version: ${ha.state_version}`;
+  }
+
+  // Update banner in Nodes view (authoritative match)
+  const bannerRole = document.getElementById("ha-banner-role");
+  if (bannerRole) {
+    let roleText = "Controller";
+    let roleClass = "ha-badge ha-badge-standby";
+    if (ha.role === "leader") {
+      roleText = info.isVerified ? "Leader" : "Unverified Leader";
+      roleClass = info.isVerified ? "ha-badge ha-badge-leader" : "ha-badge ha-badge-standby";
+    } else if (ha.role === "standby") {
+      roleText = "Standby Controller";
+      roleClass = "ha-badge ha-badge-standby";
+    } else if (ha.role === "candidate" || ha.role === "promoting") {
+      roleText = "Election";
+      roleClass = "ha-badge ha-badge-standby";
+    } else if (ha.role === "fenced") {
+      roleText = "Fenced";
+      roleClass = "ha-badge ha-badge-standby";
     }
-  } catch (e) {
-    console.warn("Failed to update HA status:", e);
+    bannerRole.textContent = roleText;
+    bannerRole.className = roleClass;
+  }
+
+  const bannerLeader = document.getElementById("ha-banner-leader-id");
+  if (bannerLeader) {
+    bannerLeader.textContent = info.displayText;
+  }
+
+  const bannerTerm = document.getElementById("ha-banner-term");
+  if (bannerTerm) bannerTerm.textContent = ha.term !== undefined ? ha.term : "-";
+
+  const bannerDesc = document.getElementById("ha-banner-status-desc");
+  if (bannerDesc) {
+    if (info.isVerified) {
+      bannerDesc.textContent = "Auto-failover ready";
+    } else if (ha.role === "fenced") {
+      bannerDesc.textContent = "Controller fenced";
+    } else if (ha.lease_valid === false) {
+      bannerDesc.textContent = "Lease expired";
+    } else if (!info.isRegistered) {
+      bannerDesc.textContent = "Unregistered leader ID";
+    } else if (!info.isOnline) {
+      bannerDesc.textContent = "Leader node is offline";
+    } else {
+      bannerDesc.textContent = "Leadership unverified";
+    }
+  }
+
+  const bannerStandbys = document.getElementById("ha-banner-standbys");
+  if (bannerStandbys) {
+    const cnt = ha.standbys_count !== undefined ? ha.standbys_count : (ha.standbys ? ha.standbys.length : 0);
+    bannerStandbys.textContent = `${cnt} Standby${cnt === 1 ? '' : 's'} Synced`;
+  }
+
+  // Update Summary Card in Dashboard
+  const sumHaMain = document.getElementById("sum-card-ha-main");
+  if (sumHaMain) {
+    if (ha.role === "leader" && ha.lease_valid !== false && info.isVerified) {
+      sumHaMain.textContent = `Active Leader (${info.leaderName})`;
+      sumHaMain.style.color = "#3fb950";
+    } else if (ha.role === "standby" && info.isVerified) {
+      sumHaMain.textContent = `Standby Controller (Leader: ${info.leaderName})`;
+      sumHaMain.style.color = "#58a6ff";
+    } else if (ha.role === "candidate" || ha.lease_valid === false) {
+      sumHaMain.textContent = `Election in Progress`;
+      sumHaMain.style.color = "#f0883e";
+    } else if (ha.role === "fenced") {
+      sumHaMain.textContent = `Fenced Controller`;
+      sumHaMain.style.color = "#f85149";
+    } else if (!info.isVerified) {
+      sumHaMain.textContent = `Leader Unverified (${info.leaderName})`;
+      sumHaMain.style.color = "#d29922";
+    } else {
+      sumHaMain.textContent = `HA: ${ha.role || "Standalone"}`;
+      sumHaMain.style.color = "#8b949e";
+    }
+  }
+  const sumHaSub = document.getElementById("sum-card-ha-sub");
+  if (sumHaSub) {
+    sumHaSub.textContent = `Term ${ha.term !== undefined ? ha.term : '-'} · Version ${ha.state_version !== undefined ? ha.state_version : '-'}`;
   }
 }
 
-async function triggerManualHAFailover() {
-  if (!confirm("Simulate or trigger Master failover to another node in the cluster?")) {
-    return;
+function renderHAHeaderError(err) {
+  const dotEl = document.getElementById("ha-header-dot");
+  const leaderEl = document.getElementById("ha-header-leader");
+  const termEl = document.getElementById("ha-header-term");
+  const statusEl = document.getElementById("ha-header-status");
+  const btnEl = document.getElementById("topbar-ha-btn");
+
+  if (dotEl) dotEl.className = "ha-status-dot ha-dot-unknown";
+  if (leaderEl) leaderEl.textContent = "Unknown";
+  if (termEl) termEl.textContent = "Term: -";
+  if (statusEl) {
+    statusEl.className = "ha-header-status-badge ha-status-unknown";
+    statusEl.textContent = "Unreachable";
   }
+
+  const errMsg = err?.message || "Authoritative controller unreachable";
+  if (btnEl) {
+    btnEl.title = `High Availability Status: Unreachable (${errMsg})\nNever displaying stale leader information while API status is unknown.\nClick to view diagnostics.`;
+    btnEl.setAttribute("aria-label", "High Availability Status: Unreachable");
+  }
+
+  const legacyEl = document.getElementById("topbar-ha-status");
+  if (legacyEl) {
+    legacyEl.className = "ha-badge ha-badge-standby";
+    legacyEl.textContent = "HA: Unreachable";
+  }
+
+  // Update banner in Nodes view to explicit unreachable state (never showing stale node-pc)
+  const bannerRole = document.getElementById("ha-banner-role");
+  if (bannerRole) {
+    bannerRole.textContent = "Unreachable";
+    bannerRole.className = "ha-badge ha-badge-standby";
+  }
+  const bannerLeader = document.getElementById("ha-banner-leader-id");
+  if (bannerLeader) {
+    bannerLeader.textContent = "Leader status unknown";
+  }
+  const bannerTerm = document.getElementById("ha-banner-term");
+  if (bannerTerm) {
+    bannerTerm.textContent = "-";
+  }
+  const bannerDesc = document.getElementById("ha-banner-status-desc");
+  if (bannerDesc) {
+    bannerDesc.textContent = "Controller unreachable";
+  }
+  const bannerStandbys = document.getElementById("ha-banner-standbys");
+  if (bannerStandbys) {
+    bannerStandbys.textContent = "- Standbys";
+  }
+
+  const sumHaMain = document.getElementById("sum-card-ha-main");
+  if (sumHaMain) {
+    sumHaMain.textContent = "HA Unreachable";
+    sumHaMain.style.color = "#8b949e";
+  }
+  const sumHaSub = document.getElementById("sum-card-ha-sub");
+  if (sumHaSub) {
+    sumHaSub.textContent = "Connection failed";
+  }
+}
+
+function renderHADetailsModalContent(ha) {
+  const backdrop = document.getElementById("ha-details-modal-backdrop");
+  if (!backdrop || backdrop.style.display === "none") return;
+
+  const info = resolveLeaderInfo(ha);
+
+  const dotEl = document.getElementById("ha-modal-dot");
+  const textEl = document.getElementById("ha-modal-status-text");
+  const subEl = document.getElementById("ha-modal-status-sub");
+  const badgeEl = document.getElementById("ha-modal-badge");
+
+  let statusText = "Active Leader";
+  let dotClass = info.dotClass;
+  let badgeClass = info.badgeClass;
+  let subText = `Authoritative Leader Controller via /api/ha/status`;
+
+  if (ha.role === "leader") {
+    if (ha.lease_valid === false) {
+      statusText = "Election / Promotion";
+      subText = "Leadership lease is expired or election is resolving";
+    } else if (!info.isVerified) {
+      statusText = "Unverified Leader";
+      subText = info.isRegistered ? "Leader registered node is currently offline" : "Leader node ID is not registered in cluster";
+    } else {
+      statusText = "Active Leader";
+      subText = "Holding cluster write lease with active heartbeats";
+    }
+  } else if (ha.role === "standby") {
+    statusText = "Standby Controller";
+    subText = `Replicating state from active leader (${ha.leader_url || info.leaderName})`;
+  } else if (ha.role === "candidate" || ha.role === "promoting") {
+    statusText = "Election in Progress";
+    subText = "Candidate gathering quorum / peer agreement";
+  } else if (ha.role === "fenced") {
+    statusText = "Fenced Controller";
+    subText = "Controller partitioned or lease lost; safe from split-brain";
+  } else {
+    statusText = ha.role || "Standalone";
+    subText = "Cluster running in standalone or unmonitored mode";
+  }
+
+  if (dotEl) dotEl.className = `ha-status-dot ${dotClass}`;
+  if (textEl) textEl.textContent = statusText;
+  if (subEl) subEl.textContent = subText;
+  if (badgeEl) {
+    badgeEl.className = `ha-header-status-badge ${badgeClass}`;
+    badgeEl.textContent = statusText.toUpperCase();
+  }
+
+  const leaderIdEl = document.getElementById("ha-modal-leader-id");
+  if (leaderIdEl) leaderIdEl.textContent = info.rawLeaderId || "None";
+  const leaderNameEl = document.getElementById("ha-modal-leader-name");
+  if (leaderNameEl) {
+    const verifiedDesc = info.isVerified ? " (Verified Online)" : (info.isRegistered ? " (Offline Node)" : " (Unregistered)");
+    leaderNameEl.textContent = `Node: ${info.leaderName}${verifiedDesc}`;
+  }
+
+  const termEl = document.getElementById("ha-modal-term");
+  if (termEl) termEl.textContent = `Term ${ha.term !== undefined ? ha.term : 1}`;
+  const versionEl = document.getElementById("ha-modal-version");
+  if (versionEl) versionEl.textContent = `State Version ${ha.state_version !== undefined ? ha.state_version : 0}`;
+
+  const leaseEl = document.getElementById("ha-modal-lease");
+  if (leaseEl) {
+    leaseEl.textContent = ha.lease_valid ? "Valid (Active)" : "Expired / Inactive";
+    leaseEl.style.color = ha.lease_valid ? "#3fb950" : "#d29922";
+  }
+  const leaseTimeEl = document.getElementById("ha-modal-lease-time");
+  if (leaseTimeEl) {
+    const rem = ha.lease_remaining_sec !== undefined ? `${ha.lease_remaining_sec}s remaining` : "-";
+    leaseTimeEl.textContent = `Lease: ${rem} (Missed checks: ${ha.missed_checks || 0})`;
+  }
+
+  const standbysEl = document.getElementById("ha-modal-standbys");
+  const count = ha.standbys_count !== undefined ? ha.standbys_count : (ha.standbys ? ha.standbys.length : 0);
+  if (standbysEl) standbysEl.textContent = `${count} Synchronized Standby${count === 1 ? '' : 's'}`;
+
+  const partEl = document.getElementById("ha-modal-partition-safe");
+  if (partEl) {
+    partEl.textContent = `Partition Safe: ${ha.partition_safe !== false ? "True" : "Partition Suspected"}`;
+  }
+
+  // Standbys list
+  const listEl = document.getElementById("ha-modal-standbys-list");
+  if (listEl) {
+    const standbys = Array.isArray(ha.standbys) ? ha.standbys : [];
+    if (standbys.length === 0) {
+      listEl.innerHTML = `<span class="cell-muted">No synchronized standby controllers registered.</span>`;
+    } else {
+      listEl.innerHTML = standbys.map(s => {
+        const sid = s.node_id || s.id || s.url || "standby";
+        const sName = resolveNodeDisplayName(sid);
+        const url = s.node_url || s.url || "-";
+        const hb = s.last_heartbeat ? timeAgo(s.last_heartbeat) : "recent";
+        return `<div style="display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+          <span><strong>${sName}</strong> <span class="cell-muted">(${sid})</span></span>
+          <span class="cell-muted">${url} · ${hb}</span>
+        </div>`;
+      }).join("");
+    }
+  }
+
+  // Leader node button
+  const viewLeaderBtn = document.getElementById("ha-modal-view-node-btn");
+  if (viewLeaderBtn) {
+    if (info.rawLeaderId && info.rawLeaderId !== "None" && info.isRegistered) {
+      viewLeaderBtn.disabled = false;
+      viewLeaderBtn.textContent = `View Leader Node (${info.leaderName})`;
+    } else {
+      viewLeaderBtn.disabled = true;
+      viewLeaderBtn.textContent = info.isRegistered ? "View Leader Node" : "Leader Unregistered";
+    }
+  }
+}
+
+function renderHADetailsModalError(err) {
+  const backdrop = document.getElementById("ha-details-modal-backdrop");
+  if (!backdrop || backdrop.style.display === "none") return;
+
+  const dotEl = document.getElementById("ha-modal-dot");
+  const textEl = document.getElementById("ha-modal-status-text");
+  const subEl = document.getElementById("ha-modal-status-sub");
+  const badgeEl = document.getElementById("ha-modal-badge");
+
+  if (dotEl) dotEl.className = "ha-status-dot ha-dot-unknown";
+  if (textEl) textEl.textContent = "HA Status Unreachable";
+  if (subEl) subEl.textContent = err?.message || "Failed to communicate with HA controller endpoint";
+  if (badgeEl) {
+    badgeEl.className = "ha-header-status-badge ha-status-unknown";
+    badgeEl.textContent = "UNREACHABLE";
+  }
+
+  const viewLeaderBtn = document.getElementById("ha-modal-view-node-btn");
+  if (viewLeaderBtn) {
+    viewLeaderBtn.disabled = true;
+  }
+}
+
+async function updateHAStatus(force = false) {
+  if (isUpdatingHA && !force) return cachedHAStatus;
+  const now = Date.now();
+  if (!force && lastHAUpdateTimestamp && (now - lastHAUpdateTimestamp < 2500) && cachedHAStatus) {
+    return cachedHAStatus;
+  }
+
+  isUpdatingHA = true;
+  try {
+    if (!cachedNodes || cachedNodes.length === 0) {
+      try {
+        const clusterRes = await apiFetch("/api/cluster");
+        if (clusterRes && Array.isArray(clusterRes.nodes)) {
+          cachedNodes = clusterRes.nodes.filter(n => n.status !== "REMOVED");
+        }
+      } catch (_) {}
+    }
+
+    const ha = await apiFetch("/api/ha/status");
+    cachedHAStatus = ha;
+    lastHAUpdateTimestamp = Date.now();
+    renderHAHeader(ha);
+    renderHADetailsModalContent(ha);
+    return ha;
+  } catch (err) {
+    cachedHAStatus = null;
+    renderHAHeaderError(err);
+    renderHADetailsModalError(err);
+    return null;
+  } finally {
+    isUpdatingHA = false;
+  }
+}
+
+function openHADetailsModal() {
+  const backdrop = document.getElementById("ha-details-modal-backdrop");
+  if (backdrop) {
+    backdrop.style.display = "flex";
+  }
+  if (cachedHAStatus) {
+    renderHADetailsModalContent(cachedHAStatus);
+  }
+  updateHAStatus(true);
+}
+
+function closeHADetailsModal() {
+  const backdrop = document.getElementById("ha-details-modal-backdrop");
+  if (backdrop) {
+    backdrop.style.display = "none";
+  }
+}
+
+function viewLeaderNodeFromModal() {
+  closeHADetailsModal();
+  const rawLeaderId = cachedHAStatus?.role === "leader" 
+    ? (cachedHAStatus?.node_id || cachedHAStatus?.leader_id) 
+    : (cachedHAStatus?.leader_id || cachedHAStatus?.node_id);
+  if (rawLeaderId) {
+    window.location.hash = "#nodes";
+    setTimeout(() => {
+      if (typeof viewNodeById === "function") {
+        viewNodeById(rawLeaderId);
+      }
+    }, 80);
+  }
+}
+
+function triggerFailoverFromModal() {
+  triggerManualHAFailover();
+}
+
+async function triggerManualHAFailover() {
+  const confirmed = await showCustomConfirm({
+    title: "High Availability Failover",
+    message: "Trigger simulated failover to a standby controller in the cluster?\n\n• Leadership will transfer to an eligible synchronized standby\n• If running on the active leader, this controller will step down\n• Cluster roles, telemetry, and actions will refresh immediately"
+  });
+  if (!confirmed) return;
+
+  const btn = document.getElementById("ha-failover-btn");
+  const modalBtn = document.getElementById("ha-modal-failover-btn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Switching...";
+  }
+  if (modalBtn) {
+    modalBtn.disabled = true;
+    modalBtn.textContent = "Switching...";
+  }
+
   try {
     const res = await apiFetch("/api/ha/failover", { method: "POST" });
-    alert(`HA Failover triggered successfully!\nStatus: ${res.status || 'OK'}\nTerm: ${res.term || 'new'}`);
-    await updateHAStatus();
-    await loadNodes();
+    if (res.status === "failed") {
+      showToast(`Failover notice: ${res.error || 'No standby controller available'}`, "warning");
+    } else {
+      const targetTxt = res.target ? ` -> ${res.target}` : '';
+      showToast(`Failover triggered: ${res.action || 'Transitioned'}${targetTxt} (Term ${res.term})`, "success");
+    }
   } catch (e) {
-    alert("Failover request failed: " + e.message);
+    showToast("Failover request failed: " + e.message, "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Simulate Failover";
+    }
+    if (modalBtn) {
+      modalBtn.disabled = false;
+      modalBtn.textContent = "Simulate Failover";
+    }
+    await updateHAStatus(true);
+    await loadNodes();
   }
 }
 
@@ -515,6 +1018,7 @@ async function loadNodes() {
     const onlineCount = cachedNodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
     const countHdr = document.getElementById("nodes-count-header");
     if (countHdr) countHdr.textContent = `${onlineCount} online · ${cachedNodes.length} total`;
+    if (cachedHAStatus) renderHAHeader(cachedHAStatus);
 
     if (targetSelect) {
       const cur = targetSelect.value;
@@ -534,37 +1038,37 @@ async function loadNodes() {
       const hb = n.last_heartbeat || {};
       const sys = hb.system || {};
 
-      // 1. Battery Telemetry
+      // 1. Battery Telemetry (restrained, zero emoji)
       const bat = hb.battery || sys.battery || uNode.battery || {};
-      let batHtml = '<span class="cell-muted">-</span>';
+      let batHtml = '<span class="cell-muted" title="No battery telemetry reported">—</span>';
       if (bat.percentage != null) {
         const pct = bat.percentage;
         const isCharging = (bat.status || "").toUpperCase() === "CHARGING";
         const isAC = (bat.status || "").toUpperCase() === "AC_POWERED" || (bat.plugged || "").toUpperCase() === "PLUGGED_AC";
-        const icon = isCharging ? "⚡" : (isAC ? "🔌" : "🔋");
         let pillClass = pct > 50 ? "good" : (pct > 20 ? "warn" : "danger");
         if (isAC && !isCharging) pillClass = "info";
-        const chargeSymbol = isCharging ? " ⚡" : "";
-        const title = `Battery: ${pct}% · Status: ${bat.status || 'OK'} · Source: ${bat.plugged || 'N/A'}${bat.temperature_c ? ' · Temp: ' + bat.temperature_c + '°C' : ''} · Health: ${bat.health || 'Good'}`;
-        batHtml = `<span class="telemetry-pill ${pillClass}" title="${title}">${icon} ${pct}%${chargeSymbol}</span>`;
+        const label = isAC ? "AC Power" : `${pct}%${isCharging ? ' (charging)' : ''}`;
+        const title = `Battery: ${pct}% · Status: ${bat.status || 'OK'} · Source: ${bat.plugged || (isAC ? 'AC' : 'Battery')}${bat.temperature_c ? ' · Temp: ' + bat.temperature_c + '°C' : ''}`;
+        batHtml = `<span class="telemetry-pill ${pillClass}" title="${title}">${label}</span>`;
       } else if (n.platform === "termux") {
-        batHtml = `<span class="telemetry-pill info mono" title="Termux Android Node">📱 Phone</span>`;
+        batHtml = `<span class="telemetry-pill info mono" title="Termux Android Node">Mobile</span>`;
       }
 
-      // 2. Network & Speed Telemetry
+      // 2. Network & Speed Telemetry (restrained, zero emoji)
       const net = hb.network || sys.network || uNode.network || {};
-      let netHtml = '<span class="cell-muted">-</span>';
+      let netHtml = '<span class="cell-muted" title="No network telemetry reported">—</span>';
       if (net.wifi_signal_percent != null || net.link_speed_mbps != null || net.ping_ms != null) {
         const sig = net.wifi_signal_percent != null ? `${net.wifi_signal_percent}%` : "";
         const spd = net.link_speed_mbps != null ? `${Math.round(net.link_speed_mbps)}M` : (net.ping_ms != null ? `${net.ping_ms}ms` : "");
         const pillClass = (net.wifi_signal_percent == null || net.wifi_signal_percent > 60) ? "good" : (net.wifi_signal_percent > 30 ? "warn" : "danger");
-        const title = `Type: ${net.connection_type || 'Wi-Fi'} · SSID: ${net.wifi_ssid || 'N/A'} · Signal: ${net.wifi_signal_percent != null ? net.wifi_signal_percent + '%' : 'N/A'} (${net.wifi_rssi_dbm ? net.wifi_rssi_dbm + 'dBm' : 'N/A'}) · Link: ${net.link_speed_mbps ? net.link_speed_mbps + ' Mbps' : 'N/A'} · Ping: ${net.ping_ms ? net.ping_ms + 'ms' : 'N/A'} · IP: ${net.ip || n.ip || 'N/A'}`;
-        netHtml = `<span class="telemetry-pill ${pillClass}" title="${title}">📶 ${sig}${sig && spd ? ' · ' : ''}${spd}</span>`;
+        const title = `Type: ${net.connection_type || 'Wi-Fi'} · Signal: ${net.wifi_signal_percent != null ? net.wifi_signal_percent + '%' : 'N/A'} · Link: ${net.link_speed_mbps ? net.link_speed_mbps + ' Mbps' : 'N/A'} · Ping: ${net.ping_ms ? net.ping_ms + 'ms' : 'N/A'} · IP: ${net.ip || n.ip || 'N/A'}`;
+        const label = `${net.connection_type || 'Net'}${spd ? ' · ' + spd : (sig ? ' · ' + sig : '')}`;
+        netHtml = `<span class="telemetry-pill ${pillClass}" title="${title}">${label}</span>`;
       } else if (n.ip) {
-        netHtml = `<span class="telemetry-pill info mono" title="IP: ${n.ip}">${n.ip.startsWith('100.') ? '🔒 Tailscale' : '🌐 ' + n.ip}</span>`;
+        netHtml = `<span class="telemetry-pill info mono" title="IP: ${n.ip}">${n.ip.startsWith('100.') ? 'Tailscale' : n.ip}</span>`;
       }
 
-      // 3. CPU & Thermal Telemetry
+      // 3. CPU & Thermal Telemetry (restrained, zero emoji)
       const thm = hb.thermals || sys.thermals || uNode.thermals || {};
       const cpuDtl = hb.cpu_details || sys.cpu_details || uNode.cpu_details || {};
       const tempC = thm.temperature_c ?? cpuDtl.temperature_c;
@@ -579,70 +1083,78 @@ async function loadNodes() {
         coresStr = `${sys.cpu_cores || n.resources?.cpu_cores || "-"}c`;
       }
 
-      let cpuTempHtml = '<span class="cell-muted">-</span>';
+      let cpuTempHtml = '<span class="cell-muted">—</span>';
       if (tempC != null || cpuPct != null) {
         const tStr = tempC != null ? `${tempC}°C` : "";
         const pStr = cpuPct != null ? `${cpuPct}%` : "";
         const pillClass = (tempC == null || tempC < 65) ? "good" : (tempC < 82 ? "warn" : "danger");
-        const title = `Thermal: ${thm.status || 'Normal'} (${tempC ? tempC + '°C' : 'N/A'}) · CPU: ${cpuPct != null ? cpuPct + '%' : 'N/A'} · Cores: ${cpuDtl.cores || n.resources?.cpu_cores || '-'} · Load: ${(uNode.cpu?.load_average || sys.load_average || []).join(', ') || '-'}`;
-        cpuTempHtml = `<span class="telemetry-pill ${pillClass}" title="${title}">🌡️ ${tStr}${tStr && pStr ? ' · ' : ''}${pStr}</span>`;
+        const title = `Thermal: ${thm.status || 'Normal'} (${tempC ? tempC + '°C' : 'N/A'}) · CPU: ${cpuPct != null ? cpuPct + '%' : 'N/A'} · Cores: ${cpuDtl.cores || n.resources?.cpu_cores || '-'}`;
+        const label = `${coresStr}${tStr ? ' · ' + tStr : ''}`;
+        cpuTempHtml = `<span class="telemetry-pill ${pillClass}" title="${title}">${label}</span>`;
       } else {
         cpuTempHtml = `<span class="mono">${coresStr}</span>`;
       }
 
-      // 4. Memory & Storage
-      let memStr = "-";
-      if (uNode.memory?.total_mb) {
-        memStr = `${(uNode.memory.used_mb/1024).toFixed(1)}/${(uNode.memory.total_mb/1024).toFixed(1)}G (${uNode.memory.used_percent}%)`;
-      } else {
-        memStr = sys.memory || (n.resources?.ram_mb ? `${(n.resources.ram_mb/1024).toFixed(1)} GB` : "-");
+      // 4. Memory & Storage (clean explanation if unavailable)
+      let memStr = '<span class="cell-muted">Unavailable</span>';
+      if (uNode.memory?.total_mb && uNode.memory.total_mb > 0) {
+        memStr = `${(uNode.memory.used_mb/1024).toFixed(1)} / ${(uNode.memory.total_mb/1024).toFixed(1)}G (${uNode.memory.used_percent}%)`;
+      } else if (n.resources?.ram_mb && n.resources.ram_mb > 0) {
+        memStr = `${(n.resources.ram_mb/1024).toFixed(1)} GB`;
       }
 
-      let storageStr = "-";
-      if (uNode.storage?.total_gb) {
-        storageStr = `${uNode.storage.used_gb}/${uNode.storage.total_gb}G (${uNode.storage.used_percent}%)`;
-      } else {
-        storageStr = sys.storage || (n.resources?.storage_gb ? `${n.resources.storage_gb} GB` : "-");
+      let storageStr = '<span class="cell-muted">Unavailable</span>';
+      if (uNode.storage?.total_gb && uNode.storage.total_gb > 0) {
+        storageStr = `${uNode.storage.used_gb} / ${uNode.storage.total_gb}G (${uNode.storage.used_percent}%)`;
+      } else if (n.resources?.storage_gb && n.resources.storage_gb > 0) {
+        storageStr = `${n.resources.storage_gb} GB`;
       }
 
       const activeJobs = uNode.workloads?.active_jobs ?? 0;
-      const runningJobs = uNode.workloads?.running_jobs ?? 0;
-      const runningContainers = uNode.workloads?.running_containers ?? 0;
 
       const lastSeen = isOnline ? timeAgo(n.last_seen) : (n.last_seen ? timeAgo(n.last_seen) : "offline");
       const st = (n.status || "").toUpperCase();
 
-      let actionBtns = `<button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button> <button class="btn btn-sm btn-primary" onclick="openNodeDiagnosticsModal('${n.node_id}')" title="Test Live Speed & Telemetry">⚡ Test</button>`;
+      let actionBtns = `<button class="btn btn-sm" onclick="viewNodeById('${n.node_id}')">Details</button><button class="btn btn-sm btn-secondary" onclick="openNodeDiagnosticsModal('${n.node_id}')" title="Run Connectivity & Hardware Diagnostics">Test</button>`;
       if (st === "ONLINE") {
-        actionBtns += ` <button class="btn btn-sm btn-warning" onclick="drainNode('${n.node_id}')" title="Drain node workloads">Drain</button>`;
+        actionBtns += `<button class="btn btn-sm btn-warning" onclick="drainNode('${n.node_id}')" title="Drain node workloads">Drain</button>`;
       } else if (st === "DRAINING") {
-        actionBtns += ` <button class="btn btn-sm btn-warning" onclick="deboardNode('${n.node_id}')" title="Deboard node safely">Deboard</button>`;
-        actionBtns += ` <button class="btn btn-sm" onclick="resumeNode('${n.node_id}')" title="Resume node to ONLINE">Resume</button>`;
+        actionBtns += `<button class="btn btn-sm btn-warning" onclick="deboardNode('${n.node_id}')" title="Deboard node safely">Deboard</button>`;
+        actionBtns += `<button class="btn btn-sm" onclick="resumeNode('${n.node_id}')" title="Resume node to ONLINE">Resume</button>`;
       } else if (st === "DEBOARDING") {
-        actionBtns += ` <button class="btn btn-sm btn-danger" onclick="removeNodeSafe('${n.node_id}')" title="Remove node after safety checks">Remove</button>`;
-        actionBtns += ` <button class="btn btn-sm" onclick="resumeNode('${n.node_id}')" title="Resume node to ONLINE">Resume</button>`;
+        actionBtns += `<button class="btn btn-sm btn-danger" onclick="removeNodeSafe('${n.node_id}')" title="Remove node after safety checks">Remove</button>`;
+        actionBtns += `<button class="btn btn-sm" onclick="resumeNode('${n.node_id}')" title="Resume node to ONLINE">Resume</button>`;
       }
 
       let haTag = "";
-      if (cachedHAStatus && (n.node_id === cachedHAStatus.leader_id || n.node_id === cachedHAStatus.node_id && cachedHAStatus.role === "leader")) {
-        haTag = ` <span class="ha-tag ha-tag-leader" title="Active Cluster Master">👑 Master</span>`;
+      const isLeaderIdentified = cachedHAStatus && cachedHAStatus.lease_valid !== false && (n.node_id === cachedHAStatus.leader_id || (n.node_id === cachedHAStatus.node_id && cachedHAStatus.role === "leader"));
+      if (isLeaderIdentified) {
+        if (isOnline) {
+          haTag = `<span class="node-role-pill leader" title="Active Cluster Leader">Leader</span>`;
+        } else {
+          haTag = `<span class="node-role-pill standby" title="Leader Identity in State but Node is Offline">Leader (Offline)</span>`;
+        }
       } else if (n.role === "controller" || (cachedHAStatus?.standbys || []).some(s => s.node_id === n.node_id)) {
-        haTag = ` <span class="ha-tag ha-tag-standby" title="Standby Controller">🛡️ Standby</span>`;
+        haTag = `<span class="node-role-pill standby" title="Standby Controller">Standby</span>`;
+      } else {
+        haTag = `<span class="node-role-pill worker" title="Compute Worker">Worker</span>`;
       }
 
       return `
         <tr>
-          <td><strong>${n.name || n.node_id}</strong>${haTag}</td>
+          <td><strong class="cell-main">${n.name || n.node_id}</strong>${haTag}</td>
           <td>${renderStatusPill(n.status)}</td>
           <td>${batHtml}</td>
           <td>${netHtml}</td>
           <td>${cpuTempHtml}</td>
           <td class="mono">${memStr}</td>
           <td class="mono">${storageStr}</td>
-          <td class="mono">${activeJobs} active (${runningJobs} run)</td>
+          <td class="mono">${activeJobs} active</td>
           <td class="mono cell-muted">${lastSeen}</td>
-          <td style="text-align: right; white-space: nowrap;">
-            ${actionBtns}
+          <td style="text-align: right;">
+            <div class="node-actions-group">
+              ${actionBtns}
+            </div>
           </td>
         </tr>
       `;
@@ -723,8 +1235,8 @@ window.viewNodeById = function(nodeId) {
         <!-- 1. Battery Card -->
         <div class="telemetry-card">
           <div class="telemetry-card-header">
-            <span>🔋 Power &amp; Battery</span>
-            <span class="telemetry-pill ${batPct > 50 ? 'good' : (batPct > 20 ? 'warn' : 'danger')}">${isCharging ? '⚡ Charging' : (isAC ? '🔌 AC' : 'Battery')}</span>
+            <span>Power &amp; Battery</span>
+            <span class="telemetry-pill ${batPct > 50 ? 'good' : (batPct > 20 ? 'warn' : 'danger')}">${isCharging ? 'Charging' : (isAC ? 'AC Power' : 'Battery')}</span>
           </div>
           <div class="telemetry-metric-large" style="color: ${batColor};">
             ${bat.percentage != null ? bat.percentage + '%' : 'AC Power'}
@@ -743,7 +1255,7 @@ window.viewNodeById = function(nodeId) {
         <!-- 2. Network Card -->
         <div class="telemetry-card">
           <div class="telemetry-card-header">
-            <span>📶 Network &amp; Wi-Fi</span>
+            <span>Network &amp; Connectivity</span>
             <span class="telemetry-pill ${net.ping_ms ? 'good' : 'info'}">${net.connection_type || 'Wi-Fi'}</span>
           </div>
           <div class="telemetry-metric-large" style="color: ${netColor};">
@@ -763,7 +1275,7 @@ window.viewNodeById = function(nodeId) {
         <!-- 3. CPU & Thermal Card -->
         <div class="telemetry-card">
           <div class="telemetry-card-header">
-            <span>🌡️ Processor &amp; Thermals</span>
+            <span>Processor &amp; Thermals</span>
             <span class="telemetry-pill ${tempC && tempC > 80 ? 'danger' : 'good'}">${thm.status || 'Optimal'}</span>
           </div>
           <div class="telemetry-metric-large" style="color: ${thmColor};">
@@ -783,7 +1295,7 @@ window.viewNodeById = function(nodeId) {
         <!-- 4. Memory & Storage Card -->
         <div class="telemetry-card">
           <div class="telemetry-card-header">
-            <span>💾 Memory &amp; Storage</span>
+            <span>Memory &amp; Storage</span>
             <span class="telemetry-pill info">${memPct}% RAM</span>
           </div>
           <div class="telemetry-metric-large">
@@ -841,12 +1353,12 @@ window.openNodeDiagnosticsModal = async function(nodeId) {
   const contentEl = document.getElementById("diag-modal-content");
   const rerunBtn = document.getElementById("diag-modal-rerun-btn");
 
-  if (title) title.textContent = `⚡ Live Diagnostics & Speed: ${node.name || nodeId}`;
+  if (title) title.textContent = `Node Diagnostics: ${node.name || nodeId}`;
   if (statusEl) {
     statusEl.innerHTML = `<span class="pulse-spinner"></span> Polling live hardware metrics &amp; testing network throughput...`;
     statusEl.style.display = "flex";
   }
-  if (contentEl) contentEl.innerHTML = `<div class="mono cell-muted" style="padding: 24px; text-align: center;">Measuring latency, bandwidth throughput, CPU thermals, and battery levels...</div>`;
+  if (contentEl) contentEl.innerHTML = `<div class="mono cell-muted" style="padding: 24px; text-align: center;">Measuring latency, network connectivity, CPU thermals, and battery levels...</div>`;
   if (rerunBtn) rerunBtn.disabled = true;
 
   if (modal) modal.style.display = "flex";
@@ -855,17 +1367,25 @@ window.openNodeDiagnosticsModal = async function(nodeId) {
     const res = await apiFetch(`/api/nodes/${nodeId}/diagnostics`);
     const diag = res.diagnostics || res;
 
+    const isOffline = diag.status === "offline" || (node.status || "").toUpperCase() === "OFFLINE";
+    const isLive = diag.live === true;
     const bat = diag.battery || {};
     const net = diag.network || {};
     const cpu = diag.cpu || {};
     const thm = diag.thermals || {};
 
-    const speedMbps = net.transfer_speed_mbps != null ? net.transfer_speed_mbps : (net.link_speed_mbps || 0);
-    const pingMs = net.ping_ms != null ? net.ping_ms : 0;
+    const speedMbps = net.transfer_speed_mbps != null ? net.transfer_speed_mbps : net.link_speed_mbps;
+    const pingMs = net.ping_ms;
     const tempC = thm.temperature_c ?? cpu.temperature_c;
 
     if (statusEl) {
-      statusEl.innerHTML = `<span class="text-online">✓ Diagnostics Complete</span> <span class="cell-muted">(${diag.duration_ms ? diag.duration_ms + 'ms' : 'live'}, ${diag.status || 'completed'})</span>`;
+      if (isOffline) {
+        statusEl.innerHTML = `<span class="text-offline">● Node is Offline</span> <span class="cell-muted">(Cannot poll live hardware; displaying last recorded heartbeat)</span>`;
+      } else if (!isLive) {
+        statusEl.innerHTML = `<span class="text-warning">● Live Agent Unreachable</span> <span class="cell-muted">(${diag.error || 'Displaying cached heartbeat metrics'})</span>`;
+      } else {
+        statusEl.innerHTML = `<span class="text-online">✓ Live Diagnostics Complete</span> <span class="cell-muted">(${diag.duration_ms ? diag.duration_ms + 'ms' : 'live'})</span>`;
+      }
     }
 
     if (contentEl) {
@@ -874,63 +1394,63 @@ window.openNodeDiagnosticsModal = async function(nodeId) {
           <!-- 1. Internet Speed & Network -->
           <div class="telemetry-card">
             <div class="telemetry-card-header">
-              <span>📶 Network &amp; Internet Speed</span>
-              <span class="telemetry-pill good">${net.connection_type || 'Wi-Fi'}</span>
+              <span>Network &amp; Connectivity</span>
+              <span class="telemetry-pill ${isOffline ? 'danger' : 'good'}">${isOffline ? 'Offline' : (net.connection_type || 'Connected')}</span>
             </div>
-            <div class="telemetry-metric-large text-online">
-              ${net.link_speed_mbps ? Math.round(net.link_speed_mbps) + ' Mbps' : (speedMbps ? speedMbps + ' Mbps' : 'Connected')}
-              <span class="cell-muted" style="font-size: 11px; font-weight: normal;">link rate</span>
+            <div class="telemetry-metric-large ${isOffline ? 'text-offline' : 'text-online'}">
+              ${speedMbps != null ? Math.round(speedMbps) + ' Mbps' : (isOffline ? '0 Mbps' : 'Not measured')}
+              <span class="cell-muted" style="font-size: 11px; font-weight: normal;">transfer throughput</span>
             </div>
             <div class="telemetry-meta-list mono">
-              <div class="telemetry-meta-row"><span>Ping Latency</span><span class="text-online">${pingMs ? pingMs + ' ms' : '< 15 ms'}</span></div>
-              <div class="telemetry-meta-row"><span>Wi-Fi SSID</span><span class="cell-main">${net.wifi_ssid || 'PersonalServer-Mesh'}</span></div>
-              <div class="telemetry-meta-row"><span>Signal Strength</span><span>${net.wifi_signal_percent != null ? net.wifi_signal_percent + '%' : 'Strong'} (${net.wifi_rssi_dbm ? net.wifi_rssi_dbm + ' dBm' : 'Good'})</span></div>
-              <div class="telemetry-meta-row"><span>LAN IP</span><span class="cell-main">${net.ip || node.ip || '-'}</span></div>
-              <div class="telemetry-meta-row"><span>Tailscale Mesh</span><span class="cell-main">${net.tailscale_ip || 'Connected'}</span></div>
+              <div class="telemetry-meta-row"><span>Ping Latency</span><span class="${pingMs != null ? 'text-online' : 'cell-muted'}">${pingMs != null ? pingMs + ' ms' : 'Not measured'}</span></div>
+              <div class="telemetry-meta-row"><span>Wi-Fi SSID</span><span class="cell-main">${net.wifi_ssid || 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>Signal Strength</span><span>${net.wifi_signal_percent != null ? net.wifi_signal_percent + '%' : 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>LAN IP</span><span class="cell-main">${net.ip || node.ip || 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>Tailscale IP</span><span class="cell-main">${net.tailscale_ip || (node.ip?.startsWith('100.') ? node.ip : 'Not configured')}</span></div>
             </div>
           </div>
 
           <!-- 2. Battery & Power -->
           <div class="telemetry-card">
             <div class="telemetry-card-header">
-              <span>🔋 Battery &amp; Power</span>
-              <span class="telemetry-pill ${bat.percentage > 50 ? 'good' : (bat.percentage > 20 ? 'warn' : 'danger')}">${bat.status || 'OK'}</span>
+              <span>Battery &amp; Power</span>
+              <span class="telemetry-pill ${bat.percentage != null ? (bat.percentage > 50 ? 'good' : (bat.percentage > 20 ? 'warn' : 'danger')) : 'info'}">${bat.status || (bat.percentage != null ? 'Battery' : 'Not reported')}</span>
             </div>
-            <div class="telemetry-metric-large" style="color: ${bat.percentage > 50 ? 'var(--status-green)' : 'var(--status-yellow)'};">
-              ${bat.percentage != null ? bat.percentage + '%' : 'AC Connected'}
-              <span class="cell-muted" style="font-size: 11px; font-weight: normal;">${bat.plugged || 'PLUGGED_AC'}</span>
+            <div class="telemetry-metric-large" style="color: ${bat.percentage != null ? (bat.percentage > 50 ? 'var(--status-green)' : 'var(--status-yellow)') : 'var(--text-muted)'};">
+              ${bat.percentage != null ? bat.percentage + '%' : 'AC / Not reported'}
+              <span class="cell-muted" style="font-size: 11px; font-weight: normal;">${bat.plugged || (bat.percentage != null ? 'Battery' : 'AC Power')}</span>
             </div>
             <div class="telemetry-meta-list mono">
-              <div class="telemetry-meta-row"><span>Status</span><span class="cell-main">${bat.status || 'CHARGING'}</span></div>
-              <div class="telemetry-meta-row"><span>Battery Temp</span><span>${bat.temperature_c ? bat.temperature_c + '°C' : 'Optimal'}</span></div>
-              <div class="telemetry-meta-row"><span>Health State</span><span class="text-online">${bat.health || 'GOOD'}</span></div>
-              <div class="telemetry-meta-row"><span>Power Source</span><span>${bat.plugged || 'PLUGGED_AC'}</span></div>
+              <div class="telemetry-meta-row"><span>Status</span><span class="cell-main">${bat.status || 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>Battery Temp</span><span>${bat.temperature_c ? bat.temperature_c + '°C' : 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>Health State</span><span class="${bat.health ? 'text-online' : 'cell-muted'}">${bat.health || 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>Power Source</span><span>${bat.plugged || 'Not reported'}</span></div>
             </div>
           </div>
 
           <!-- 3. CPU Status & Thermals -->
           <div class="telemetry-card">
             <div class="telemetry-card-header">
-              <span>🌡️ Processor &amp; Thermals</span>
-              <span class="telemetry-pill ${tempC && tempC > 80 ? 'danger' : 'good'}">${thm.status || 'Optimal'}</span>
+              <span>Processor &amp; Thermals</span>
+              <span class="telemetry-pill ${tempC && tempC > 80 ? 'danger' : 'good'}">${thm.status || (tempC != null ? (tempC < 80 ? 'Normal' : 'High') : 'Not reported')}</span>
             </div>
             <div class="telemetry-metric-large text-online">
-              ${tempC ? tempC + '°C' : (cpu.utilization_percent != null ? cpu.utilization_percent + '%' : 'Optimal')}
+              ${tempC != null ? tempC + '°C' : (cpu.utilization_percent != null ? cpu.utilization_percent + '%' : 'Not reported')}
               <span class="cell-muted" style="font-size: 11px; font-weight: normal;">${cpu.utilization_percent != null ? cpu.utilization_percent + '% usage' : ''}</span>
             </div>
             <div class="telemetry-meta-list mono">
-              <div class="telemetry-meta-row"><span>CPU Cores</span><span class="cell-main">${cpu.cores || node.resources?.cpu_cores || 8} cores</span></div>
-              <div class="telemetry-meta-row"><span>Thermal Status</span><span class="text-online">${thm.status || 'Optimal'}</span></div>
-              <div class="telemetry-meta-row"><span>Clock Speed</span><span>${cpu.frequency_mhz ? Math.round(cpu.frequency_mhz) + ' MHz' : 'Auto Scaling'}</span></div>
-              <div class="telemetry-meta-row"><span>Load Average</span><span>${(cpu.load_average || []).slice(0, 3).join(', ') || '-'}</span></div>
+              <div class="telemetry-meta-row"><span>CPU Cores</span><span class="cell-main">${cpu.cores || node.resources?.cpu_cores || 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>Thermal Status</span><span class="${tempC != null ? 'text-online' : 'cell-muted'}">${thm.status || (tempC != null ? (tempC < 80 ? 'Normal' : 'High') : 'Not reported')}</span></div>
+              <div class="telemetry-meta-row"><span>Clock Speed</span><span>${cpu.frequency_mhz ? Math.round(cpu.frequency_mhz) + ' MHz' : 'Not reported'}</span></div>
+              <div class="telemetry-meta-row"><span>Load Average</span><span>${(cpu.load_average || []).slice(0, 3).join(', ') || 'Not reported'}</span></div>
             </div>
           </div>
 
           <!-- 4. System & Summary -->
           <div class="telemetry-card">
             <div class="telemetry-card-header">
-              <span>⚙️ Node Identity &amp; State</span>
-              <span class="telemetry-pill info">Online</span>
+              <span>Node Identity &amp; State</span>
+              <span class="telemetry-pill ${isOffline ? 'danger' : 'info'}">${isOffline ? 'Offline' : 'Online'}</span>
             </div>
             <div class="telemetry-metric-large">
               ${node.platform || 'Linux'}
@@ -940,7 +1460,7 @@ window.openNodeDiagnosticsModal = async function(nodeId) {
               <div class="telemetry-meta-row"><span>Node Name</span><span class="cell-main">${node.name || nodeId}</span></div>
               <div class="telemetry-meta-row"><span>Role</span><span>${node.role || 'compute'}</span></div>
               <div class="telemetry-meta-row"><span>Heartbeat Age</span><span>${timeAgo(node.last_seen)}</span></div>
-              <div class="telemetry-meta-row"><span>Timestamp</span><span class="cell-muted" style="font-size: 10px;">${diag.timestamp || '-'}</span></div>
+              <div class="telemetry-meta-row"><span>Timestamp</span><span class="cell-muted" style="font-size: 10px;">${diag.timestamp || 'Not recorded'}</span></div>
             </div>
           </div>
         </div>
@@ -1104,28 +1624,157 @@ window.removeNodeSafe = async function(nodeId) {
   }
 };
 
-// 3. Jobs View
+// 3. Jobs View & Safe Lifecycle
+let jobCurrentPage = 1;
+let jobPageSize = 25;
+let jobTotalCount = 0;
+let jobTotalPages = 1;
+let activeDetailJobId = null;
+let jobsSearchDebounceTimer = null;
+
+window.toggleSubmitJobCard = function(forceState) {
+  const card = document.getElementById("job-submit-card");
+  if (!card) return;
+  const isCurrentlyOpen = card.style.display !== "none";
+  const shouldOpen = forceState !== undefined ? forceState : !isCurrentlyOpen;
+  card.style.display = shouldOpen ? "block" : "none";
+  const btn = document.getElementById("toggle-submit-job-btn");
+  if (btn) btn.textContent = shouldOpen ? "Hide Submit Form" : "+ Submit Workload";
+};
+
+window.resetJobFilters = function() {
+  const searchInput = document.getElementById("jobs-search-input");
+  const statusSelect = document.getElementById("jobs-filter-status");
+  const typeSelect = document.getElementById("jobs-filter-type");
+  const nodeSelect = document.getElementById("jobs-filter-node");
+  const sortSelect = document.getElementById("jobs-sort-by");
+
+  if (searchInput) searchInput.value = "";
+  if (statusSelect) statusSelect.value = "all";
+  if (typeSelect) typeSelect.value = "all";
+  if (nodeSelect) nodeSelect.value = "all";
+  if (sortSelect) sortSelect.value = "recent";
+
+  jobCurrentPage = 1;
+  loadJobs();
+};
+
+window.changeJobPage = function(delta) {
+  const newPage = jobCurrentPage + delta;
+  if (newPage >= 1 && newPage <= jobTotalPages) {
+    jobCurrentPage = newPage;
+    loadJobs();
+  }
+};
+
+window.changeJobPageSize = function(val) {
+  const parsed = parseInt(val, 10);
+  if (!isNaN(parsed) && parsed > 0) {
+    jobPageSize = parsed;
+    jobCurrentPage = 1;
+    loadJobs();
+  }
+};
+
+async function populateJobNodeDropdowns() {
+  const targetSelect = document.getElementById("job-target");
+  const filterNodeSelect = document.getElementById("jobs-filter-node");
+
+  try {
+    const data = await apiFetch("/api/nodes");
+    const nodes = data.nodes ? Object.values(data.nodes) : [];
+
+    if (targetSelect) {
+      const currVal = targetSelect.value;
+      targetSelect.innerHTML = `<option value="auto">Auto (Scheduler)</option>` +
+        nodes.map(n => `<option value="${escapeHtml(n.node_id)}">${escapeHtml(n.hostname || n.node_id)} (${escapeHtml(n.status)})</option>`).join("");
+      if (currVal) targetSelect.value = currVal;
+    }
+
+    if (filterNodeSelect) {
+      const currFilter = filterNodeSelect.value;
+      filterNodeSelect.innerHTML = `<option value="all">All Nodes</option>` +
+        nodes.map(n => `<option value="${escapeHtml(n.node_id)}">${escapeHtml(n.hostname || n.node_id)}</option>`).join("");
+      if (currFilter) filterNodeSelect.value = currFilter;
+    }
+  } catch (err) {
+    // Non-fatal fallback
+  }
+}
+
 async function loadJobs() {
   updateLastRefreshed();
   const tbody = document.getElementById("jobs-tbody");
+  if (!tbody) return;
+
+  populateJobNodeDropdowns();
+
+  // Read filter values
+  const search = document.getElementById("jobs-search-input")?.value.trim() || "";
+  const status = document.getElementById("jobs-filter-status")?.value || "all";
+  const type = document.getElementById("jobs-filter-type")?.value || "all";
+  const node = document.getElementById("jobs-filter-node")?.value || "all";
+  const sort = document.getElementById("jobs-sort-by")?.value || "recent";
+
+  // Build query string
+  const params = new URLSearchParams();
+  params.set("page", jobCurrentPage);
+  params.set("limit", jobPageSize);
+  params.set("sort", sort);
+  if (status !== "all") params.set("status", status);
+  if (type !== "all") params.set("type", type);
+  if (node !== "all") params.set("node", node);
+  if (search) params.set("search", search);
+
+  tbody.innerHTML = `<tr><td colspan="8" class="cell-muted" style="text-align: center; padding: 24px;">Loading execution history...</td></tr>`;
 
   try {
-    const data = await apiFetch("/api/jobs");
+    const data = await apiFetch(`/api/jobs?${params.toString()}`);
     cachedJobs = data.jobs || [];
+    jobTotalCount = data.total_count !== undefined ? data.total_count : cachedJobs.length;
+    jobTotalPages = data.total_pages || Math.max(1, Math.ceil(jobTotalCount / jobPageSize));
 
+    // Update headers and pagination info
     const countHdr = document.getElementById("jobs-count-header");
-    if (countHdr) countHdr.textContent = `${cachedJobs.length} total jobs`;
+    if (countHdr) countHdr.textContent = `${jobTotalCount} total jobs`;
+
+    const pageInfo = document.getElementById("jobs-pagination-info");
+    if (pageInfo) {
+      if (jobTotalCount === 0) {
+        pageInfo.textContent = "Showing 0 of 0 jobs";
+      } else {
+        const start = (jobCurrentPage - 1) * jobPageSize + 1;
+        const end = Math.min(jobCurrentPage * jobPageSize, jobTotalCount);
+        pageInfo.textContent = `Showing ${start}-${end} of ${jobTotalCount} jobs`;
+      }
+    }
+
+    const pageNum = document.getElementById("jobs-page-number");
+    if (pageNum) pageNum.textContent = `Page ${jobCurrentPage} of ${jobTotalPages}`;
+
+    const prevBtn = document.getElementById("jobs-prev-btn");
+    if (prevBtn) prevBtn.disabled = jobCurrentPage <= 1;
+
+    const nextBtn = document.getElementById("jobs-next-btn");
+    if (nextBtn) nextBtn.disabled = jobCurrentPage >= jobTotalPages;
 
     if (cachedJobs.length === 0) {
+      const hasActiveFilters = search || status !== "all" || type !== "all" || node !== "all";
       tbody.innerHTML = `
         <tr>
           <td colspan="8">
-            <div class="empty-state">
-              <div class="empty-state-icon">⚡</div>
-              <div class="empty-state-title">No Workload Jobs Recorded</div>
-              <div class="empty-state-desc">No jobs have been submitted yet. Dispatch a bash command or Python workload across cluster nodes.</div>
+            <div class="empty-state" style="padding: 32px 16px; text-align: center;">
+              <div class="empty-state-title" style="font-size: 14px; font-weight: 600; margin-bottom: 6px;">
+                ${hasActiveFilters ? "No Matching Workload Jobs" : "No Workload Jobs Recorded"}
+              </div>
+              <div class="empty-state-desc cell-muted" style="font-size: 12px; margin-bottom: 12px;">
+                ${hasActiveFilters ? "No jobs match the current filter criteria." : "No jobs have been dispatched yet."}
+              </div>
               <div class="empty-state-action">
-                <button class="btn btn-sm btn-primary" onclick="document.getElementById('job-cmd')?.focus()">Submit First Job</button>
+                ${hasActiveFilters
+                  ? `<button class="btn btn-sm" onclick="resetJobFilters()">Clear Filters</button>`
+                  : `<button class="btn btn-sm btn-primary" onclick="toggleSubmitJobCard(true)">Submit First Job</button>`
+                }
               </div>
             </div>
           </td>
@@ -1134,66 +1783,167 @@ async function loadJobs() {
       return;
     }
 
-    const sorted = [...cachedJobs].reverse();
-    tbody.innerHTML = sorted.map(j => {
+    tbody.innerHTML = cachedJobs.map(j => {
       const jobId = j.job_id || j.id || "";
       const target = j.assigned_node || j.target_node || j.target || "auto";
-      const duration = j.result?.duration_ms ? (j.result.duration_ms + "ms") : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
-      const createdStr = j.created_at ? new Date(j.created_at).toLocaleTimeString() : "-";
+      const res = j.result || {};
+      const duration = res.duration_ms !== undefined ? `${res.duration_ms}ms` : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
+      const createdStr = j.created_at || j.submitted_at ? new Date(j.created_at || j.submitted_at).toLocaleTimeString() : "-";
       const attemptStr = `${j.attempt || 1}/${j.max_attempts || 3}`;
+      const st = (j.status || j.state || "").toUpperCase();
+      const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING");
 
       return `
         <tr>
-          <td class="mono"><strong>${jobId}</strong></td>
-          <td>${j.type}</td>
-          <td class="mono">${target}</td>
-          <td>${renderStatusPill(j.status || j.state)}</td>
-          <td class="mono">${attemptStr}</td>
+          <td class="mono"><strong>${escapeHtml(jobId)}</strong></td>
+          <td><span class="mono" style="font-size: 11px; padding: 2px 6px; background: var(--bg-hover); border-radius: 4px; border: 1px solid var(--border-color);">${escapeHtml(j.type || "-")}</span></td>
+          <td class="mono cell-muted">${escapeHtml(target)}</td>
+          <td>${renderStatusPill(st)}</td>
+          <td class="mono cell-muted">${attemptStr}</td>
           <td class="mono cell-muted">${duration}</td>
           <td class="mono cell-muted">${createdStr}</td>
           <td style="text-align: right;">
-            <button class="btn btn-sm" onclick="viewJobById('${jobId}')">Details</button>
+            <div class="job-actions-cell">
+              <button class="btn btn-sm" onclick="viewJobById('${escapeHtml(jobId)}')">Details</button>
+              ${isCancellable
+                ? `<button class="btn btn-sm btn-cancel-job" onclick="confirmCancelJob('${escapeHtml(jobId)}')" title="Cancel active job">Cancel</button>`
+                : `<button class="btn btn-sm btn-cancel-job" disabled title="Job is terminal (${st})">Cancel</button>`
+              }
+            </div>
           </td>
         </tr>
       `;
     }).join("");
 
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" class="text-offline">Unable to load jobs: ${err.message}</td></tr>`;
+    tbody.innerHTML = `
+      <tr>
+        <td colspan="8" style="padding: 24px; text-align: center;">
+          <div class="text-offline" style="margin-bottom: 8px;">Unable to load execution history: ${escapeHtml(err.message)}</div>
+          <button class="btn btn-sm" onclick="loadJobs()">Retry</button>
+        </td>
+      </tr>
+    `;
   }
 }
 
+window.confirmCancelJob = async function(jobId) {
+  const job = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
+  const jobType = job ? job.type : "workload";
+  const node = job ? (job.target_node || job.assigned_node || "assigned worker") : "assigned worker";
+
+  const confirmed = await showCustomConfirm({
+    title: "Confirm Job Cancellation",
+    message: `Are you sure you want to cancel job ${jobId} (${jobType})? Any active execution on node '${node}' will be terminated immediately.`,
+    confirmText: "Cancel Job",
+    isDanger: true
+  });
+
+  if (!confirmed) return;
+
+  await cancelJob(jobId);
+};
+
+window.cancelJob = async function(jobId) {
+  try {
+    await apiFetch(`/api/jobs/${jobId}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: "Cancelled by operator via dashboard", idempotent: true })
+    });
+
+    // Update job in cache immediately
+    const cachedIdx = cachedJobs.findIndex(j => (j.job_id === jobId || j.id === jobId));
+    if (cachedIdx !== -1) {
+      cachedJobs[cachedIdx].status = "CANCELLED";
+      cachedJobs[cachedIdx].state = "CANCELLED";
+      cachedJobs[cachedIdx].cancel_reason = "Cancelled by operator via dashboard";
+    }
+
+    // Refresh detail panel if open
+    if (activeDetailJobId === jobId) {
+      viewJobById(jobId);
+    }
+
+    // Refresh jobs list
+    loadJobs();
+  } catch (err) {
+    showCustomAlert({
+      title: "Cancellation Failed",
+      message: `Failed to cancel job ${jobId}: ${err.message}`,
+      isError: true
+    });
+  }
+};
+
+window.cancelJobFromDetail = function() {
+  if (activeDetailJobId) {
+    confirmCancelJob(activeDetailJobId);
+  }
+};
+
 window.viewJobById = function(jobId) {
+  activeDetailJobId = jobId;
   const job = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
   const panel = document.getElementById("job-detail-panel");
   const title = document.getElementById("job-detail-title");
+  const statusPill = document.getElementById("job-detail-status-pill");
+  const cancelBtn = document.getElementById("job-detail-cancel-btn");
   const sumGrid = document.getElementById("job-detail-summary");
+  const paramsBox = document.getElementById("job-detail-params");
   const stdoutBox = document.getElementById("job-detail-stdout");
 
   const renderJobInfo = (j) => {
-    if (title) title.textContent = `Job: ${j.job_id || j.id}`;
-    
+    const id = j.job_id || j.id || "";
+    if (title) title.textContent = `Job: ${id}`;
+    const st = (j.status || j.state || "").toUpperCase();
+    if (statusPill) statusPill.innerHTML = renderStatusPill(st);
+
+    const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING");
+    if (cancelBtn) {
+      cancelBtn.style.display = isCancellable ? "inline-block" : "none";
+    }
+
     const sched = j.scheduler || {};
     const res = j.result || {};
-    
-    sumGrid.innerHTML = `
-      <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(j.status || j.state)}</span></div>
-      <div class="detail-item"><span class="detail-label">Workload</span><span class="detail-value">${j.type}</span></div>
-      <div class="detail-item"><span class="detail-label">Target</span><span class="detail-value mono">${j.target || 'auto'}</span></div>
-      <div class="detail-item"><span class="detail-label">Assigned Node</span><span class="detail-value mono">${j.assigned_node || j.target_node || '-'}</span></div>
-      <div class="detail-item"><span class="detail-label">Attempt</span><span class="detail-value mono">${j.attempt || 1}/${j.max_attempts || 3}</span></div>
-      <div class="detail-item"><span class="detail-label">Duration</span><span class="detail-value mono">${res.duration_ms ? res.duration_ms + 'ms' : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : '-')}</span></div>
-      <div class="detail-item"><span class="detail-label">Exit Code</span><span class="detail-value mono">${res.exit_code !== undefined ? res.exit_code : '-'}</span></div>
-      <div class="detail-item"><span class="detail-label">Created At</span><span class="detail-value mono">${j.created_at || '-'}</span></div>
-      <div class="detail-item"><span class="detail-label">Scheduler Reason</span><span class="detail-value">${sched.reason || 'Explicit selection'}</span></div>
-      <div class="detail-item"><span class="detail-label">Retry Reason</span><span class="detail-value">${j.retry_reason || 'None'}</span></div>
-    `;
+    const targetNode = j.target_node || j.target || "auto";
+    const assignedNode = j.assigned_node || j.target_node || "-";
+    const durationStr = res.duration_ms !== undefined ? `${res.duration_ms}ms` : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
+    const submittedStr = j.submitted_at || j.created_at || "-";
+    const finishedStr = j.finished_at || j.cancelled_at || "-";
+    const retryReason = j.retry_reason || (j.diagnostics && j.diagnostics.failure_reason) || "None";
+    const cancelReason = j.cancel_reason || "None";
 
-    const outText = res.stdout || res.stderr || (j.result ? JSON.stringify(j.result, null, 2) : "No output recorded.");
-    stdoutBox.textContent = outText;
+    if (sumGrid) {
+      sumGrid.innerHTML = `
+        <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(st)}</span></div>
+        <div class="detail-item"><span class="detail-label">Workload</span><span class="detail-value">${escapeHtml(j.type || "-")}</span></div>
+        <div class="detail-item"><span class="detail-label">Target Node</span><span class="detail-value mono">${escapeHtml(targetNode)}</span></div>
+        <div class="detail-item"><span class="detail-label">Assigned Worker</span><span class="detail-value mono">${escapeHtml(assignedNode)}</span></div>
+        <div class="detail-item"><span class="detail-label">Attempt</span><span class="detail-value mono">${j.attempt || 1}/${j.max_attempts || 3}</span></div>
+        <div class="detail-item"><span class="detail-label">Duration</span><span class="detail-value mono">${durationStr}</span></div>
+        <div class="detail-item"><span class="detail-label">Exit Code</span><span class="detail-value mono">${res.exit_code !== undefined ? res.exit_code : '-'}</span></div>
+        <div class="detail-item"><span class="detail-label">Submitted At</span><span class="detail-value mono">${escapeHtml(submittedStr)}</span></div>
+        <div class="detail-item"><span class="detail-label">Finished At</span><span class="detail-value mono">${escapeHtml(finishedStr)}</span></div>
+        <div class="detail-item"><span class="detail-label">Retry Reason</span><span class="detail-value">${escapeHtml(retryReason)}</span></div>
+        ${j.cancel_reason ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">Cancel Reason</span><span class="detail-value text-offline">${escapeHtml(cancelReason)}</span></div>` : ""}
+      `;
+    }
 
-    panel.style.display = "block";
-    panel.scrollIntoView({ behavior: "smooth" });
+    if (paramsBox) {
+      const p = j.parameters;
+      paramsBox.textContent = p && Object.keys(p).length > 0 ? JSON.stringify(p, null, 2) : "No parameters provided.";
+    }
+
+    if (stdoutBox) {
+      const outText = res.stdout || res.stderr || (j.result ? JSON.stringify(j.result, null, 2) : "No execution logs recorded.");
+      stdoutBox.textContent = outText;
+    }
+
+    if (panel) {
+      panel.style.display = "block";
+      panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
   };
 
   if (job) {
@@ -1201,13 +1951,14 @@ window.viewJobById = function(jobId) {
   } else {
     apiFetch(`/api/jobs/${jobId}`)
       .then(d => renderJobInfo(d.job || d))
-      .catch(e => alert("Failed to fetch job details: " + e.message));
+      .catch(e => showCustomAlert({ title: "Error", message: "Failed to fetch job details: " + e.message, isError: true }));
   }
 };
 
 window.closeJobDetail = function() {
   const panel = document.getElementById("job-detail-panel");
   if (panel) panel.style.display = "none";
+  activeDetailJobId = null;
 };
 
 // Dispatch job
@@ -1223,7 +1974,11 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
     try {
       params = JSON.parse(paramsRaw);
     } catch (err) {
-      alert("Invalid JSON parameters: " + err.message);
+      showCustomAlert({
+        title: "Invalid Parameters",
+        message: "Invalid JSON parameters: " + err.message,
+        isError: true
+      });
       return;
     }
   }
@@ -1234,10 +1989,41 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ type, target, timeout, parameters: params })
     });
+    toggleSubmitJobCard(false);
+    jobCurrentPage = 1;
     loadJobs();
   } catch (err) {
-    alert("Job submission failed: " + err.message);
+    showCustomAlert({
+      title: "Job Submission Failed",
+      message: err.message,
+      isError: true
+    });
   }
+});
+
+// Setup filter listeners
+document.getElementById("jobs-search-input")?.addEventListener("input", () => {
+  clearTimeout(jobsSearchDebounceTimer);
+  jobsSearchDebounceTimer = setTimeout(() => {
+    jobCurrentPage = 1;
+    loadJobs();
+  }, 300);
+});
+document.getElementById("jobs-filter-status")?.addEventListener("change", () => {
+  jobCurrentPage = 1;
+  loadJobs();
+});
+document.getElementById("jobs-filter-type")?.addEventListener("change", () => {
+  jobCurrentPage = 1;
+  loadJobs();
+});
+document.getElementById("jobs-filter-node")?.addEventListener("change", () => {
+  jobCurrentPage = 1;
+  loadJobs();
+});
+document.getElementById("jobs-sort-by")?.addEventListener("change", () => {
+  jobCurrentPage = 1;
+  loadJobs();
 });
 
 // 4. Storage View (Windows File Explorer Subsystem)
@@ -1804,15 +2590,94 @@ let currentAppFilesPath = "";
 let currentAppFilesItems = [];
 let detectedBlueprint = null;
 
+// Render Status Badge with Dot Indicator for Applications
+function renderAppStatusBadge(state) {
+  const s = (state || "").toUpperCase();
+  let badgeClass = "status-stopped";
+  let label = s || "UNKNOWN";
+
+  if (s === "RUNNING") {
+    badgeClass = "status-running";
+    label = "Running";
+  } else if (["DEPLOYING", "QUEUED", "CLAIMED", "RECOVERING"].includes(s)) {
+    badgeClass = "status-deploying";
+    label = s === "DEPLOYING" ? "Deploying" : (s === "QUEUED" ? "Queued" : s);
+  } else if (["FAILED", "REJECTED", "TIMEOUT", "ERROR"].includes(s)) {
+    badgeClass = "status-failed";
+    label = "Failed";
+  } else if (s === "STOPPED") {
+    badgeClass = "status-stopped";
+    label = "Stopped";
+  } else if (s === "CREATED") {
+    badgeClass = "status-stopped";
+    label = "Created";
+  }
+
+  return `<span class="app-status-badge ${badgeClass}"><span class="status-dot"></span><span>${escapeHtml(label)}</span></span>`;
+}
+
+function updateAppsSummaryMetrics(apps) {
+  const total = apps.length;
+  const running = apps.filter(a => (a.status || '').toUpperCase() === 'RUNNING').length;
+  const stopped = apps.filter(a => ['STOPPED', 'CREATED', 'REMOVED'].includes((a.status || '').toUpperCase())).length;
+  const failed = apps.filter(a => ['FAILED', 'ERROR', 'REJECTED'].includes((a.status || '').toUpperCase())).length;
+
+  const totalEl = document.getElementById("apps-metric-total");
+  const runningEl = document.getElementById("apps-metric-running");
+  const stoppedEl = document.getElementById("apps-metric-stopped");
+  const failedEl = document.getElementById("apps-metric-failed");
+
+  if (totalEl) totalEl.textContent = total;
+  if (runningEl) runningEl.textContent = running;
+  if (stoppedEl) stoppedEl.textContent = stopped;
+  if (failedEl) failedEl.textContent = failed;
+}
+
+window.filterAppsList = function(query) {
+  const q = (query || "").toLowerCase().trim();
+  const rows = document.querySelectorAll(".apps-table tbody tr.app-row");
+  const cards = document.querySelectorAll(".apps-cards-container .app-card");
+
+  rows.forEach(r => {
+    const text = r.textContent.toLowerCase();
+    const match = !q || text.includes(q);
+    r.style.display = match ? "" : "none";
+    const appId = r.getAttribute("data-app-id");
+    if (appId) {
+      const errRow = document.querySelector(`.apps-table tbody tr.app-error-row[data-app-id="${appId}"]`);
+      if (errRow) errRow.style.display = match ? "" : "none";
+    }
+  });
+
+  cards.forEach(c => {
+    const text = c.textContent.toLowerCase();
+    c.style.display = !q || text.includes(q) ? "" : "none";
+  });
+};
+
+window.openDeployModal = function() {
+  window.showDeployContainer();
+};
+
 async function loadApps() {
   const tbody = document.getElementById("apps-tbody");
+  const cardsContainer = document.getElementById("apps-cards-container");
   const countHeader = document.getElementById("apps-count-header");
   const targetSelect = document.getElementById("app-target");
 
   try {
+    if (tbody && (!cachedApps || cachedApps.length === 0)) {
+      tbody.innerHTML = `<tr><td colspan="6" class="cell-muted" style="text-align: center; padding: 24px;"><span class="pulse-spinner"></span> Loading applications...</td></tr>`;
+    }
+    if (cardsContainer && (!cachedApps || cachedApps.length === 0)) {
+      cardsContainer.innerHTML = `<div class="apps-loading-state"><span class="pulse-spinner"></span><span>Loading applications...</span></div>`;
+    }
+
     const res = await apiFetch("/api/apps");
     cachedApps = res.apps || [];
-    
+
+    updateAppsSummaryMetrics(cachedApps);
+
     if (countHeader) {
       countHeader.textContent = `${cachedApps.length} application${cachedApps.length === 1 ? '' : 's'}`;
     }
@@ -1828,73 +2693,196 @@ async function loadApps() {
     }
 
     if (cachedApps.length === 0) {
-      tbody.innerHTML = `
-        <tr>
-          <td colspan="7">
-            <div class="empty-state">
-              <div class="empty-state-icon">📦</div>
-              <div class="empty-state-title">No Applications Deployed</div>
-              <div class="empty-state-desc">Deploy Git repositories, static sites, or containerized APIs across cluster nodes with reverse proxy routing.</div>
-              <div class="empty-state-action">
-                <button class="btn btn-sm btn-primary" onclick="openDeployModal()">+ Deploy from GitHub</button>
-              </div>
-            </div>
-          </td>
-        </tr>
+      const emptyHtml = `
+        <div class="apps-empty-state">
+          <div class="apps-empty-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+              <line x1="12" y1="22.08" x2="12" y2="12"></line>
+            </svg>
+          </div>
+          <div class="apps-empty-title">No Applications Deployed</div>
+          <div class="apps-empty-desc">Deploy Git repositories, static sites, or containerized APIs across cluster nodes with reverse proxy routing.</div>
+          <div class="apps-empty-action">
+            <button class="btn btn-primary" onclick="showDeployContainer()">Deploy Application</button>
+          </div>
+        </div>
       `;
+      if (tbody) {
+        tbody.innerHTML = `<tr><td colspan="6">${emptyHtml}</td></tr>`;
+      }
+      if (cardsContainer) {
+        cardsContainer.innerHTML = emptyHtml;
+      }
       return;
     }
 
-    tbody.innerHTML = cachedApps.map(app => {
-      const statusPill = renderStatusPill(app.status);
-      const hostPort = app.port || app.host_port || "-";
-      const contPort = app.container_port || "-";
-      const portDisplay = hostPort !== "-" ? `${hostPort}:${contPort}` : `${contPort}`;
-      const nodeDisplay = app.selected_node || app.target || "auto";
-      const failureNote = app.failure_reason ? `<div class="cell-muted mono" style="font-size: 10px; color: var(--status-red);">${escapeHtml(app.failure_reason)}</div>` : '';
+    // Desktop Table HTML
+    if (tbody) {
+      tbody.innerHTML = cachedApps.map(app => {
+        const statusBadge = renderAppStatusBadge(app.status);
+        const hostPort = app.port || app.host_port || "-";
+        const contPort = app.container_port || "-";
+        const portDisplay = hostPort !== "-" ? `${hostPort} → ${contPort}` : `${contPort}`;
+        const nodeDisplay = app.selected_node || app.target || "auto";
+        const isFailed = ["FAILED", "ERROR"].includes((app.status || "").toUpperCase()) || Boolean(app.failure_reason);
 
-      const isGithub = app.source && app.source.type === "github";
-      const sourceBadge = isGithub
-        ? `<span class="source-badge" title="GitHub: ${escapeHtml(app.source.repository)}@${escapeHtml(app.source.branch || 'main')}">GitHub: ${escapeHtml(app.source.repository?.split('/')[1] || app.source.repository || 'repo')}</span>`
-        : `<span class="source-badge source-badge-manual">Manual</span>`;
+        const isGithub = app.source && app.source.type === "github";
+        const isImage = (app.source && app.source.type === "image") || Boolean(app.image);
 
-      const routePath = app.route?.path || (app.route ? app.route.path : "-");
-      const routeDisplay = routePath && routePath !== "-"
-        ? `<a href="${routePath}/" target="_blank" class="mono text-online" style="font-weight: 500;" title="Open application route">${escapeHtml(routePath)}/</a>`
-        : `<span class="cell-muted mono">—</span>`;
+        let sourceBadge = `<span class="app-source-pill">Manual</span>`;
+        if (isGithub) {
+          const repoName = app.source.repository || 'repo';
+          const shortRepo = repoName.includes('/') ? repoName.split('/')[1] : repoName;
+          const branch = app.source.branch || 'main';
+          sourceBadge = `<span class="app-source-pill" title="GitHub: ${escapeHtml(repoName)}@${escapeHtml(branch)}"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg> ${escapeHtml(shortRepo)}</span>`;
+        } else if (isImage) {
+          const imgRef = app.image || app.source?.image || 'image';
+          const shortImg = imgRef.includes('/') ? imgRef.split('/').slice(-1)[0] : imgRef;
+          sourceBadge = `<span class="app-source-pill" title="Image: ${escapeHtml(imgRef)}">${escapeHtml(shortImg)}</span>`;
+        }
 
-      const canDeploy = ["CREATED", "STOPPED", "FAILED"].includes(app.status);
-      const canRedeploy = isGithub && ["RUNNING", "FAILED", "STOPPED"].includes(app.status);
-      const canStop = ["RUNNING"].includes(app.status);
-      const canRestart = ["RUNNING", "STOPPED"].includes(app.status);
+        const routePath = app.route?.path || (app.route ? app.route.path : "-");
+        const routeDisplay = routePath && routePath !== "-"
+          ? `<a href="${routePath}/" target="_blank" class="app-route-link" title="Open ${escapeHtml(routePath)}/"><span>${escapeHtml(routePath)}/</span><svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.5 0a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0V3.56l-5.22 5.22a.75.75 0 0 1-1.06-1.06l5.22-5.22H11a.75.75 0 0 1-.75-.75Z"/></svg></a>`
+          : `<span class="cell-muted mono">—</span>`;
 
-      return `
-        <tr>
-          <td>
-            <a href="javascript:void(0)" onclick="openAppDetails('${app.app_id}')" class="mono" style="font-weight: 600;">${escapeHtml(app.name)}</a>
-            <div class="cell-muted mono" style="font-size: 10px;">${escapeHtml(app.app_id)}</div>
-          </td>
-          <td>${sourceBadge}</td>
-          <td>
-            ${statusPill}
-            ${failureNote}
-          </td>
-          <td>${routeDisplay}</td>
-          <td class="mono">${escapeHtml(nodeDisplay)}</td>
-          <td class="mono">${portDisplay}</td>
-          <td style="text-align: right;">
-            <div style="display: inline-flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end;">
-              <button class="btn btn-sm" onclick="openAppDetails('${app.app_id}')">Details</button>
-              ${canRedeploy ? `<button class="btn btn-sm btn-primary" onclick="redeployApp('${app.app_id}')">Redeploy</button>` : ''}
-              ${(!canRedeploy && canDeploy) ? `<button class="btn btn-sm btn-primary" onclick="deployApp('${app.app_id}')">Deploy</button>` : ''}
-              ${canStop ? `<button class="btn btn-sm" onclick="stopApp('${app.app_id}')">Stop</button>` : ''}
-              ${canRestart ? `<button class="btn btn-sm" onclick="restartApp('${app.app_id}')">Restart</button>` : ''}
-              <button class="btn btn-sm btn-danger" onclick="deleteApp('${app.app_id}')">Delete</button>
+        const canDeploy = ["CREATED", "STOPPED", "FAILED"].includes(app.status);
+        const canRedeploy = isGithub && ["RUNNING", "FAILED", "STOPPED"].includes(app.status);
+        const canStop = ["RUNNING"].includes(app.status);
+        const canRestart = ["RUNNING", "STOPPED"].includes(app.status);
+
+        let rowHtml = `
+          <tr class="app-row" data-app-id="${escapeHtml(app.app_id)}">
+            <td>
+              <div class="app-title-group">
+                <a href="javascript:void(0)" onclick="openAppDetails('${escapeHtml(app.app_id)}')" class="app-name-link">${escapeHtml(app.name)}</a>
+                <div class="app-meta-sub">
+                  <span class="app-id-pill">${escapeHtml(app.app_id)}</span>
+                  ${app.runtime ? `<span class="app-runtime-tag">${escapeHtml(app.runtime)}</span>` : ''}
+                </div>
+              </div>
+            </td>
+            <td>${statusBadge}</td>
+            <td>${sourceBadge}</td>
+            <td>${routeDisplay}</td>
+            <td>
+              <div class="app-target-group">
+                <span class="app-node-label" title="${escapeHtml(nodeDisplay)}">${escapeHtml(nodeDisplay)}</span>
+                <span class="app-port-label">${escapeHtml(portDisplay)}</span>
+              </div>
+            </td>
+            <td style="text-align: right;">
+              <div class="app-actions-group">
+                <button class="btn btn-sm btn-subtle" onclick="openAppDetails('${escapeHtml(app.app_id)}')">Details</button>
+                ${canRedeploy ? `<button class="btn btn-sm btn-primary" onclick="redeployApp('${escapeHtml(app.app_id)}')">Redeploy</button>` : ''}
+                ${(!canRedeploy && canDeploy) ? `<button class="btn btn-sm btn-primary" onclick="deployApp('${escapeHtml(app.app_id)}')">Deploy</button>` : ''}
+                ${canRestart ? `<button class="btn btn-sm btn-subtle" onclick="restartApp('${escapeHtml(app.app_id)}')">Restart</button>` : ''}
+                ${canStop ? `<button class="btn btn-sm btn-subtle" onclick="stopApp('${escapeHtml(app.app_id)}')">Stop</button>` : ''}
+                <button class="btn btn-sm btn-danger" onclick="deleteApp('${escapeHtml(app.app_id)}')">Delete</button>
+              </div>
+            </td>
+          </tr>
+        `;
+
+        if (isFailed && app.failure_reason) {
+          rowHtml += `
+            <tr class="app-error-row" data-app-id="${escapeHtml(app.app_id)}">
+              <td colspan="6">
+                <div class="app-error-callout">
+                  <span class="app-error-badge">Deployment Failed</span>
+                  <span class="app-error-msg">${escapeHtml(app.failure_reason)}</span>
+                </div>
+              </td>
+            </tr>
+          `;
+        }
+
+        return rowHtml;
+      }).join("");
+    }
+
+    // Mobile Cards HTML
+    if (cardsContainer) {
+      cardsContainer.innerHTML = cachedApps.map(app => {
+        const statusBadge = renderAppStatusBadge(app.status);
+        const hostPort = app.port || app.host_port || "-";
+        const contPort = app.container_port || "-";
+        const portDisplay = hostPort !== "-" ? `${hostPort} → ${contPort}` : `${contPort}`;
+        const nodeDisplay = app.selected_node || app.target || "auto";
+        const isFailed = ["FAILED", "ERROR"].includes((app.status || "").toUpperCase()) || Boolean(app.failure_reason);
+
+        const isGithub = app.source && app.source.type === "github";
+        const isImage = (app.source && app.source.type === "image") || Boolean(app.image);
+
+        let sourceText = "Manual";
+        if (isGithub) {
+          sourceText = `GitHub: ${app.source.repository || 'repo'}`;
+        } else if (isImage) {
+          sourceText = `Image: ${app.image || app.source?.image || 'container'}`;
+        }
+
+        const routePath = app.route?.path || (app.route ? app.route.path : "-");
+        const routeDisplay = routePath && routePath !== "-"
+          ? `<a href="${routePath}/" target="_blank" class="app-route-link"><span>${escapeHtml(routePath)}/</span></a>`
+          : `<span class="cell-muted mono">—</span>`;
+
+        const canDeploy = ["CREATED", "STOPPED", "FAILED"].includes(app.status);
+        const canRedeploy = isGithub && ["RUNNING", "FAILED", "STOPPED"].includes(app.status);
+        const canStop = ["RUNNING"].includes(app.status);
+        const canRestart = ["RUNNING", "STOPPED"].includes(app.status);
+
+        return `
+          <div class="app-card" data-app-id="${escapeHtml(app.app_id)}">
+            <div class="app-card-header">
+              <div class="app-title-group">
+                <a href="javascript:void(0)" onclick="openAppDetails('${escapeHtml(app.app_id)}')" class="app-name-link" style="font-size: 14px;">${escapeHtml(app.name)}</a>
+                <div class="app-meta-sub">
+                  <span class="app-id-pill">${escapeHtml(app.app_id)}</span>
+                  ${app.runtime ? `<span class="app-runtime-tag">${escapeHtml(app.runtime)}</span>` : ''}
+                </div>
+              </div>
+              <div>${statusBadge}</div>
             </div>
-          </td>
-        </tr>
-      `;
-    }).join("");
+
+            <div class="app-card-grid">
+              <div class="app-card-grid-item">
+                <span class="app-card-grid-label">Source</span>
+                <span class="mono cell-muted" style="font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(sourceText)}</span>
+              </div>
+              <div class="app-card-grid-item">
+                <span class="app-card-grid-label">Route</span>
+                <div>${routeDisplay}</div>
+              </div>
+              <div class="app-card-grid-item">
+                <span class="app-card-grid-label">Assigned Node</span>
+                <span class="mono" style="font-size: 11px;">${escapeHtml(nodeDisplay)}</span>
+              </div>
+              <div class="app-card-grid-item">
+                <span class="app-card-grid-label">Port Mapping</span>
+                <span class="mono cell-muted" style="font-size: 11px;">${escapeHtml(portDisplay)}</span>
+              </div>
+            </div>
+
+            ${(isFailed && app.failure_reason) ? `
+              <div class="app-card-error">
+                <strong>Deployment Error:</strong> ${escapeHtml(app.failure_reason)}
+              </div>
+            ` : ''}
+
+            <div class="app-card-footer">
+              <button class="btn btn-sm btn-subtle" onclick="openAppDetails('${escapeHtml(app.app_id)}')">Details</button>
+              ${canRedeploy ? `<button class="btn btn-sm btn-primary" onclick="redeployApp('${escapeHtml(app.app_id)}')">Redeploy</button>` : ''}
+              ${(!canRedeploy && canDeploy) ? `<button class="btn btn-sm btn-primary" onclick="deployApp('${escapeHtml(app.app_id)}')">Deploy</button>` : ''}
+              ${canRestart ? `<button class="btn btn-sm btn-subtle" onclick="restartApp('${escapeHtml(app.app_id)}')">Restart</button>` : ''}
+              ${canStop ? `<button class="btn btn-sm btn-subtle" onclick="stopApp('${escapeHtml(app.app_id)}')">Stop</button>` : ''}
+              <button class="btn btn-sm btn-danger" onclick="deleteApp('${escapeHtml(app.app_id)}')">Delete</button>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
 
     if (currentActiveAppId) {
       const currentApp = cachedApps.find(a => a.app_id === currentActiveAppId);
@@ -1906,7 +2894,20 @@ async function loadApps() {
     updateLastRefreshed();
   } catch (err) {
     console.error("Failed to load apps:", err);
-    tbody.innerHTML = `<tr><td colspan="7" class="text-offline">Error loading applications: ${err.message}</td></tr>`;
+    const errHtml = `
+      <div class="apps-error-state">
+        <div class="apps-error-msg-wrap">
+          <span class="text-offline">Error loading applications: ${escapeHtml(err.message)}</span>
+        </div>
+        <button class="btn btn-sm" onclick="loadApps()">Retry</button>
+      </div>
+    `;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="6">${errHtml}</td></tr>`;
+    }
+    if (cardsContainer) {
+      cardsContainer.innerHTML = errHtml;
+    }
   }
 }
 
@@ -2957,8 +3958,17 @@ document.getElementById("ps-modal-confirm-btn")?.addEventListener("click", () =>
 });
 
 document.addEventListener("keydown", (e) => {
-  const backdrop = document.getElementById("ps-modal-backdrop");
-  if (!backdrop || backdrop.style.display === "none") return;
+  const haBackdrop = document.getElementById("ha-details-modal-backdrop");
+  if (haBackdrop && haBackdrop.style.display !== "none") {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeHADetailsModal();
+      return;
+    }
+  }
+
+  const psBackdrop = document.getElementById("ps-modal-backdrop");
+  if (!psBackdrop || psBackdrop.style.display === "none") return;
 
   if (e.key === "Escape") {
     e.preventDefault();
@@ -2968,6 +3978,17 @@ document.addEventListener("keydown", (e) => {
     document.getElementById("ps-modal-confirm-btn")?.click();
   }
 });
+
+document.getElementById("ha-details-modal-backdrop")?.addEventListener("click", (e) => {
+  if (e.target.id === "ha-details-modal-backdrop") {
+    closeHADetailsModal();
+  }
+});
+
+// Periodic background polling for cluster HA telemetry (15-second interval)
+setInterval(() => {
+  updateHAStatus(false);
+}, 15000);
 
 // Initialize
 navigate();

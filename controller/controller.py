@@ -13,6 +13,7 @@ import time
 import secrets
 import argparse
 import hashlib
+import math
 import hmac
 import shutil
 import threading
@@ -105,7 +106,8 @@ from config.ha_manager import (
     HAManager,
     HAState,
     LeaderLease,
-    find_active_leader
+    find_active_leader,
+    resolve_controller_node_id
 )
 
 HA_MANAGER = None
@@ -116,8 +118,9 @@ def get_ha_manager(paths=None, role="auto", node_id=None, node_url=None, force_r
     curr_paths = paths or get_controller_paths()
     if HA_MANAGER is None or force_reload or (paths and getattr(HA_MANAGER, "paths", None) != paths):
         cfg = get_controller_runtime_config()
+        resolved_node_id = resolve_controller_node_id(node_id=node_id, paths=curr_paths)
         HA_MANAGER = HAManager(
-            node_id=node_id,
+            node_id=resolved_node_id,
             node_url=node_url or f"http://{cfg.host if cfg.host != '0.0.0.0' else '127.0.0.1'}:{cfg.port}",
             role=role,
             paths=curr_paths
@@ -1512,8 +1515,13 @@ class ControllerHandler(BaseHTTPRequestHandler):
         # GET /ha/leader or GET /api/ha/leader
         if path in ("/ha/leader", "/api/ha/leader"):
             mgr = get_ha_manager()
+            leader_id = mgr.current_leader_id
+            leader_name, leader_online, leader_registered = mgr.resolve_leader_name(leader_id) if hasattr(mgr, "resolve_leader_name") else (leader_id, False, False)
             self.send_json(200, {
-                "leader_id": mgr.current_leader_id,
+                "leader_id": leader_id,
+                "leader_name": leader_name,
+                "leader_online": leader_online,
+                "leader_registered": leader_registered,
                 "leader_url": mgr.current_leader_url,
                 "term": mgr.current_term,
                 "state_version": mgr.state_version,
@@ -1684,15 +1692,22 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.send_json(200, eval_res)
             return
 
-        # GET /nodes/<node_id>/diagnostics
-        if path.startswith("/nodes/") and path.endswith("/diagnostics"):
-            node_id = path[7:-12].strip()
+        # GET /nodes/<node_id>/diagnostics or /api/nodes/<node_id>/diagnostics
+        norm_path = path.rstrip("/")
+        is_diag = False
+        diag_node_id = None
+        if norm_path.endswith("/diagnostics"):
+            if norm_path.startswith("/api/nodes/"):
+                diag_node_id = norm_path[11:-12].strip("/")
+                is_diag = True
+            elif norm_path.startswith("/nodes/"):
+                diag_node_id = norm_path[7:-12].strip("/")
+                is_diag = True
+
+        if is_diag and diag_node_id:
+            node_id = diag_node_id
             nodes_db = load_nodes_db()
             node = nodes_db.get("nodes", {}).get(node_id)
-            if not node:
-                self.send_json(404, {"error": f"Node '{node_id}' not found"})
-                return
-
             is_local = (node_id in ("local", "self") or (node and node.get("ip") in ("127.0.0.1", "localhost", "::1")))
             if is_local:
                 try:
@@ -1700,8 +1715,44 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     diag_res = run_live_diagnostics()
                     self.send_json(200, {"node_id": node_id, "diagnostics": diag_res})
                     return
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.send_json(500, {"error": f"Local diagnostics error: {e}"})
+                    return
+
+            if not node:
+                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return
+
+            node_status = (node.get("status") or "").upper()
+            hb = node.get("last_heartbeat", {}) if node else {}
+            hb_sys = hb.get("system", {})
+            bat = hb.get("battery") or hb_sys.get("battery") or {}
+            net = hb.get("network") or hb_sys.get("network") or {}
+            cpu = hb.get("cpu_details") or hb_sys.get("cpu_details") or {}
+            thm = hb.get("thermals") or hb_sys.get("thermals") or {}
+
+            if node_status == "OFFLINE":
+                self.send_json(200, {
+                    "node_id": node_id,
+                    "diagnostics": {
+                        "status": "offline",
+                        "live": False,
+                        "duration_ms": 0,
+                        "error": f"Node '{node_id}' is OFFLINE. Cannot run live diagnostics.",
+                        "timestamp": node.get("last_seen"),
+                        "battery": bat,
+                        "network": {
+                            **net,
+                            "status": "offline",
+                            "ip": node.get("ip"),
+                            "ping_ms": None,
+                            "transfer_speed_mbps": 0
+                        },
+                        "cpu": cpu,
+                        "thermals": thm
+                    }
+                })
+                return
 
             node_ip = node.get("ip") if node else None
             if node_ip and node_ip not in ("127.0.0.1", "localhost", "::1"):
@@ -1709,17 +1760,12 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     req = urllib.request.Request(f"http://{node_ip}:8080/diagnostics", headers={"User-Agent": "PersonalServer-Controller/1.0"})
                     with urllib.request.urlopen(req, timeout=2.5) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
-                        self.send_json(200, {"node_id": node_id, "diagnostics": data.get("diagnostics", data)})
+                        diag_payload = data.get("diagnostics", data)
+                        diag_payload["live"] = True
+                        self.send_json(200, {"node_id": node_id, "diagnostics": diag_payload})
                         return
                 except Exception:
                     pass
-
-            hb = node.get("last_heartbeat", {}) if node else {}
-            hb_sys = hb.get("system", {})
-            bat = hb.get("battery") or hb_sys.get("battery") or {}
-            net = hb.get("network") or hb_sys.get("network") or {}
-            cpu = hb.get("cpu_details") or hb_sys.get("cpu_details") or {}
-            thm = hb.get("thermals") or hb_sys.get("thermals") or {}
 
             ping_ms = None
             if node_ip:
@@ -1730,7 +1776,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     pass
 
             diag_obj = {
-                "status": "cached",
+                "status": "cached" if ping_ms is not None else "unreachable",
+                "live": False,
+                "error": None if ping_ms is not None else f"Live telemetry unreachable on {node_ip or 'node'}:8080. Returning cached heartbeat metrics.",
                 "timestamp": hb.get("timestamp") or (node.get("last_seen") if node else None),
                 "battery": bat,
                 "network": {
@@ -1745,17 +1793,20 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return
 
         # GET /nodes/<node_id>
-        if path.startswith("/nodes/"):
-            node_id = path[7:].strip()
-            nodes_db = load_nodes_db()
-            node = nodes_db.get("nodes", {}).get(node_id)
-            if not node:
-                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+        if norm_path.startswith("/nodes/") or norm_path.startswith("/api/nodes/"):
+            prefix_len = 11 if norm_path.startswith("/api/nodes/") else 7
+            rest = norm_path[prefix_len:].strip("/")
+            if "/" not in rest and rest:
+                node_id = rest
+                nodes_db = load_nodes_db()
+                node = nodes_db.get("nodes", {}).get(node_id)
+                if not node:
+                    self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                    return
+                s_node = sanitize_node_record(node, self.heartbeat_timeout)
+                s_node["deboarding"] = evaluate_node_deboarding_safety(node_id, nodes_db)
+                self.send_json(200, {"node": s_node})
                 return
-            s_node = sanitize_node_record(node, self.heartbeat_timeout)
-            s_node["deboarding"] = evaluate_node_deboarding_safety(node_id, nodes_db)
-            self.send_json(200, {"node": s_node})
-            return
 
         # GET /jobs
         if path == "/jobs":
@@ -1766,15 +1817,70 @@ class ControllerHandler(BaseHTTPRequestHandler):
             all_jobs = list(jobs_db.get("jobs", {}).values())
             filter_node = query.get("node", [None])[0]
             filter_status = query.get("status", [None])[0]
+            filter_type = query.get("type", [None])[0]
+            search_q = query.get("search", query.get("q", [None]))[0]
+            sort_by = query.get("sort", ["recent"])[0]
 
-            if filter_node:
-                all_jobs = [j for j in all_jobs if j.get("target_node") == filter_node]
-            if filter_status:
+            if filter_node and filter_node != "all":
+                all_jobs = [j for j in all_jobs if j.get("target_node") == filter_node or j.get("assigned_node") == filter_node]
+            if filter_status and filter_status != "all":
                 all_jobs = [j for j in all_jobs if j.get("status") == filter_status.upper()]
+            if filter_type and filter_type != "all":
+                all_jobs = [j for j in all_jobs if j.get("type") == filter_type]
+            if search_q:
+                q_lower = search_q.strip().lower()
+                all_jobs = [
+                    j for j in all_jobs
+                    if q_lower in (j.get("job_id") or "").lower()
+                    or q_lower in (j.get("type") or "").lower()
+                    or q_lower in (j.get("target_node") or "").lower()
+                    or q_lower in (j.get("assigned_node") or "").lower()
+                ]
+
+            # Sorting: default recent first
+            if sort_by == "oldest":
+                all_jobs.sort(key=lambda j: j.get("created_at") or j.get("submitted_at") or "")
+            elif sort_by == "duration":
+                all_jobs.sort(key=lambda j: (j.get("result", {}) or {}).get("duration_ms") or j.get("execution_duration_sec") or 0, reverse=True)
+            else:
+                all_jobs.sort(key=lambda j: j.get("created_at") or j.get("submitted_at") or "", reverse=True)
+
+            total_count = len(all_jobs)
+
+            # Optional server-side pagination: limit, page, offset
+            limit_str = query.get("limit", query.get("page_size", [None]))[0]
+            page_str = query.get("page", [None])[0]
+            offset_str = query.get("offset", [None])[0]
+
+            if limit_str is not None or page_str is not None or offset_str is not None:
+                limit = max(1, min(100, int(limit_str) if limit_str else 25))
+                if offset_str is not None:
+                    offset = max(0, int(offset_str))
+                    page = (offset // limit) + 1
+                elif page_str is not None:
+                    page = max(1, int(page_str))
+                    offset = (page - 1) * limit
+                else:
+                    offset = 0
+                    page = 1
+
+                paginated_jobs = all_jobs[offset : offset + limit]
+                total_pages = max(1, math.ceil(total_count / limit)) if total_count > 0 else 1
+
+                self.send_json(200, {
+                    "jobs": paginated_jobs,
+                    "count": len(paginated_jobs),
+                    "total_count": total_count,
+                    "page": page,
+                    "page_size": limit,
+                    "total_pages": total_pages
+                })
+                return
 
             self.send_json(200, {
                 "jobs": all_jobs,
-                "count": len(all_jobs)
+                "count": len(all_jobs),
+                "total_count": total_count
             })
             return
 
@@ -2011,6 +2117,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
         body = self.read_json_body()
         if body and isinstance(body, dict):
             self.current_correlation_id = extract_correlation_id(self.headers, body)
@@ -2069,7 +2176,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
             mgr = get_ha_manager()
             target_url = body.get("target_url") if body else None
             result = mgr.manual_failover(target_node_url=target_url)
-            self.send_json(200, result)
+            status_code = 200 if result.get("status") == "success" else 400
+            self.send_json(status_code, result)
             return
 
         if path == "/ha/promote":
@@ -2743,7 +2851,26 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
 
             current_st = job.get("status")
-            if current_st in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED, JOB_STATE_REJECTED) or not validate_job_transition(current_st, JOB_STATE_CANCELLED):
+
+            # Idempotent repeat cancellation check
+            if current_st == JOB_STATE_CANCELLED:
+                if (body and body.get("idempotent")) or query.get("idempotent", [False])[0]:
+                    self.send_json(200, {
+                        "status": JOB_STATE_CANCELLED,
+                        "job_id": job_id,
+                        "duplicate": True,
+                        "message": f"Job '{job_id}' is already cancelled.",
+                        "job": job
+                    })
+                    return
+                self.send_json(400, {
+                    "error": f"Invalid state transition: Cannot cancel job '{job_id}' in terminal state '{current_st}'.",
+                    "status": current_st
+                })
+                return
+
+            # Terminal states: SUCCEEDED, FAILED, REJECTED cannot be cancelled
+            if current_st in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_REJECTED) or not validate_job_transition(current_st, JOB_STATE_CANCELLED):
                 self.send_json(400, {
                     "error": f"Invalid state transition: Cannot cancel job '{job_id}' in terminal state '{current_st}'.",
                     "status": current_st
@@ -2751,13 +2878,26 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
 
             now_iso = get_current_iso_timestamp()
+            reason = (body.get("reason") if body else "") or "Cancelled by operator request"
+
+            # Attempt active process / container termination if job was actively executing
+            termination_info = {"supported": True, "terminated": False}
+            if current_st in (JOB_STATE_RUNNING, JOB_STATE_CLAIMED):
+                try:
+                    from agent.job_executor import JobExecutor
+                    termination_info = JobExecutor.terminate_active_job(job_id, reason=reason)
+                except Exception as e:
+                    print(f"[CONTROLLER] Active job termination attempt note for {job_id}: {e}", file=sys.stderr)
+
             job["status"] = JOB_STATE_CANCELLED
             job["state"] = JOB_STATE_CANCELLED
+            job["cancellation_requested"] = True
             job["cancelled_at"] = now_iso
             job["finished_at"] = now_iso
             job["lease_expires_at"] = None
-            reason = (body.get("reason") if body else "") or "Cancelled by client request"
             job["cancel_reason"] = reason
+            if termination_info.get("terminated"):
+                job["terminated_active_workload"] = True
             save_jobs_db(jobs_db)
 
             print(f"[CONTROLLER] Job {job_id} CANCELLED: {reason}")
@@ -2765,6 +2905,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "status": JOB_STATE_CANCELLED,
                 "job_id": job_id,
                 "message": f"Job '{job_id}' successfully cancelled.",
+                "termination": termination_info,
                 "job": job
             })
             return
@@ -3733,41 +3874,6 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
 
         # ----------------------------------------------------------------------
-        # 6. Cancel Job: POST /jobs/<job_id>/cancel
-        # ----------------------------------------------------------------------
-        if path.startswith("/jobs/") and path.endswith("/cancel"):
-            job_id = path[6:-7].strip()
-            enrollment_token = get_or_create_enrollment_token()
-            if token and not constant_time_compare(token, enrollment_token):
-                pass
-
-            jobs_db = load_jobs_db()
-            job = jobs_db.get("jobs", {}).get(job_id)
-            if not job:
-                self.send_json(404, {"error": f"Job '{job_id}' not found"})
-                return
-
-            if job.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED):
-                self.send_json(400, {
-                    "error": f"Cannot cancel job '{job_id}' in terminal state '{job.get('status')}'."
-                })
-                return
-
-            job["status"] = JOB_STATE_CANCELLED
-            job["state"] = JOB_STATE_CANCELLED
-            job["finished_at"] = get_current_iso_timestamp()
-            job["lease_expires_at"] = None
-            save_jobs_db(jobs_db)
-
-            print(f"[CONTROLLER] Job {job_id} cancelled by admin.")
-            self.send_json(200, {
-                "status": "cancelled",
-                "job_id": job_id,
-                "job": job
-            })
-            return
-
-        # ----------------------------------------------------------------------
         # 7. Node Lifecycle: Drain, Deboard, Resume, and Safe Remove
         # ----------------------------------------------------------------------
         # POST /nodes/<node_id>/drain
@@ -4143,7 +4249,7 @@ def start_server(host=None, port=None, timeout=None, role=None):
 
     # Initialize High Availability (HA) Manager
     ha_role = role or os.environ.get("PERSONALSERVER_HA_ROLE", "auto")
-    ha_node_id = os.environ.get("PERSONALSERVER_NODE_ID", socket.gethostname() or "node-master")
+    ha_node_id = resolve_controller_node_id(node_id=None, paths=paths)
     ha_node_url = f"http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}"
     ha_mgr = get_ha_manager(paths=paths, role=ha_role, node_id=ha_node_id, node_url=ha_node_url, force_reload=True)
     ha_mgr.initialize()

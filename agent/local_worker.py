@@ -545,8 +545,33 @@ class LocalWorker:
                 self._submit_job_result(job_id, err_result, token)
                 return err_result
 
-            # 2. Workload Execution via JobExecutor
-            exec_result = JobExecutor.execute(job)
+            # 2. Workload Execution via JobExecutor with cooperative cancellation watcher
+            stop_cancel_watcher = threading.Event()
+
+            def _watch_cancellation():
+                check_url = f"{self.controller_url}/jobs/{job_id}"
+                while not stop_cancel_watcher.wait(timeout=1.0):
+                    try:
+                        req = urllib.request.Request(
+                            check_url,
+                            headers={"Authorization": f"Bearer {token}", "User-Agent": "PersonalServer-LocalWorker/1.0"}
+                        )
+                        with urllib.request.urlopen(req, timeout=1.5) as resp:
+                            j_data = json.loads(resp.read().decode("utf-8"))
+                            curr_st = (j_data.get("job") or {}).get("status")
+                            if curr_st == JOB_STATE_CANCELLED or (j_data.get("job") or {}).get("cancellation_requested"):
+                                JobExecutor.terminate_active_job(job_id, reason="Cancelled via controller request")
+                                break
+                    except Exception:
+                        pass
+
+            watcher_thread = threading.Thread(target=_watch_cancellation, daemon=True)
+            watcher_thread.start()
+            try:
+                exec_result = JobExecutor.execute(job)
+            finally:
+                stop_cancel_watcher.set()
+                watcher_thread.join(timeout=0.2)
 
             # 3. Post result back to controller
             self._submit_job_result(job_id, exec_result, token)

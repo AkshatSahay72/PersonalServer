@@ -50,6 +50,97 @@ def get_current_iso_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def resolve_controller_node_id(node_id: Optional[str] = None, paths=None) -> str:
+    """
+    Authoritatively resolves the local controller's registered node ID.
+    Precedence:
+    1. Explicit non-empty node_id argument.
+    2. PERSONALSERVER_NODE_ID environment variable.
+    3. Local node configuration file (config/node.json or config/node.conf).
+    4. Match local network IP or hostname against registered cluster nodes in nodes.json.
+    5. Fallback to machine hostname or 'node-master'.
+    """
+    if node_id and str(node_id).strip() and str(node_id).strip() not in ("unknown", "None", "-"):
+        return str(node_id).strip()
+
+    env_id = os.environ.get("PERSONALSERVER_NODE_ID")
+    if env_id and env_id.strip() and env_id.strip() not in ("unknown", "None", "-"):
+        return env_id.strip()
+
+    curr_paths = paths or get_controller_paths()
+    config_dir = getattr(curr_paths, "config_dir", BASE_DIR / "config")
+    data_dir = getattr(curr_paths, "data_dir", BASE_DIR / "controller" / "data")
+
+    # 3. Check local node config files
+    node_json = config_dir / "node.json"
+    if node_json.exists():
+        try:
+            with open(node_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                nid = data.get("node_id") or data.get("NODE_ID")
+                if nid and str(nid).strip():
+                    return str(nid).strip()
+        except Exception:
+            pass
+
+    node_conf = config_dir / "node.conf"
+    if node_conf.exists():
+        try:
+            with open(node_conf, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("NODE_ID="):
+                        nid = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if nid:
+                            return nid
+        except Exception:
+            pass
+
+    # 4. Match local network IP / Tailscale IP / hostname against registered nodes.json
+    nodes_file = getattr(curr_paths, "nodes_file", data_dir / "nodes.json")
+    if nodes_file.exists():
+        try:
+            with open(nodes_file, "r", encoding="utf-8") as f:
+                nodes_db = json.load(f)
+                nodes = nodes_db.get("nodes", {})
+
+                local_ips = set(["127.0.0.1"])
+                try:
+                    hostname = socket.gethostname()
+                    for ip in socket.gethostbyname_ex(hostname)[2]:
+                        local_ips.add(ip)
+                except Exception:
+                    pass
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                        s.connect(("10.255.255.255", 1))
+                        local_ips.add(s.getsockname()[0])
+                except Exception:
+                    pass
+
+                # Check for IP match (e.g. Tailscale IP)
+                for nid, n in nodes.items():
+                    n_ts = n.get("tailscale_ip")
+                    n_host = n.get("host")
+                    n_ip = n.get("ip")
+                    if (n_ts and n_ts in local_ips) or (n_host and n_host in local_ips) or (n_ip and n_ip in local_ips):
+                        return nid
+
+                # Check for hostname match
+                try:
+                    cur_host = socket.gethostname().lower()
+                    for nid, n in nodes.items():
+                        n_name = (n.get("name") or "").lower()
+                        n_hostname = (n.get("hostname") or "").lower()
+                        if cur_host and (cur_host == n_name or cur_host == n_hostname):
+                            return nid
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return socket.gethostname() or "node-master"
+
+
 class LeaderLease:
     """
     Lease object holding cluster leadership, election term,
@@ -154,7 +245,7 @@ class HAManager:
         self.paths = paths or get_controller_paths()
         self.lease_file = getattr(self.paths, "leader_lease_file", self.paths.data_dir / "leader_lease.json")
 
-        self.node_id = str(node_id or socket.gethostname() or "node-master").strip()
+        self.node_id = resolve_controller_node_id(node_id=node_id, paths=self.paths)
         self.node_url = str(node_url or "http://127.0.0.1:8000").rstrip("/")
         
         # Load candidate URLs from args or environment
@@ -622,8 +713,35 @@ class HAManager:
                 new_term = self.current_term + 1
                 self.step_down(new_term, "target-leader", target_node_url)
                 return {"status": "success", "action": "stepped_down", "target": target_node_url, "term": new_term}
+            elif self.is_leader:
+                # If target not specified, look for available synchronized standbys to transfer to
+                if self.standby_nodes:
+                    candidates = sorted(
+                        self.standby_nodes.values(),
+                        key=lambda s: (s.get("in_sync", False), s.get("state_version", 0)),
+                        reverse=True
+                    )
+                    chosen_target = candidates[0].get("url")
+                    if chosen_target and chosen_target != self.node_url:
+                        new_term = self.current_term + 1
+                        self.step_down(new_term, "target-leader", chosen_target)
+                        return {
+                            "status": "success",
+                            "action": "stepped_down",
+                            "target": chosen_target,
+                            "term": new_term,
+                            "standby_node_id": candidates[0].get("node_id")
+                        }
+                # No standbys to fail over to
+                return {
+                    "status": "failed",
+                    "action": "no_standbys",
+                    "error": "No standby controller nodes available in the cluster to transfer leadership to.",
+                    "node_id": self.node_id,
+                    "term": self.current_term
+                }
             else:
-                # Force local promotion
+                # Local promotion from STANDBY to LEADER
                 self.elect_self(reason="Manual failover trigger")
                 return {"status": "success", "action": "promoted_local", "node_id": self.node_id, "term": self.current_term}
 
@@ -659,15 +777,52 @@ class HAManager:
             interval = self.heartbeat_interval_sec if self.is_leader else self.check_interval_sec
             self._stop_event.wait(timeout=interval)
 
+    def resolve_leader_name(self, leader_id: Optional[str]) -> Tuple[str, bool, bool]:
+        """
+        Resolves leader_id against the cluster node database.
+        Returns (display_name, is_online, is_registered).
+        """
+        if not leader_id or str(leader_id).strip() in ("None", "unknown", "-", ""):
+            return ("None", False, False)
+
+        target_id = str(leader_id).strip()
+        nodes_file = getattr(self.paths, "nodes_file", self.paths.data_dir / "nodes.json")
+        if nodes_file.exists():
+            try:
+                with open(nodes_file, "r", encoding="utf-8") as f:
+                    db = json.load(f)
+                    nodes = db.get("nodes", {})
+                    node = nodes.get(target_id)
+                    if not node:
+                        for nid, n in nodes.items():
+                            if n.get("name") == target_id or n.get("hostname") == target_id:
+                                node = n
+                                target_id = nid
+                                break
+                    if node:
+                        name = node.get("name") or node.get("hostname") or target_id
+                        status = (node.get("status") or "").upper()
+                        is_online = (status == "ONLINE")
+                        return (name, is_online, True)
+            except Exception:
+                pass
+        return (target_id, False, False)
+
     def get_status_dict(self) -> Dict[str, Any]:
         """Returns structured HA status dictionary for HTTP endpoints and Web UI."""
         with self._lock:
+            leader_id = self.current_leader_id
+            leader_name, leader_online, leader_registered = self.resolve_leader_name(leader_id)
+
             return {
                 "ha_enabled": True,
                 "role": self.state,
                 "node_id": self.node_id,
                 "node_url": self.node_url,
-                "leader_id": self.current_leader_id,
+                "leader_id": leader_id,
+                "leader_name": leader_name,
+                "leader_online": leader_online,
+                "leader_registered": leader_registered,
                 "leader_url": self.current_leader_url,
                 "term": self.current_term,
                 "state_version": self.state_version,
