@@ -1,0 +1,9 @@
+# PersonalServer Development, Testing, and CI Dependencies
+# -----------------------------------------------------------------------------
+-r requirements.txt
+
+# Test runner and assertion framework
+pytest>=8.0.0,<10.0.0
+
+# Fast static analysis, linting, and style enforcement
+ruff>=0.8.0,<1.0.0

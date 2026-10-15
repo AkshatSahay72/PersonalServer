@@ -1,0 +1,15 @@
+{
+  "image_ref": "personalserver/harmless-app:v1.0.0",
+  "repository": "personalserver/harmless-app",
+  "tag": "v1.0.0",
+  "digest": "sha256:9118eff063e988f49bf401086da83cfcf44bdbb464a45834d57c61952e1e6784",
+  "architecture": "amd64",
+  "created_at": "2026-10-15T16:07:50Z",
+  "metadata": {
+    "app_id": "test-sample-87c2c6b9",
+    "app_name": "harmless-app",
+    "size_bytes": 142,
+    "runtime": "local-store",
+    "build_duration_ms": 16
+  }
+}

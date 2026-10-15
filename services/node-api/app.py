@@ -11,6 +11,8 @@ import sys
 import json
 import re
 import shutil
+import hmac
+import shlex
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -28,6 +30,12 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE_DIR))
 from config.platform_config import get_platform_config
+from config.structured_logger import (
+    extract_correlation_id,
+    generate_correlation_id,
+    redact_sensitive_text,
+    redact_sensitive_data
+)
 CONFIG_FILE = BASE_DIR / "config" / "node.conf"
 CONFIG_JSON = BASE_DIR / "config" / "node.json"
 SECRETS_DIR = BASE_DIR / "config" / "secrets"
@@ -36,8 +44,8 @@ AUTH_TOKEN_FILE = SECRETS_DIR / "auth.token"
 STORAGE_ROOT = (BASE_DIR / "storage").resolve()
 STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 
-DEFAULT_CONTROLLER_URL = "http://127.0.0.1:8000"
-DEFAULT_ROUTER_URL = "http://127.0.0.1:8088"
+DEFAULT_CONTROLLER_URL = os.environ.get("PERSONALSERVER_CONTROLLER_URL", "http://127.0.0.1:8000")
+DEFAULT_ROUTER_URL = os.environ.get("PERSONALSERVER_ROUTER_URL", "http://127.0.0.1:8088")
 
 
 class ProxyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -56,12 +64,7 @@ class ProxyRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 PROXY_OPENER = urllib.request.build_opener(ProxyRedirectHandler)
 
-DEFAULT_KNOWN_NODES = {
-    "server-5387a86bf36116b1": {"name": "vivo-y31", "endpoint": "http://100.85.108.5:8080"},
-    "vivo-y31": {"node_id": "server-5387a86bf36116b1", "endpoint": "http://100.85.108.5:8080"},
-    "server-95bad5ff01424d4c8d184330d6d2e394": {"name": "node-02", "endpoint": "http://100.73.52.72:8080"},
-    "node-02": {"node_id": "server-95bad5ff01424d4c8d184330d6d2e394", "endpoint": "http://100.73.52.72:8080"},
-}
+DEFAULT_KNOWN_NODES = {}
 
 
 def resolve_target_node_endpoint(node_param):
@@ -93,10 +96,9 @@ def resolve_target_node_endpoint(node_param):
                 if param_str in (nid, nname):
                     if nid == local_id or nname == local_name:
                         return True, None
-                    if nid in DEFAULT_KNOWN_NODES:
-                        return False, DEFAULT_KNOWN_NODES[nid].get("endpoint")
-                    if nname in DEFAULT_KNOWN_NODES:
-                        return False, DEFAULT_KNOWN_NODES[nname].get("endpoint")
+                    node_ip = n.get("ip") or n.get("tailscale_ip") or n.get("host")
+                    if node_ip and node_ip not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                        return False, f"http://{node_ip}:8080"
     except Exception:
         pass
 
@@ -252,11 +254,31 @@ def load_config():
     return config
 
 
-def command(cmd):
+def constant_time_compare(val1, val2) -> bool:
+    """
+    Constant-time comparison for secrets and tokens to prevent timing attacks.
+    Returns False if either operand is empty, None, or not a string/bytes.
+    """
+    if not val1 or not val2:
+        return False
+    if not isinstance(val1, (str, bytes)) or not isinstance(val2, (str, bytes)):
+        return False
     try:
+        return hmac.compare_digest(val1, val2)
+    except Exception:
+        return False
+
+
+def command(cmd):
+    """Safely executes an administrative command without shell interpretation."""
+    try:
+        if isinstance(cmd, str):
+            cmd_args = shlex.split(cmd)
+        else:
+            cmd_args = list(cmd)
         return subprocess.check_output(
-            cmd,
-            shell=True,
+            cmd_args,
+            shell=False,
             text=True,
             stderr=subprocess.DEVNULL
         ).strip()
@@ -266,23 +288,26 @@ def command(cmd):
 
 def get_system_info():
     try:
-        cpu_cores = int(command("nproc"))
+        cpu_cores = os.cpu_count() or 1
     except Exception:
         cpu_cores = 1
 
-    uptime_output = command("uptime")
-    load_match = re.search(
-        r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)",
-        uptime_output
-    )
-    if load_match:
-        load_average = [
-            float(load_match.group(1)),
-            float(load_match.group(2)),
-            float(load_match.group(3))
-        ]
-    else:
-        load_average = [0.0, 0.0, 0.0]
+    try:
+        load_average = list(os.getloadavg())
+    except (AttributeError, OSError):
+        uptime_output = command("uptime")
+        load_match = re.search(
+            r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)",
+            uptime_output
+        )
+        if load_match:
+            load_average = [
+                float(load_match.group(1)),
+                float(load_match.group(2)),
+                float(load_match.group(3))
+            ]
+        else:
+            load_average = [0.0, 0.0, 0.0]
 
     memory_output = command("free -h")
     memory = {"total": "N/A", "used": "N/A", "available": "N/A"}
@@ -294,28 +319,42 @@ def get_system_info():
             elif len(parts) >= 4:
                 memory = {"total": parts[1], "used": parts[2], "available": parts[3]}
 
-    storage_output = command(f"df -h '{STORAGE_ROOT}'")
     storage = {"total": "N/A", "used": "N/A", "available": "N/A", "used_percent": "N/A"}
-    lines = storage_output.splitlines()
-    if len(lines) >= 2:
-        parts = lines[-1].split()
-        if len(parts) >= 5:
-            storage = {
-                "total": parts[1],
-                "used": parts[2],
-                "available": parts[3],
-                "used_percent": parts[4]
-            }
+    try:
+        ensure_storage_root()
+        usage = shutil.disk_usage(str(STORAGE_ROOT))
+        total_gb = usage.total / (1024 ** 3)
+        used_gb = usage.used / (1024 ** 3)
+        free_gb = usage.free / (1024 ** 3)
+        pct = (usage.used / usage.total * 100) if usage.total > 0 else 0
+        storage = {
+            "total": f"{total_gb:.1f}G",
+            "used": f"{used_gb:.1f}G",
+            "available": f"{free_gb:.1f}G",
+            "used_percent": f"{pct:.0f}%"
+        }
+    except Exception:
+        pass
+
+    try:
+        from config.node_telemetry import collect_comprehensive_telemetry
+        telem = collect_comprehensive_telemetry()
+    except Exception:
+        telem = {}
 
     return {
         "cpu_cores": cpu_cores,
         "load_average": load_average,
         "memory": memory,
-        "storage": storage
+        "storage": storage,
+        "battery": telem.get("battery", {}),
+        "network": telem.get("network", {}),
+        "cpu_details": telem.get("cpu_details", {}),
+        "thermals": telem.get("thermals", {})
     }
 
 
-def get_health():
+def get_health(correlation_id=None):
     config = load_config()
     return {
         "status": "online",
@@ -325,6 +364,7 @@ def get_health():
             "role": config.get("NODE_ROLE", config.get("role", "compute"))
         },
         "system": get_system_info(),
+        "correlation_id": correlation_id or generate_correlation_id(),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -373,12 +413,17 @@ def resolve_safe_storage_path(relative_path_str: str) -> Path:
 class NodeAPIHandler(BaseHTTPRequestHandler):
 
     def send_json(self, status_code, data):
+        corr_id = getattr(self, "current_correlation_id", None) or extract_correlation_id(self.headers)
+        if corr_id and isinstance(data, dict) and "correlation_id" not in data:
+            data["correlation_id"] = corr_id
         body = json.dumps(data, indent=2).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if corr_id:
+            self.send_header("X-Correlation-ID", corr_id)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Correlation-ID, X-Request-ID")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
@@ -386,13 +431,14 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Correlation-ID, X-Request-ID")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
 
     def check_auth(self):
-        """Optional token check for administrative storage endpoints."""
+        """Token and origin check for administrative storage endpoints."""
         expected_token = get_auth_token()
+        controller_token = get_controller_auth_token()
         auth_header = self.headers.get("Authorization", "")
         token = ""
         if auth_header.startswith("Bearer "):
@@ -402,11 +448,11 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # Cloudflare Access authentication verification
         cf_email = self.headers.get("Cf-Access-Authenticated-User-Email")
-        if cf_email:
+        if cf_email and (self.headers.get("Cf-Ray") or self.headers.get("Cf-Connecting-Ip")):
             return True
 
-        # If token matches configured auth token
-        if token and token == expected_token:
+        # If token matches configured auth token or controller enrollment token
+        if token and (constant_time_compare(token, expected_token) or constant_time_compare(token, controller_token)):
             return True
 
         # Allow local loopback access
@@ -414,8 +460,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         if client_ip in ("127.0.0.1", "::1", "localhost"):
             return True
 
-        # Allow if no auth token is explicitly mandated or matches
-        return True
+        # Deny unauthenticated external requests
+        return False
 
     def read_json_body(self):
         try:
@@ -437,6 +483,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         headers = {
             "User-Agent": "PersonalServer-WebGateway/1.0"
         }
+        corr_id = getattr(self, "current_correlation_id", None) or extract_correlation_id(self.headers)
+        headers["X-Correlation-ID"] = corr_id
         content_type = self.headers.get("Content-Type")
         if content_type:
             headers["Content-Type"] = content_type
@@ -470,8 +518,35 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(err_body)
-        except Exception as e:
-            self.send_json(502, {"error": f"Controller unavailable at {controller_url}: {e}"})
+        except Exception as initial_err:
+            # Trigger HA master auto-discovery across candidate controller URLs
+            try:
+                from config.ha_manager import find_active_leader
+                env_candidates = os.environ.get("PERSONALSERVER_CONTROLLER_URLS", "")
+                candidates = [u.strip().rstrip("/") for u in env_candidates.split(",") if u.strip()]
+                if controller_url not in candidates:
+                    candidates.append(controller_url)
+                if DEFAULT_CONTROLLER_URL not in candidates:
+                    candidates.append(DEFAULT_CONTROLLER_URL)
+
+                active_url, leader_info = find_active_leader(candidates, exclude_url=controller_url)
+                if active_url:
+                    retry_target = f"{active_url}{subpath}"
+                    if query_str:
+                        retry_target += f"?{query_str}"
+                    retry_req = urllib.request.Request(retry_target, data=body_bytes, headers=headers, method=method)
+                    with urllib.request.urlopen(retry_req, timeout=timeout_sec) as response:
+                        resp_data = response.read()
+                        self.send_response(response.status)
+                        self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
+                        self.send_header("Content-Length", str(len(resp_data)))
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(resp_data)
+                        return
+            except Exception:
+                pass
+            self.send_json(502, {"error": f"Controller unavailable at {controller_url} (HA failover attempted): {initial_err}"})
 
     def proxy_to_router(self, method, full_path, body_bytes=None):
         config = load_config()
@@ -578,6 +653,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_json(502, {"error": f"Remote storage proxy error at {remote_endpoint}: {e}"})
 
     def do_GET(self):
+        self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -631,7 +707,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # 3. Node Health / Status
         if path in ("/health", "/status"):
-            self.send_json(200, get_health())
+            self.send_json(200, get_health(self.current_correlation_id))
             return
 
         # 4. Storage Subsystem: GET /storage/nodes
@@ -752,6 +828,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # 7. Storage Usage: GET /storage/usage
         if path == "/storage/usage":
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
             target_node = query.get("node", [""])[0]
             is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
             if remote_endpoint == "INVALID":
@@ -831,6 +910,37 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # 8a. Live Diagnostics / Hardware & Speed Test: GET /diagnostics or GET /api/diagnostics
+        if path in ("/diagnostics", "/api/diagnostics"):
+            try:
+                from config.node_telemetry import run_live_diagnostics
+                config = load_config()
+                node_id = config.get("NODE_ID", config.get("node_id", "unknown"))
+                diag_res = run_live_diagnostics()
+                self.send_json(200, {"node_id": node_id, "diagnostics": diag_res})
+            except Exception as e:
+                self.send_json(500, {"error": f"Diagnostics error: {e}"})
+            return
+
+        # 8a2. Node Diagnostics: GET /api/nodes/<node_id>/diagnostics or /nodes/<node_id>/diagnostics
+        if (path.startswith("/api/nodes/") or path.startswith("/nodes/")) and path.endswith("/diagnostics"):
+            parts = path.strip("/").split("/")
+            nid = parts[-2]
+            config = load_config()
+            local_id = config.get("NODE_ID", config.get("node_id", ""))
+            local_name = config.get("NODE_NAME", config.get("name", ""))
+            if nid in ("local", "self", local_id, local_name):
+                try:
+                    from config.node_telemetry import run_live_diagnostics
+                    diag_res = run_live_diagnostics()
+                    self.send_json(200, {"node_id": local_id or nid, "diagnostics": diag_res})
+                    return
+                except Exception as e:
+                    pass
+            subpath = path[4:] if path.startswith("/api/") else path
+            self.proxy_to_controller("GET", subpath, parsed.query)
+            return
+
         # 8b. Platform Configuration: GET /api/platform or GET /api/config/platform
         if path in ("/api/platform", "/api/config/platform"):
             self.send_json(200, get_platform_config().to_dict())
@@ -851,6 +961,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         self.proxy_to_router("GET", self.path)
 
     def do_POST(self):
+        self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -1081,6 +1192,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         self.proxy_to_router("POST", self.path, body_bytes=body_bytes)
 
     def do_DELETE(self):
+        self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -1172,7 +1284,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
 def is_service_running(pattern):
     try:
-        out = subprocess.check_output(f"pgrep -f '{pattern}'", shell=True, text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(["pgrep", "-f", str(pattern)], shell=False, text=True, stderr=subprocess.DEVNULL)
         return bool(out.strip())
     except Exception:
         return False
@@ -1205,11 +1317,19 @@ def start_heartbeat_reporter(interval_seconds=15):
                             "status": "online",
                             "timestamp": now,
                             "services": services_info,
+                            "battery": sys_info.get("battery", {}),
+                            "network": sys_info.get("network", {}),
+                            "cpu_details": sys_info.get("cpu_details", {}),
+                            "thermals": sys_info.get("thermals", {}),
                             "system": {
                                 "cpu_cores": sys_info.get("cpu_cores", 8),
                                 "load_average": sys_info.get("load_average", []),
                                 "memory": f"{sys_info.get('memory', {}).get('used', '0')}/{sys_info.get('memory', {}).get('total', '0')}",
-                                "storage": f"{sys_info.get('storage', {}).get('used', '0')}/{sys_info.get('storage', {}).get('total', '0')} ({sys_info.get('storage', {}).get('used_percent', '0%')})"
+                                "storage": f"{sys_info.get('storage', {}).get('used', '0')}/{sys_info.get('storage', {}).get('total', '0')} ({sys_info.get('storage', {}).get('used_percent', '0%')})",
+                                "battery": sys_info.get("battery", {}),
+                                "network": sys_info.get("network", {}),
+                                "cpu_details": sys_info.get("cpu_details", {}),
+                                "thermals": sys_info.get("thermals", {})
                             }
                         }
 

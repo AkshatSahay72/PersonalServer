@@ -64,6 +64,10 @@
         </div>
         <div class="topbar-actions mono">
           <div class="topbar-meta-item">
+            <span class="cell-muted">HA Master:</span>
+            <span id="topbar-ha-status" class="ha-badge ha-badge-leader" title="Cluster High Availability Master">👑 Master (Leader)</span>
+          </div>
+          <div class="topbar-meta-item">
             <span class="cell-muted">Cluster:</span>
             <span id="topbar-cluster-status" class="text-online">2 online</span>
           </div>
@@ -83,6 +87,11 @@
       <section id="view-dashboard" class="page-view active">
         <!-- Compact Summary Row -->
         <div class="summary-strip">
+          <div class="summary-col">
+            <span class="summary-label">High Availability</span>
+            <span class="summary-value mono" id="sum-card-ha-main" style="color: #3fb950;">Active Master</span>
+            <span class="summary-sub mono cell-muted" id="sum-card-ha-sub" style="font-size: 0.75rem;">Failover ready</span>
+          </div>
           <div class="summary-col">
             <span class="summary-label">Cluster</span>
             <span class="summary-value mono" id="sum-card-cluster-main">2 online</span>
@@ -223,6 +232,23 @@
 
       <!-- 2. NODES VIEW -->
       <section id="view-nodes" class="page-view">
+        <!-- HA Cluster Status Banner -->
+        <div class="ha-banner section-card" id="ha-cluster-banner" style="margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span class="ha-badge ha-badge-leader" id="ha-banner-role">👑 Master (Leader)</span>
+              <div>
+                <span class="mono" style="font-weight: 600; font-size: 0.92rem;" id="ha-banner-title">High Availability Active</span>
+                <div class="cell-muted mono" style="font-size: 0.78rem;" id="ha-banner-sub">Leader: <span id="ha-banner-leader-id" style="color:#e6edf3;">node-pc</span> · Term: <span id="ha-banner-term">1</span> · Auto-failover ready</div>
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <span class="badge badge-success mono" id="ha-banner-standbys">1 Standby Synced</span>
+              <button class="btn btn-sm btn-secondary" id="ha-failover-btn" onclick="triggerManualHAFailover()" title="Simulate Master failure or transfer leadership">⚡ Simulate Failover</button>
+            </div>
+          </div>
+        </div>
+
         <div class="section-card">
           <div class="section-header">
             <span class="section-title">Cluster Nodes</span>
@@ -233,20 +259,19 @@
               <thead>
                 <tr>
                   <th>Node</th>
-                  <th style="width: 100px;">Status</th>
-                  <th>Role</th>
-                  <th>Platform</th>
-                  <th>CPU</th>
+                  <th style="width: 90px;">Status</th>
+                  <th>Battery</th>
+                  <th>Network &amp; Speed</th>
+                  <th>CPU &amp; Temp</th>
                   <th>RAM</th>
                   <th>Storage</th>
-                  <th>Jobs</th>
-                  <th>Containers</th>
+                  <th>Workloads</th>
                   <th>Last seen</th>
-                  <th style="width: 70px; text-align: right;">Action</th>
+                  <th style="width: 140px; text-align: right;">Action</th>
                 </tr>
               </thead>
               <tbody id="nodes-tbody">
-                <tr><td colspan="11" class="cell-muted">Loading cluster nodes...</td></tr>
+                <tr><td colspan="10" class="cell-muted">Loading cluster nodes...</td></tr>
               </tbody>
             </table>
           </div>
@@ -257,11 +282,13 @@
           <div class="section-header">
             <span class="section-title" id="node-detail-title">Node Details</span>
             <div style="display: flex; gap: 8px; align-items: center;">
+              <button class="btn btn-sm btn-primary" id="node-detail-diag-btn" onclick="runNodeDetailDiagnostics()">⚡ Live Diagnostics &amp; Speed</button>
               <span id="node-lifecycle-actions" style="display: inline-flex; gap: 6px;"></span>
               <button class="btn btn-sm" onclick="closeNodeDetail()">Close</button>
             </div>
           </div>
           <div class="detail-content">
+            <div id="node-detail-hero" style="margin-bottom: 16px;"></div>
             <div class="detail-grid mono" id="node-detail-grid">
               <!-- Dynamic -->
             </div>
@@ -864,6 +891,28 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=1.4.0"></script>
+  <!-- Live Node Hardware & Speed Diagnostics Modal -->
+  <div id="node-diag-modal-backdrop" class="modal-backdrop" style="display:none">
+    <div class="modal-frame" style="max-width: 760px; width: 92%;" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <span class="modal-title mono" id="diag-modal-title">⚡ Live Node Diagnostics</span>
+        <button type="button" class="modal-close-btn" onclick="closeNodeDiagModal()" title="Close (Esc)">✕</button>
+      </div>
+      <div class="modal-body" style="max-height: 75vh; overflow-y: auto;">
+        <div id="diag-modal-status" class="mono cell-muted" style="margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+          <span class="pulse-spinner"></span> Polling live hardware metrics &amp; testing network latency...
+        </div>
+        <div id="diag-modal-content">
+          <!-- Populated dynamically -->
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm" onclick="closeNodeDiagModal()">Close</button>
+        <button type="button" class="btn btn-sm btn-primary" id="diag-modal-rerun-btn" onclick="rerunCurrentNodeDiag()">⚡ Re-run Test</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=1.5.0"></script>
 </body>
 </html>

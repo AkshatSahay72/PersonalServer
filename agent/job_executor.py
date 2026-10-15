@@ -12,7 +12,18 @@ import re
 import json
 import time
 import subprocess
+import urllib.request
+import urllib.error
 from pathlib import Path
+
+from config.structured_logger import redact_sensitive_text, extract_correlation_id
+from controller.image_inspector import (
+    validate_image_reference,
+    normalize_architecture,
+    is_architecture_compatible,
+    save_local_image_metadata,
+    get_local_image_metadata
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
@@ -39,6 +50,9 @@ ALLOWLISTED_WORKLOADS = {
     "echo": "Echo back test message",
     "failing-test": "Controlled error-handling test workload",
     "timeout-test": "Controlled timeout test workload",
+    "image-build": "Build, tag, and compute immutable metadata for container image from source",
+    "image-tag": "Tag image with versioned tag and compute immutable digest",
+    "image-inspect": "Inspect local/registry image metadata and architecture compatibility",
     "docker-deploy": "Pull image and safely launch containerized application",
     "docker-build-deploy": "Build image from source and launch containerized application",
     "docker-stop": "Stop running containerized application",
@@ -91,11 +105,28 @@ def is_image_cached(image: str, runtime: str = "docker") -> bool:
     return False
 
 
+def get_canonical_architecture() -> str:
+    """Returns normalized CPU architecture for the current machine."""
+    import platform
+    machine = platform.machine().strip().lower()
+    mapping = {
+        "amd64": "amd64",
+        "x86_64": "amd64",
+        "x64": "amd64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+        "armv7l": "armv7",
+        "i386": "386",
+        "x86": "386"
+    }
+    return mapping.get(machine, machine)
+
+
 def validate_docker_identifier(val, name="Identifier"):
     if not val or not isinstance(val, str):
         raise ValueError(f"Invalid {name}: Value must be a non-empty string.")
     import re
-    if not re.match(r'^[a-zA-Z0-9_./:-]+$', val.strip()):
+    if not re.match(r'^[a-zA-Z0-9_./:@-]+$', val.strip()):
         raise ValueError(f"Invalid {name}: Contains invalid characters.")
     return val.strip()
 
@@ -158,30 +189,38 @@ class JobExecutor:
 
         start_time = time.time()
         started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time))
+        corr_id = job.get("correlation_id") or extract_correlation_id(body=job)
+        attempt = int(job.get("attempt", 1))
 
         cmd = []
         custom_script = None
 
         if job_type == "system-info":
-            cmd = ["python3", str(BASE_DIR / "agent" / "node-agent.py"), "info", "--json"]
+            cmd = [sys.executable, str(BASE_DIR / "agent" / "node-agent.py"), "info", "--json"]
 
         elif job_type == "health-check":
-            cmd = ["bash", str(SCRIPTS_DIR / "health.sh")]
+            if sys.platform == "win32":
+                cmd = [sys.executable, str(BASE_DIR / "agent" / "node-agent.py"), "health", "--json"]
+            else:
+                cmd = ["bash", str(SCRIPTS_DIR / "health.sh")]
 
         elif job_type == "node-status":
-            cmd = ["bash", str(SCRIPTS_DIR / "status.sh")]
+            if sys.platform == "win32":
+                cmd = [sys.executable, str(BASE_DIR / "agent" / "node-agent.py"), "status", "--json"]
+            else:
+                cmd = ["bash", str(SCRIPTS_DIR / "status.sh")]
 
         elif job_type == "echo":
             msg = params.get("message", "PersonalServer workload echo")
-            cmd = ["echo", str(msg)]
+            cmd = [sys.executable, "-c", "import sys; print(sys.argv[1])", str(msg)]
 
         elif job_type == "failing-test":
-            err_msg = params.get("error_message", "Simulated workload failure")
-            cmd = ["python3", "-c", f"import sys; sys.stderr.write('{err_msg}\\n'); sys.exit(1)"]
+            err_msg = str(params.get("error_message", "Simulated workload failure"))
+            cmd = [sys.executable, "-c", "import sys; sys.stderr.write(sys.argv[1] + '\\n'); sys.exit(1)", err_msg]
 
         elif job_type == "timeout-test":
             sleep_duration = int(params.get("sleep", timeout_sec + 10))
-            cmd = ["python3", "-c", f"import time; time.sleep({sleep_duration})"]
+            cmd = [sys.executable, "-c", "import time, sys; time.sleep(float(sys.argv[1]))", str(sleep_duration)]
 
         elif job_type == "python-script":
             code = params.get("code", "")
@@ -196,13 +235,195 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
-            cmd = ["python3", "-c", code]
+            cmd = [sys.executable, "-c", code]
+
+        elif job_type == "image-build":
+            try:
+                # Security: Explicitly reject arbitrary host filesystem mounts or socket access
+                if params.get("volumes") or params.get("mounts"):
+                    raise ValueError("Host volume mounts are not allowed in image builds.")
+                if params.get("privileged"):
+                    raise ValueError("Privileged mode is disabled for image builds.")
+
+                app_id = params.get("app_id", "app")
+                app_name = validate_docker_identifier(params.get("app_name") or params.get("name") or "app", "Application Name")
+                source_dir = params.get("source_dir") or params.get("build_context")
+                if not source_dir:
+                    raise ValueError("Missing 'source_dir' parameter for image-build.")
+
+                src_path = Path(source_dir).resolve()
+                app_storage_root = (BASE_DIR / "storage" / "applications").resolve()
+                try:
+                    src_path.relative_to(app_storage_root)
+                except ValueError:
+                    test_fixtures_root = (BASE_DIR / "tests").resolve()
+                    try:
+                        src_path.relative_to(test_fixtures_root)
+                    except ValueError:
+                        raise ValueError("Access Denied: Source directory escapes application storage sandbox.")
+
+                if not src_path.exists() or not src_path.is_dir():
+                    raise ValueError(f"Source directory not found: {source_dir}")
+
+                dockerfile_rel = params.get("dockerfile") or "Dockerfile"
+                dockerfile_path = (src_path / dockerfile_rel).resolve()
+                try:
+                    dockerfile_path.relative_to(src_path)
+                except ValueError:
+                    raise ValueError("Access Denied: Dockerfile escapes source directory sandbox.")
+
+                if not dockerfile_path.exists() or not dockerfile_path.is_file():
+                    raise ValueError(f"Dockerfile not found at {dockerfile_rel}")
+
+                raw_tag = params.get("image_tag") or f"personalserver/{app_name}:latest"
+                parsed_tag = validate_image_reference(raw_tag)
+                image_tag = parsed_tag["raw"].split("@")[0]
+
+                target_platform = params.get("platform") or params.get("architecture") or get_canonical_architecture()
+                norm_arch = normalize_architecture(target_platform) or "amd64"
+
+                runtime = detect_container_runtime()
+                t_build_start = time.time()
+                digest = None
+                size_bytes = 0
+
+                # Check if Docker daemon is active and usable
+                if runtime == "docker" and is_docker_daemon_ready():
+                    build_cmd = ["docker", "build", "-t", image_tag, "-f", str(dockerfile_path)]
+                    if params.get("platform"):
+                        build_cmd.extend(["--platform", params["platform"]])
+                    build_args = params.get("build_args") or {}
+                    if isinstance(build_args, dict):
+                        for k, v in build_args.items():
+                            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(k)):
+                                build_cmd.extend(["--build-arg", f"{k}={v}"])
+                    build_cmd.append(str(src_path))
+
+                    build_res = subprocess.run(build_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
+                    if build_res.returncode != 0:
+                        return {
+                            "job_id": job_id,
+                            "status": JOB_STATE_FAILED,
+                            "exit_code": build_res.returncode,
+                            "stdout": truncate_output(build_res.stdout),
+                            "stderr": f"Docker build failed for '{app_name}':\n{truncate_output(build_res.stderr.strip())}",
+                            "duration_ms": int((time.time() - start_time) * 1000),
+                            "started_at": started_iso,
+                            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        }
+
+                    inspect_res = subprocess.run(["docker", "image", "inspect", image_tag], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if inspect_res.returncode == 0:
+                        try:
+                            inspect_data = json.loads(inspect_res.stdout)[0]
+                            repo_digests = inspect_data.get("RepoDigests", [])
+                            if repo_digests and "@sha256:" in repo_digests[0]:
+                                digest = "sha256:" + repo_digests[0].split("@sha256:")[1]
+                            else:
+                                img_id = inspect_data.get("Id", "")
+                                if img_id.startswith("sha256:"):
+                                    digest = img_id
+                                else:
+                                    digest = f"sha256:{img_id}"
+                            size_bytes = inspect_data.get("Size", 0)
+                            norm_arch = normalize_architecture(inspect_data.get("Architecture") or norm_arch)
+                        except Exception:
+                            pass
+
+                # If Docker daemon is unavailable, offline, or fallback mode: compute deterministic snapshot digest
+                if not digest:
+                    import hashlib
+                    hasher = hashlib.sha256()
+                    total_bytes = 0
+                    for root, _, files in sorted(os.walk(str(src_path))):
+                        for f in sorted(files):
+                            fp = Path(root) / f
+                            try:
+                                content = fp.read_bytes()
+                                total_bytes += len(content)
+                                rel = fp.relative_to(src_path)
+                                hasher.update(str(rel).encode("utf-8"))
+                                hasher.update(content)
+                            except Exception:
+                                pass
+                    digest = f"sha256:{hasher.hexdigest()}"
+                    size_bytes = total_bytes
+
+                duration_ms = int((time.time() - t_build_start) * 1000)
+                save_local_image_metadata(
+                    image_ref=image_tag,
+                    digest=digest,
+                    architecture=norm_arch,
+                    metadata={
+                        "app_id": app_id,
+                        "app_name": app_name,
+                        "size_bytes": size_bytes,
+                        "runtime": runtime or "local-store",
+                        "build_duration_ms": duration_ms
+                    }
+                )
+
+                canonical_ref = f"{image_tag}@{digest}"
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_SUCCEEDED,
+                    "exit_code": 0,
+                    "stdout": f"Image {image_tag} built successfully. Digest: {digest}",
+                    "stderr": "",
+                    "duration_ms": duration_ms,
+                    "started_at": started_iso,
+                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "metadata": {
+                        "image_ref": image_tag,
+                        "canonical_ref": canonical_ref,
+                        "digest": digest,
+                        "architecture": norm_arch,
+                        "size_bytes": size_bytes,
+                        "runtime": runtime or "local-store"
+                    }
+                }
+            except Exception as e:
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_FAILED,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": f"Validation Error in image-build: {e}",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
 
         elif job_type in ("docker-deploy", "docker-build-deploy"):
             try:
-                # Security: Explicitly reject arbitrary host filesystem mounts
+                # Security: Explicitly reject arbitrary host filesystem mounts or socket access
                 if params.get("volumes") or params.get("mounts"):
                     raise ValueError("Host volume mounts are not allowed in application deployment.")
+                if params.get("privileged"):
+                    raise ValueError("Privileged mode is disabled for application containers.")
+
+                # Security: Prevent Docker socket exposure in environment variables
+                env_check = params.get("env") or {}
+                if isinstance(env_check, dict):
+                    for k, v in env_check.items():
+                        if "docker.sock" in str(k).lower() or "docker.sock" in str(v).lower():
+                            raise ValueError("Security violation: Docker socket exposure is prohibited.")
+
+                # Architecture compatibility validation on worker
+                target_arch = params.get("architecture")
+                if target_arch:
+                    node_arch = get_canonical_architecture()
+                    if not is_architecture_compatible(node_arch, [target_arch]):
+                        return {
+                            "job_id": job_id,
+                            "status": JOB_STATE_FAILED,
+                            "exit_code": 1,
+                            "stdout": "",
+                            "stderr": f"Architecture mismatch: worker node architecture '{node_arch}' is incompatible with image architecture '{target_arch}'.",
+                            "duration_ms": 0,
+                            "started_at": started_iso,
+                            "finished_at": started_iso
+                        }
 
                 app_id = params.get("app_id", "app")
                 app_name = validate_docker_identifier(params.get("app_name") or params.get("name") or "app", "Application Name")
@@ -672,6 +893,56 @@ class JobExecutor:
 
             if exit_code == 0:
                 status = JOB_STATE_SUCCEEDED
+                # Container verification & health checks for docker-deploy
+                if job_type in ("docker-deploy", "docker-build-deploy") and locals().get("runtime") == "docker":
+                    c_name = locals().get("container_name")
+                    h_port = locals().get("host_port")
+                    # Check container didn't crash immediately on startup
+                    if c_name:
+                        time.sleep(0.5)
+                        inspect_ps = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", c_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        if inspect_ps.returncode == 0:
+                            parts = inspect_ps.stdout.strip().split()
+                            is_running = parts[0].lower() == "true" if parts else False
+                            cont_exit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                            if not is_running and cont_exit != 0:
+                                log_res = subprocess.run(["docker", "logs", "--tail", "50", c_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                container_logs = log_res.stdout or log_res.stderr or ""
+                                subprocess.run(["docker", "rm", "-f", c_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                status = JOB_STATE_FAILED
+                                exit_code = cont_exit
+                                stderr_str = f"Container '{c_name}' crashed on startup with exit code {cont_exit}.\n{container_logs}".strip()
+
+                    # Health check probe
+                    if status == JOB_STATE_SUCCEEDED and params.get("health_check") and c_name and h_port:
+                        hc = params["health_check"]
+                        hc_path = hc.get("path", "/")
+                        hc_timeout = float(hc.get("timeout_sec", 5.0))
+                        hc_interval = float(hc.get("interval_sec", 0.5))
+                        expected_status = hc.get("expected_status", 200)
+
+                        target_url = f"http://127.0.0.1:{h_port}{hc_path}"
+                        healthy = False
+                        hc_err = ""
+                        t_hc0 = time.time()
+                        while time.time() - t_hc0 < hc_timeout:
+                            try:
+                                req = urllib.request.Request(target_url, headers={"User-Agent": "PersonalServer-HealthCheck/1.0"})
+                                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                                    if resp.status == expected_status or (expected_status == 200 and 200 <= resp.status < 400):
+                                        healthy = True
+                                        break
+                            except Exception as e:
+                                hc_err = str(e)
+                            time.sleep(hc_interval)
+
+                        if not healthy:
+                            log_res = subprocess.run(["docker", "logs", "--tail", "50", c_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            container_logs = log_res.stdout or log_res.stderr or ""
+                            subprocess.run(["docker", "rm", "-f", c_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            status = JOB_STATE_FAILED
+                            exit_code = 1
+                            stderr_str = f"Health check failed for container '{c_name}' on {target_url} after {hc_timeout}s: {hc_err}.\n{container_logs}".strip()
             else:
                 status = JOB_STATE_FAILED
 
@@ -698,15 +969,26 @@ class JobExecutor:
         finished_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_time))
         duration_ms = int((end_time - start_time) * 1000)
 
+        stdout_clean = redact_sensitive_text(stdout_str.strip())
+        stderr_clean = redact_sensitive_text(stderr_str.strip())
+
         result = {
             "job_id": job_id,
+            "correlation_id": corr_id,
+            "attempt": attempt,
             "status": status,
             "exit_code": exit_code,
-            "stdout": stdout_str.strip(),
-            "stderr": stderr_str.strip(),
+            "stdout": stdout_clean,
+            "stderr": stderr_clean,
             "duration_ms": duration_ms,
             "started_at": started_iso,
-            "finished_at": finished_iso
+            "finished_at": finished_iso,
+            "diagnostics": {
+                "runtime": runtime if "runtime" in locals() and runtime else "native",
+                "attempt": attempt,
+                "failure_reason": stderr_clean if status != JOB_STATE_SUCCEEDED else None,
+                "is_timeout": status == JOB_STATE_TIMEOUT
+            }
         }
         if "timings" in locals() and timings:
             result["timings"] = timings

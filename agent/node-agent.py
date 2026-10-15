@@ -22,11 +22,17 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
 # Import local JobExecutor
 from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
-
-# Paths relative to agent directory
-BASE_DIR = Path(__file__).resolve().parent.parent
+from config.structured_logger import (
+    agent_logger,
+    extract_correlation_id,
+    generate_correlation_id,
+    redact_sensitive_text
+)
 CONFIG_DIR = BASE_DIR / "config"
 SECRETS_DIR = CONFIG_DIR / "secrets"
 SCRIPTS_DIR = BASE_DIR / "scripts"
@@ -46,17 +52,26 @@ RESTART_SCRIPT = SCRIPTS_DIR / "restart.sh"
 STATUS_SCRIPT = SCRIPTS_DIR / "status.sh"
 HEALTH_SCRIPT = SCRIPTS_DIR / "health.sh"
 
-DEFAULT_CONTROLLER_URL = "http://100.120.251.42:8000"
+DEFAULT_CONTROLLER_URL = os.environ.get("PERSONALSERVER_CONTROLLER_URL", "http://127.0.0.1:8000")
 
 
 def get_current_iso_timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+import shlex
+
+
 def run_cmd(cmd):
-    """Run a shell command and return trimmed stdout."""
+    """Run a command safely without shell interpretation when possible."""
     try:
-        return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+        if isinstance(cmd, str):
+            cmd_args = shlex.split(cmd) if "|" not in cmd else cmd
+            use_shell = "|" in cmd
+        else:
+            cmd_args = cmd
+            use_shell = False
+        return subprocess.check_output(cmd_args, shell=use_shell, text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return ""
 
@@ -73,7 +88,29 @@ def discover_hardware(base_dir=BASE_DIR):
 
     # RAM in MB
     ram_mb = 0
-    if Path("/proc/meminfo").exists():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                ram_mb = int(round(stat.ullTotalPhys / (1024 * 1024)))
+        except Exception:
+            pass
+
+    if ram_mb <= 0 and Path("/proc/meminfo").exists():
         try:
             with open("/proc/meminfo", "r", encoding="utf-8") as f:
                 for line in f:
@@ -85,7 +122,7 @@ def discover_hardware(base_dir=BASE_DIR):
         except Exception:
             pass
 
-    if ram_mb <= 0:
+    if ram_mb <= 0 and hasattr(os, "sysconf"):
         try:
             pages = os.sysconf("SC_PHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
@@ -396,6 +433,12 @@ def get_system_metrics():
     st_tot_str = f"{total_st_gb:.1f}G"
     st_avail_str = f"{avail_st_gb:.1f}G"
 
+    try:
+        from config.node_telemetry import collect_comprehensive_telemetry
+        telem = collect_comprehensive_telemetry()
+    except Exception:
+        telem = {}
+
     return {
         "cpu_cores": cpu_cores,
         "load_average": load_average,
@@ -423,7 +466,11 @@ def get_system_metrics():
             "available_gb": avail_st_gb,
             "used_percent": st_pct
         },
-        "uptime": uptime_raw.strip()
+        "uptime": uptime_raw.strip(),
+        "battery": telem.get("battery", {}),
+        "network": telem.get("network", {}),
+        "cpu_details": telem.get("cpu_details", {}),
+        "thermals": telem.get("thermals", {})
     }
 
 
@@ -490,10 +537,10 @@ def get_service_states():
                         services["node_api"] = "degraded"
             except Exception:
                 services["node_api"] = "unresponsive"
-        elif (BASE_DIR / "start.sh").exists():
+        elif (BASE_DIR / "scripts" / "start.sh").exists() or (BASE_DIR / "start.sh").exists():
             services["node_api"] = "stopped"
 
-    if (BASE_DIR / "start.sh").exists():
+    if (BASE_DIR / "scripts" / "start.sh").exists() or (BASE_DIR / "start.sh").exists():
         cf_pid = ""
         cf_pid_file = RUNTIME_DIR / "cloudflared.pid"
         if cf_pid_file.exists():
@@ -503,7 +550,7 @@ def get_service_states():
                 pass
 
         if not is_pid_alive(cf_pid, "cloudflared"):
-            cf_pid = run_cmd("pgrep -f 'cloudflared tunnel run' | head -n 1")
+            cf_pid = run_cmd("pgrep -f 'cloudflared tunnel' | head -n 1")
 
         if is_pid_alive(cf_pid, "cloudflared"):
             services["cloudflare"] = "running"
@@ -527,6 +574,55 @@ def get_default_controller_url():
         except Exception:
             pass
     return DEFAULT_CONTROLLER_URL
+
+
+def get_candidate_controller_urls():
+    candidates = []
+    env_c = os.environ.get("PERSONALSERVER_CONTROLLER_URLS", "")
+    for u in env_c.split(","):
+        if u.strip():
+            candidates.append(u.strip().rstrip("/"))
+    if CONTROLLER_JSON.exists():
+        try:
+            with open(CONTROLLER_JSON, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if "urls" in d and isinstance(d["urls"], list):
+                    for u in d["urls"]:
+                        candidates.append(str(u).strip().rstrip("/"))
+                elif "url" in d and d["url"]:
+                    candidates.append(str(d["url"]).strip().rstrip("/"))
+        except Exception:
+            pass
+    reg = load_registration_state()
+    if reg and reg.get("controller_url"):
+        candidates.append(reg["controller_url"].rstrip("/"))
+    if DEFAULT_CONTROLLER_URL:
+        candidates.append(DEFAULT_CONTROLLER_URL.rstrip("/"))
+
+    seen = set()
+    result = []
+    for u in candidates:
+        if u and u not in seen:
+            seen.add(u)
+            result.append(u)
+    return result or ["http://127.0.0.1:8000"]
+
+
+def failover_active_controller():
+    """Finds active leader and updates registration state with new master URL."""
+    try:
+        from config.ha_manager import find_active_leader
+        candidates = get_candidate_controller_urls()
+        active_url, leader_info = find_active_leader(candidates)
+        if active_url:
+            reg = load_registration_state()
+            if reg:
+                reg["controller_url"] = active_url
+                save_registration_state(reg)
+            return active_url
+    except Exception:
+        pass
+    return None
 
 
 def load_registration_state():
@@ -609,7 +705,16 @@ def cmd_health(args):
     print()
     print("=== SYSTEM METRICS ===")
     print(f"Uptime:    {system_metrics.get('uptime')}")
-    print(f"CPU Cores: {system_metrics.get('cpu_cores')}")
+    print(f"CPU Cores: {system_metrics.get('cpu_cores')} cores | Usage: {system_metrics.get('cpu_percent', 0.0)}%")
+    bat = system_metrics.get("battery", {})
+    if bat.get("percentage") is not None:
+        print(f"Battery:   {bat.get('percentage')}% ({bat.get('status', 'UNKNOWN')}, {bat.get('plugged', 'UNKNOWN')}) | Health: {bat.get('health', 'UNKNOWN')}")
+    net = system_metrics.get("network", {})
+    if net.get("connection_type") or net.get("wifi_ssid"):
+        print(f"Network:   {net.get('connection_type', 'LAN')} | SSID: {net.get('wifi_ssid') or 'N/A'} | Signal: {net.get('wifi_signal_percent', 'N/A')}% | Speed: {net.get('link_speed_mbps', 'N/A')} Mbps | Ping: {net.get('ping_ms', 'N/A')} ms")
+    thm = system_metrics.get("thermals", {})
+    if thm.get("temperature_c") is not None:
+        print(f"Thermal:   {thm.get('temperature_c')}°C ({thm.get('status', 'Normal')})")
     print(f"Memory:    Total: {system_metrics['memory']['total']} | Used: {system_metrics['memory']['used']} | Available: {system_metrics['memory']['available']}")
     print(f"Storage:   Total: {system_metrics['storage']['total']} | Used: {system_metrics['storage']['used']} | Usage: {system_metrics['storage']['used_percent']}")
     print()
@@ -793,6 +898,10 @@ def cmd_heartbeat(args=None):
         "capabilities": caps,
         "services": services_state,
         "workloads": workload_metrics,
+        "battery": system_metrics.get("battery", {}),
+        "network": system_metrics.get("network", {}),
+        "cpu_details": system_metrics.get("cpu_details", {}),
+        "thermals": system_metrics.get("thermals", {}),
         "system": {
             "cpu_cores": system_metrics.get("cpu_cores"),
             "load_average": system_metrics.get("load_average"),
@@ -801,7 +910,11 @@ def cmd_heartbeat(args=None):
             "memory_details": system_metrics.get("memory_details"),
             "storage": f"{system_metrics['storage']['used']}/{system_metrics['storage']['total']} ({system_metrics['storage']['used_percent']})",
             "storage_details": system_metrics.get("storage_details"),
-            "uptime": system_metrics.get("uptime")
+            "uptime": system_metrics.get("uptime"),
+            "battery": system_metrics.get("battery", {}),
+            "network": system_metrics.get("network", {}),
+            "cpu_details": system_metrics.get("cpu_details", {}),
+            "thermals": system_metrics.get("thermals", {})
         }
     }
 
@@ -845,6 +958,21 @@ def cmd_heartbeat(args=None):
     except Exception as e:
         print("FAILED")
         print(f"Connection Error: {e}", file=sys.stderr)
+        new_leader = failover_active_controller()
+        if new_leader and new_leader != controller_url:
+            print(f"[HA FAILOVER] Discovered new master at {new_leader}. Retrying heartbeat...", flush=True)
+            try:
+                retry_endpoint = f"{new_leader}/heartbeat"
+                retry_req = urllib.request.Request(retry_endpoint, data=payload, headers=req.headers, method="POST")
+                with urllib.request.urlopen(retry_req, timeout=5) as retry_resp:
+                    res_data = json.loads(retry_resp.read().decode("utf-8"))
+                    reg_state["last_heartbeat"] = now
+                    reg_state["controller_url"] = new_leader
+                    save_registration_state(reg_state)
+                    print(f"Heartbeat acknowledged by new master at {res_data.get('timestamp', now)}.")
+                    return 0
+            except Exception as retry_e:
+                print(f"Retry on new master failed: {retry_e}", file=sys.stderr)
         return 1
 
 
@@ -1028,12 +1156,33 @@ def cmd_work(args):
                 print("No pending jobs assigned to this node.")
                 return 0
 
-            print(f"-> Assigned Job: {job.get('job_id')} ({job.get('type')})")
+            job_id = job.get("job_id")
+            corr_id = job.get("correlation_id") or extract_correlation_id(body=job)
+            attempt = job.get("attempt", 1)
+            agent_logger.info(
+                "job.received",
+                f"Assigned Job: {job_id} ({job.get('type')}, attempt: {attempt})",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=node_id,
+                attempt=attempt
+            )
+
+            print(f"-> Assigned Job: {job_id} ({job.get('type')})")
             print(f"-> Executing workload under user permissions...")
 
             # Execute via JobExecutor
             result = JobExecutor.execute(job)
 
+            agent_logger.info(
+                "job.completed",
+                f"Execution completed with status: {result.get('status')} (Exit: {result.get('exit_code')})",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=node_id,
+                status=result.get("status"),
+                exit_code=result.get("exit_code")
+            )
             print(f"-> Execution completed with status: {result.get('status')} (Exit: {result.get('exit_code')})")
 
             # Post result back to controller
@@ -1044,6 +1193,7 @@ def cmd_work(args):
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {auth_token}",
+                    "X-Correlation-ID": corr_id,
                     "User-Agent": "PersonalServer-NodeAgent/1.0"
                 },
                 method="POST"
@@ -1077,6 +1227,42 @@ def cmd_exec_local(args):
     return 0 if res.get("status") == "SUCCEEDED" else 1
 
 
+def cmd_local_worker(args):
+    """Start or manage the native LocalWorker daemon."""
+    try:
+        from agent.local_worker import LocalWorker
+    except ImportError:
+        from local_worker import LocalWorker
+    worker = LocalWorker(controller_url=getattr(args, "controller", None))
+    action = getattr(args, "action", "run")
+    if action == "register":
+        res = worker.register(force=True)
+        print(f"Local worker registered: {res.get('node_id')}")
+        return 0
+    elif action == "status":
+        meta = worker.get_node_metadata()
+        print(json.dumps(meta, indent=2))
+        return 0
+    elif action == "once":
+        res = worker.poll_and_execute_next()
+        if res:
+            print(f"Executed job {res.get('job_id')}: status={res.get('status')} exit={res.get('exit_code')}")
+        else:
+            print("No job pending.")
+        return 0
+    else:
+        worker.start()
+        print(f"LocalWorker started for node '{worker.node_id}'. Press Ctrl+C to stop.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nStopping LocalWorker...")
+            worker.stop()
+            print("LocalWorker stopped.")
+        return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="node-agent",
@@ -1103,11 +1289,11 @@ def main():
 
     # Registration and Heartbeat commands
     p_reg = subparsers.add_parser("register", help="Register node with a PersonalServer controller")
-    p_reg.add_argument("--controller", help="Controller URL (e.g. http://100.120.251.42:8000)")
+    p_reg.add_argument("--controller", help="Controller URL (e.g. http://127.0.0.1:8000)")
     p_reg.add_argument("--token", help="Enrollment secret token")
 
     p_onboard = subparsers.add_parser("onboard", help="Automatically onboard and register this node with a controller")
-    p_onboard.add_argument("--controller", help="Controller URL (e.g. http://100.120.251.42:8000)")
+    p_onboard.add_argument("--controller", help="Controller URL (e.g. http://127.0.0.1:8000)")
     p_onboard.add_argument("--code", required=True, help="One-time onboarding code (PS-XXXX-XXXX)")
 
     p_hb = subparsers.add_parser("heartbeat", help="Send heartbeat to registered controller")
@@ -1125,6 +1311,10 @@ def main():
     p_exec_local.add_argument("--type", required=True, choices=list(ALLOWLISTED_WORKLOADS.keys()), help="Workload type")
     p_exec_local.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
     p_exec_local.add_argument("--params", help="JSON parameters")
+
+    p_local_worker = subparsers.add_parser("local-worker", help="Start or manage local worker daemon on this machine")
+    p_local_worker.add_argument("--controller", help="Override controller URL")
+    p_local_worker.add_argument("--action", choices=["run", "register", "once", "status"], default="run", help="Worker action")
 
     args = parser.parse_args()
 
@@ -1145,6 +1335,7 @@ def main():
         "registration-status": cmd_registration_status,
         "work": cmd_work,
         "exec-local": cmd_exec_local,
+        "local-worker": cmd_local_worker,
     }
 
     handler = command_handlers.get(args.command)

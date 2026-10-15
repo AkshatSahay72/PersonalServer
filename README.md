@@ -1,12 +1,15 @@
 # PersonalServer
 
-> **A lightweight, robust, self-hosted personal server and distributed compute cluster designed for heterogeneous edge devices (Android/Termux, Raspberry Pi, Linux servers, WSL, and Laptops).**
+> **A lightweight, robust, self-hosted personal server, container platform, and distributed compute cluster designed for heterogeneous edge devices (Android/Termux, Raspberry Pi, Linux servers, WSL, and Laptops).**
 
 ---
 
 ## 1. Highlights
 
+* 👑 **High Availability (HA) & Master Failover**: Self-contained, zero-dependency consensus with leader leases, term tracking, continuous state sync, and transparent worker/client failover when a master goes down.
 * ⚡ **1-Command Zero-Touch Onboarding**: Add any Android phone (via Termux), Raspberry Pi, or Linux machine to your cluster in seconds using short-lived, single-use pairing codes (`PS-XXXX-XXXX`) with automated hardware discovery.
+* 📊 **Rich Device Telemetry**: Real-time cross-platform inspection of battery percentage, charging state, WiFi/Cellular signal strength (dBm), link speed, CPU temperature, and thermal throttling.
+* 🐳 **Decoupled OCI Container Platform**: 8-stage image build, tagging with immutable `sha256:...` digests, architecture normalization (`arm64`/`amd64`), and sandboxed execution without exposing Docker sockets.
 * 📦 **Multi-Node Decentralized Storage**: Browse, upload, download, and organize files across multiple physical storage nodes with sandboxed paths and strict path-traversal defenses.
 * 🔄 **Reliable Workload Execution & Scheduling**: Resource-aware job placement, automatic lease-based failure recovery, and retries.
 * 🖥️ **Technical Operations Console**: Compact, information-dense server administration interface accessible over HTTPS via Cloudflare Zero Trust without exposing internal ports.
@@ -26,45 +29,49 @@
                       |     Cloudflare Zero Trust       |
                       +─────────────────────────────────+
                                        │
-                                       ▼ (http://127.0.0.1:8080)
+                                       ▼ (http://127.0.0.1:8080 or :8088)
 +─────────────────────────────────────────────────────────────────────────────+
-|                              NODE 01 (VIVO Y31)                             |
+|                        ACTIVE CONTROLLER / MASTER NODE                      |
 |                                                                             |
-|   +─────────────────────────────────────────────────────────────────────+   |
-|   |                    Node API & Operations Web Console                |   |
-|   |  - Cluster Summary Strip               - System Telemetry           |   |
-|   |  - Nodes Table & Live Status           - Workload Job Execution UI  |   |
-|   |  - Multi-Node Storage Browser          - Settings & Diagnostics     |   |
-|   +─────────────────────────────────────────────────────────────────────+   |
-|                                      │                                      |
-|   +──────────────────────────────────┴─────+   +────────────────────────+   |
-|   |         Local Storage Root             |   |       Node Agent       |   |
-|   |     ~/PersonalServer/storage/          |   |  - Service Supervisor  |   |
-|   |     (Sandboxed & Traversal Defended)   |   |  - Heartbeat Reporter  |   |
-|   +────────────────────────────────────────+   |  - Job Executor        |   |
-|                                                +────────────┬───────────+   |
-+─────────────────────────────────────────────────────────────┼───────────────+
-                                                              │
-                                                Tailscale WireGuard Mesh
-                                                              │
-                 ┌────────────────────────────────────────────┴─────────────┐
-                 │                                                          │
-                 ▼                                                          ▼
-+──────────────────────────────────────────+   +────────────────────────────┴─+
-|               NODE 02                    |   |      LAPTOP CONTROLLER       |
-|                                          |   |                              |
-|   +──────────────────────────────────+   |   |   +───────────────────────+  |
-|   |       Node API (:8080)           |   |   |   | PersonalServer        |  |
-|   |   - Remote Storage Read/Write    |   |   |   | Controller (:8000)    |  |
-|   +──────────────────────────────────+   |   |   | - Cluster Inventory   |  |
-|   |       Node Agent                 |   |   |   | - Resource Scheduler  |  |
-|   |   - Hardware Discovery           |   |   |   | - Lease Sweeper       |  |
-|   |   - Workload Job Executor        |   |   |   | - Onboarding Store    |  |
-|   +──────────────────────────────────+   |   |   +───────────────────────+  |
-|   |       Storage Root               |   |   +──────────────────────────────+
-|   |   ~/PersonalServer/storage/      |   |
-|   +──────────────────────────────────+   |
-+──────────────────────────────────────────+
+|   +───────────────────────────────────+   +─────────────────────────────+   |
+|   |   Node API & Web Operations UI    |   |     Cluster Controller      |   |
+|   |  - Real-time Cluster Summary      |   |  - Node Inventory & Health  |   |
+|   |  - Rich Telemetry (Battery/WiFi)  |   |  - Resource Scheduler       |   |
+|   |  - Workload Job Management        |   |  - Lease Sweeper            |   |
+|   |  - Storage Explorer (Multi-Node)  |   |  - Onboarding Store         |   |
+|   |  - HA Master Status & Failover    |   |  - App Registry & Deployer  |   |
+|   +───────────────────────────────────+   +──────────────┬──────────────+   |
+|                                                          │                  |
+|   +───────────────────────────────────+                  │                  |
+|   |     High Availability Manager     |◄─────────────────┘                  |
+|   |  - Leader Lease & Term Consensus  |                                     |
+|   |  - State Versioning & Snapshots   |                                     |
+|   +─────────────────┬─────────────────+                                     |
++─────────────────────┼───────────────────────────────────────────────────────+
+                      │ Heartbeats, Sync & WireGuard Tailscale Mesh
+       ┌──────────────┴───────────────────────────────┐
+       ▼                                              ▼
++─────────────────────────────────────────+  +────────────────────────────────+
+|        HOT STANDBY CONTROLLER           |  |       APPLICATION ROUTER       |
+|  - Passive Liveness Monitor             |  |  router/app_router.py (:8088)  |
+|  - Synchronized State (nodes/jobs/apps) |  |  - Dynamic Path-Based Routing  |
+|  - Auto-Election upon Master Crash      |  |  - SSRF & Traversal Defenses   |
+|  - Seamless Worker & Client Failover    |  |  - Container Reverse Proxy     |
++─────────────────────────────────────────+  +────────────────────────────────+
+       │
+       ▼ WireGuard Tailscale Mesh (:8000, :8022, :8080)
++─────────────────────────────────────────────────────────────────────────────+
+|                     HETEROGENEOUS WORKER / STORAGE NODES                    |
+|                                                                             |
+|   +─────────────────────────────────+     +─────────────────────────────+   |
+|   |     Node 01: Android (Termux)   |     |    Node 02: Raspberry Pi    |   |
+|   |  - Node Agent & Supervisor      |     |  - Docker Container Runtime |   |
+|   |  - Rich Telemetry Engine        |     |  - Multi-Arch OCI Images    |   |
+|   |    (Battery, WiFi dBm, Thermal) |     |  - High-Capacity Storage    |   |
+|   |  - Sandboxed Job Executor       |     |  - Node Agent & Worker      |   |
+|   |  - Sandboxed File Storage       |     |  - SSH Administration       |   |
+|   +─────────────────────────────────+     +─────────────────────────────+   |
++─────────────────────────────────────────────────────────────────────────────+
 ```
 
 ---
@@ -107,7 +114,7 @@ The agent automatically detects hardware, configures identity, registers with th
 ### Step 3: Manage Cluster & Workloads
 
 ```bash
-# Check cluster inventory
+# Check cluster inventory & rich telemetry
 python controller/controller.py nodes
 
 # Submit a workload job to the cluster
@@ -140,27 +147,43 @@ All files reside securely in `~/PersonalServer/storage/` on each node. Access fi
 
 Access the high-density administration console at `http://<NODE_IP>:8080/` (or via Cloudflare Tunnel over HTTPS):
 
-* **Dashboard**: Cluster metrics, online node count, active workloads, and system stats.
-* **Nodes**: Detailed hardware inventory, CPU cores, RAM, storage, and health.
+* **Dashboard**: Cluster metrics, online node count, active workloads, and HA Master badge.
+* **Nodes**: Detailed hardware inventory, CPU cores, RAM, storage, battery %, WiFi dBm, and CPU temperature.
 * **Jobs**: Dispatch allowlisted workloads and inspect execution logs.
 * **Storage**: Multi-node switcher, directory browser, uploads, downloads, and file management.
-* **Settings**: Cluster configuration and network routing details.
+* **Settings**: Cluster configuration, network routing, and HA failover simulation.
 
 ---
 
 ## 6. Complete Documentation
 
-Detailed technical guides are available in the [`docs/`](file:///d:/Coding/Major%20Project/PersonalServer/docs/) directory:
+Comprehensive technical guides are maintained in the [`docs/`](file:///d:/Coding/Major%20Project/PersonalServer/docs/README.md) directory:
 
+### Core Architecture & HA
+* [Technical Documentation Catalog](file:///d:/Coding/Major%20Project/PersonalServer/docs/README.md)
 * [System Architecture](file:///d:/Coding/Major%20Project/PersonalServer/docs/architecture.md)
-* [Getting Started & Setup](file:///d:/Coding/Major%20Project/PersonalServer/docs/getting-started.md)
-* [Node Enrollment & Onboarding](file:///d:/Coding/Major%20Project/PersonalServer/docs/node-enrollment.md)
-* [Controller Architecture](file:///d:/Coding/Major%20Project/PersonalServer/docs/controller.md)
-* [Node Agent & Hardware Discovery](file:///d:/Coding/Major%20Project/PersonalServer/docs/node-agent.md)
-* [Multi-Node Storage](file:///d:/Coding/Major%20Project/PersonalServer/docs/storage.md)
-* [Workload Jobs & Allowlist](file:///d:/Coding/Major%20Project/PersonalServer/docs/jobs.md)
+* [High Availability (HA) & Master Failover](file:///d:/Coding/Major%20Project/PersonalServer/docs/high_availability_failover.md)
+* [Controller Reference & API](file:///d:/Coding/Major%20Project/PersonalServer/docs/controller.md)
+* [Node Agent & Telemetry Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/node-agent.md)
 * [Resource-Aware Scheduling](file:///d:/Coding/Major%20Project/PersonalServer/docs/scheduling.md)
-* [Reliability & Leases](file:///d:/Coding/Major%20Project/PersonalServer/docs/reliability.md)
-* [Networking & Ingress](file:///d:/Coding/Major%20Project/PersonalServer/docs/networking.md)
-* [Security & Threat Model](file:///d:/Coding/Major%20Project/PersonalServer/docs/security.md)
-* [Troubleshooting Runbook](file:///d:/Coding/Major%20Project/PersonalServer/docs/troubleshooting.md)
+* [Multi-Node Storage Subsystem](file:///d:/Coding/Major%20Project/PersonalServer/docs/storage.md)
+
+### Workloads, Reliability & Containers
+* [Job Reliability & Failure Recovery](file:///d:/Coding/Major%20Project/PersonalServer/docs/reliability.md)
+* [Job Lifecycle FSM & Recovery Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/job_lifecycle_recovery.md)
+* [Workload Jobs & Allowlist](file:///d:/Coding/Major%20Project/PersonalServer/docs/jobs.md)
+* [OCI Image Build & Deployment Workflow](file:///d:/Coding/Major%20Project/PersonalServer/docs/image_build_deploy_workflow.md)
+* [Application Routing & Gateway](file:///d:/Coding/Major%20Project/PersonalServer/docs/domain_migration.md)
+
+### Setup, Security & Migration
+* [Getting Started Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/getting-started.md)
+* [Node Enrollment & Onboarding](file:///d:/Coding/Major%20Project/PersonalServer/docs/node-enrollment.md)
+* [Troubleshooting & Runbook](file:///d:/Coding/Major%20Project/PersonalServer/docs/troubleshooting.md)
+* [Security Model & Threat Assessment](file:///d:/Coding/Major%20Project/PersonalServer/docs/security.md)
+* [Networking & Ingress Architecture](file:///d:/Coding/Major%20Project/PersonalServer/docs/networking.md)
+* [Hardware Migration Plan (Raspberry Pi & Android)](file:///d:/Coding/Major%20Project/PersonalServer/docs/hardware_migration_plan.md)
+* [Raspberry Pi OS Deployment & FHS Mapping](file:///d:/Coding/Major%20Project/PersonalServer/docs/raspberry_pi_migration.md)
+* [Multi-Node Simulation Suite](file:///d:/Coding/Major%20Project/PersonalServer/docs/multi_node_simulation.md)
+* [Reproducible Development, CI & Backup](file:///d:/Coding/Major%20Project/PersonalServer/docs/reproducible_setup.md)
+* [Development & Testing Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/development.md)
+* [Evolution & Roadmap](file:///d:/Coding/Major%20Project/PersonalServer/docs/roadmap.md)

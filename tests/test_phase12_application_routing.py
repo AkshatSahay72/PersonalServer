@@ -88,6 +88,18 @@ class TestPhase12ApplicationRouting(unittest.TestCase):
         cls.controller_url = "http://127.0.0.1:8000"
         cls.router_url = "http://127.0.0.1:8088"
 
+        # Check if live controller is reachable
+        try:
+            req = urllib.request.Request(f"{cls.controller_url}/health", headers={"User-Agent": "HealthCheck"})
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                if resp.status != 200:
+                    raise Exception()
+        except Exception:
+            raise unittest.SkipTest(
+                f"PersonalServer controller is not running on {cls.controller_url}. "
+                "Skipping live application routing daemon tests."
+            )
+
         # Start a mock backend container on port 18090
         cls.mock_backend_port = 18090
         cls.mock_backend = HTTPServer(("127.0.0.1", cls.mock_backend_port), MockContainerHandler)

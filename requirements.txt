@@ -1,0 +1,10 @@
+# PersonalServer Core Runtime Requirements
+# -----------------------------------------------------------------------------
+# PersonalServer's controller and node agent are deliberately built to run
+# dependency-free using the standard Python 3.9+ library (http.server, urllib,
+# json, sqlite3/json-persistence, socket, subprocess, pathlib).
+#
+# PyYAML is an optional dependency for strict YAML 1.2 parsing of platform.yaml
+# and deployment blueprints. If PyYAML is not installed, PersonalServer
+# automatically uses its built-in fallback parser.
+pyyaml>=6.0.1,<7.0.0

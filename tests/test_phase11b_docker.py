@@ -36,7 +36,17 @@ def get_token():
 
 AUTH_HEADER = {"Authorization": f"Bearer {get_token()}"}
 
+def is_controller_running():
+    try:
+        req = urllib.request.Request(f"{CONTROLLER_URL}/health", headers={"User-Agent": "HealthCheck"})
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
 def http_req(path, method="GET", data=None, headers=None):
+    if not is_controller_running():
+        raise unittest.SkipTest(f"PersonalServer controller is not running on {CONTROLLER_URL}. Skipping live cluster endpoint test.")
     url = f"{CONTROLLER_URL}{path}"
     req_headers = {"Content-Type": "application/json"}
     if headers:

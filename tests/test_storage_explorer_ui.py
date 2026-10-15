@@ -23,7 +23,19 @@ import unittest
 NODE_API_URL = "http://100.85.108.5:8080" # Node 01 local endpoint
 CONTROLLER_URL = "http://127.0.0.1:8000"
 
+def is_url_reachable(url):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "HealthCheck"})
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            return True
+    except Exception:
+        return False
+
 def http_json(url, method="GET", data=None):
+    parsed = urllib.parse.urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    if not is_url_reachable(base):
+        raise unittest.SkipTest(f"Node API not reachable at {base}. Skipping physical device storage UI test.")
     req_headers = {"Content-Type": "application/json"}
     body = json.dumps(data).encode("utf-8") if data is not None else None
     req = urllib.request.Request(url, data=body, headers=req_headers, method=method)

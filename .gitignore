@@ -4,10 +4,13 @@ config/network.json
 config/services.json
 
 # Secrets
-config/secrets/
+config/secrets/*
+!config/secrets/*.example*
+!config/secrets/.gitkeep
 *.key
 *.pem
 *.token
+!*.example.token
 *.secret
 
 # Runtime & Persistence
@@ -15,6 +18,12 @@ logs/
 runtime/
 data/
 controller/data/
+backups/
+*.tar.gz
+*.tar
+*.zip
+.pytest_cache/
+.ruff_cache/
 *.pid
 *.bak
 

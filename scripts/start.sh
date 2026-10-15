@@ -1,5 +1,4 @@
-
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 
 # ==============================================================================
 # PersonalServer - Service Startup Script
@@ -102,7 +101,7 @@ if [ -f "$CLOUDFLARED_PID_FILE" ]; then
 fi
 
 if [ "$cloudflared_running" = false ]; then
-    existing_cf_pid=$(pgrep -f "cloudflared tunnel run" | head -n 1)
+    existing_cf_pid=$(pgrep -f "cloudflared tunnel" | head -n 1)
     if [ -n "$existing_cf_pid" ]; then
         echo "$existing_cf_pid" > "$CLOUDFLARED_PID_FILE"
         echo "already running (PID: $existing_cf_pid, PID file recovered)"
@@ -113,7 +112,8 @@ if [ "$cloudflared_running" = false ]; then
         elif [ ! -f "$TOKEN_FILE" ]; then
             echo "FAILED (Token missing at $TOKEN_FILE)"
         else
-            nohup cloudflared tunnel run --token-file "$TOKEN_FILE" >> "$CLOUDFLARED_LOG" 2>&1 &
+            CF_PROTOCOL="${CLOUDFLARED_PROTOCOL:-http2}"
+            nohup cloudflared tunnel run --protocol "$CF_PROTOCOL" --token-file "$TOKEN_FILE" >> "$CLOUDFLARED_LOG" 2>&1 &
             new_cf_pid=$!
             echo "$new_cf_pid" > "$CLOUDFLARED_PID_FILE"
 

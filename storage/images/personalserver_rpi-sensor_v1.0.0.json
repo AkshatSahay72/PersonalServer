@@ -1,0 +1,13 @@
+{
+  "image_ref": "personalserver/rpi-sensor:v1.0.0",
+  "repository": "personalserver/rpi-sensor",
+  "tag": "v1.0.0",
+  "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "architecture": "arm64",
+  "created_at": "2026-10-15T16:07:51Z",
+  "metadata": {
+    "target_platform": "linux/arm64",
+    "tested_hardware": "Raspberry Pi 4B (Simulated)",
+    "note": "Native ARM64 execution requires Raspberry Pi OS ARM64 worker or QEMU user emulation."
+  }
+}

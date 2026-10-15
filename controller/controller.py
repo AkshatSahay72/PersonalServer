@@ -29,7 +29,19 @@ sys.path.insert(0, str(BASE_DIR))
 
 # Import ResourceScheduler
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness, extract_node_telemetry
-from config.platform_config import get_platform_config
+from config.platform_config import (
+    get_platform_config,
+    get_controller_paths,
+    get_controller_runtime_config,
+    redact_sensitive_dict
+)
+from config.structured_logger import (
+    controller_logger,
+    extract_correlation_id,
+    generate_correlation_id,
+    redact_sensitive_text,
+    redact_sensitive_data
+)
 try:
     from controller.image_inspector import (
         validate_image_reference,
@@ -57,33 +69,74 @@ except (ImportError, ModuleNotFoundError):
         is_secret_variable
     )
 
-CONFIG_DIR = BASE_DIR / "config"
-SECRETS_DIR = CONFIG_DIR / "secrets"
+PATHS = get_controller_paths()
+CONFIG_DIR = PATHS.config_dir
+SECRETS_DIR = PATHS.secrets_dir
 CONTROLLER_DIR = BASE_DIR / "controller"
-DATA_DIR = CONTROLLER_DIR / "data"
+DATA_DIR = PATHS.data_dir
 
-NODES_FILE = DATA_DIR / "nodes.json"
-BACKUP_NODES_FILE = DATA_DIR / "nodes.json.bak"
-JOBS_FILE = DATA_DIR / "jobs.json"
-BACKUP_JOBS_FILE = DATA_DIR / "jobs.json.bak"
-APPS_FILE = DATA_DIR / "apps.json"
-BACKUP_APPS_FILE = DATA_DIR / "apps.json.bak"
-ONBOARDING_CODES_FILE = DATA_DIR / "onboarding_codes.json"
-BACKUP_ONBOARDING_CODES_FILE = DATA_DIR / "onboarding_codes.json.bak"
-ENROLLMENT_TOKEN_FILE = SECRETS_DIR / "enrollment.token"
+NODES_FILE = PATHS.nodes_file
+BACKUP_NODES_FILE = PATHS.backup_nodes_file
+JOBS_FILE = PATHS.jobs_file
+BACKUP_JOBS_FILE = PATHS.backup_jobs_file
+APPS_FILE = PATHS.apps_file
+BACKUP_APPS_FILE = PATHS.backup_apps_file
+ONBOARDING_CODES_FILE = PATHS.onboarding_codes_file
+BACKUP_ONBOARDING_CODES_FILE = PATHS.backup_onboarding_codes_file
+ENROLLMENT_TOKEN_FILE = PATHS.enrollment_token_file
 
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 8000
-DEFAULT_HEARTBEAT_TIMEOUT = 60  # seconds
-DEFAULT_LEASE_GRACE_SEC = 20    # seconds beyond job timeout
-DEFAULT_ONBOARDING_TTL_SEC = 900 # 15 minutes (seconds)
+RUNTIME_CFG = get_controller_runtime_config()
+DEFAULT_HOST = RUNTIME_CFG.host
+DEFAULT_PORT = RUNTIME_CFG.port
+DEFAULT_HEARTBEAT_TIMEOUT = RUNTIME_CFG.heartbeat_timeout  # seconds
+DEFAULT_LEASE_GRACE_SEC = RUNTIME_CFG.lease_grace_sec    # seconds beyond job timeout
+DEFAULT_ONBOARDING_TTL_SEC = RUNTIME_CFG.onboarding_ttl_sec # 15 minutes (seconds)
 
 PORT_RANGE_START = 18000
 PORT_RANGE_END = 18999
 
+DB_LOCK = threading.RLock()
 ONBOARDING_LOCK = threading.Lock()
 APPS_LOCK = threading.Lock()
-APP_STORAGE_ROOT = (BASE_DIR / "storage" / "applications").resolve()
+APP_STORAGE_ROOT = (PATHS.storage_dir / "applications").resolve()
+
+# High Availability (HA) Manager
+from config.ha_manager import (
+    HAManager,
+    HAState,
+    LeaderLease,
+    find_active_leader
+)
+
+HA_MANAGER = None
+
+
+def get_ha_manager(paths=None, role="auto", node_id=None, node_url=None, force_reload=False):
+    global HA_MANAGER
+    curr_paths = paths or get_controller_paths()
+    if HA_MANAGER is None or force_reload or (paths and getattr(HA_MANAGER, "paths", None) != paths):
+        cfg = get_controller_runtime_config()
+        HA_MANAGER = HAManager(
+            node_id=node_id,
+            node_url=node_url or f"http://{cfg.host if cfg.host != '0.0.0.0' else '127.0.0.1'}:{cfg.port}",
+            role=role,
+            paths=curr_paths
+        )
+    return HA_MANAGER
+def constant_time_compare(val1, val2) -> bool:
+    """
+    Constant-time comparison for secrets and tokens to prevent timing attacks.
+    Returns False if either operand is empty, None, or not a string/bytes.
+    """
+    if not val1 or not val2:
+        return False
+    if not isinstance(val1, (str, bytes)) or not isinstance(val2, (str, bytes)):
+        return False
+    try:
+        return hmac.compare_digest(val1, val2)
+    except Exception:
+        return False
+
 
 
 def resolve_safe_app_storage_path(app_id, rel_path=""):
@@ -146,6 +199,29 @@ JOB_STATE_CANCELLED = "CANCELLED"
 JOB_STATE_RECOVERING = "RECOVERING"
 JOB_STATE_REJECTED = "REJECTED"
 
+# Formal Job State Transitions Lifecycle
+VALID_JOB_TRANSITIONS = {
+    JOB_STATE_QUEUED: {JOB_STATE_CLAIMED, JOB_STATE_CANCELLED, JOB_STATE_REJECTED},
+    JOB_STATE_CLAIMED: {JOB_STATE_RUNNING, JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED, JOB_STATE_RECOVERING},
+    JOB_STATE_RUNNING: {JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED, JOB_STATE_RECOVERING},
+    JOB_STATE_RECOVERING: {JOB_STATE_CLAIMED, JOB_STATE_FAILED, JOB_STATE_CANCELLED},
+    JOB_STATE_SUCCEEDED: set(),   # Terminal
+    JOB_STATE_FAILED: set(),      # Terminal
+    JOB_STATE_TIMEOUT: set(),     # Terminal if max_attempts reached
+    JOB_STATE_CANCELLED: set(),   # Terminal
+    JOB_STATE_REJECTED: set(),    # Terminal
+}
+
+
+def validate_job_transition(current_state: str, new_state: str) -> bool:
+    """
+    Validates whether transitioning from current_state to new_state is allowed by the lifecycle state machine.
+    """
+    if current_state == new_state:
+        return True  # Idempotent re-affirmation
+    allowed = VALID_JOB_TRANSITIONS.get(current_state, set())
+    return new_state in allowed
+
 # Centralized Application States (Phase 11-13 Lifecycle)
 APP_STATE_CREATED = "CREATED"
 APP_STATE_FETCHING_SOURCE = "FETCHING_SOURCE"
@@ -181,24 +257,25 @@ def get_current_iso_timestamp():
 
 
 def ensure_directories():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SECRETS_DIR.mkdir(parents=True, exist_ok=True)
+    PATHS.ensure_directories()
 
 
 def get_or_create_enrollment_token():
-    ensure_directories()
-    if ENROLLMENT_TOKEN_FILE.exists():
+    paths = get_controller_paths()
+    paths.ensure_directories()
+    token_file = paths.enrollment_token_file
+    if token_file.exists():
         try:
-            token = ENROLLMENT_TOKEN_FILE.read_text(encoding="utf-8").strip()
+            token = token_file.read_text(encoding="utf-8").strip()
             if token:
                 return token
         except Exception:
             pass
 
     token = secrets.token_hex(24)
-    ENROLLMENT_TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
+    token_file.write_text(token + "\n", encoding="utf-8")
     try:
-        os.chmod(ENROLLMENT_TOKEN_FILE, 0o600)
+        os.chmod(token_file, 0o600)
     except Exception:
         pass
     return token
@@ -209,99 +286,144 @@ def get_or_create_enrollment_token():
 # ------------------------------------------------------------------------------
 
 def load_nodes_db():
-    ensure_directories()
-    if NODES_FILE.exists():
-        try:
-            with open(NODES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: Corrupt {NODES_FILE} ({e}). Attempting rollback to backup...", file=sys.stderr)
-            if BACKUP_NODES_FILE.exists():
-                try:
-                    with open(BACKUP_NODES_FILE, "r", encoding="utf-8") as bf:
-                        return json.load(bf)
-                except Exception:
-                    pass
-    return {"cluster_name": "PersonalServer", "nodes": {}}
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        nodes_file = paths.nodes_file
+        backup_file = paths.backup_nodes_file
+        if nodes_file.exists():
+            try:
+                with open(nodes_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Warning: Corrupt {nodes_file} ({e}). Attempting rollback to backup...", file=sys.stderr)
+                if backup_file.exists():
+                    try:
+                        with open(backup_file, "r", encoding="utf-8") as bf:
+                            return json.load(bf)
+                    except Exception:
+                        pass
+        return {"cluster_name": "PersonalServer", "nodes": {}}
 
 
 def save_nodes_db(db):
-    ensure_directories()
-    temp_file = NODES_FILE.with_suffix(".tmp")
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2)
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        nodes_file = paths.nodes_file
+        backup_file = paths.backup_nodes_file
+        temp_file = nodes_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2)
 
-    if NODES_FILE.exists():
-        try:
-            shutil.copy2(NODES_FILE, BACKUP_NODES_FILE)
-        except Exception:
-            pass
+        if nodes_file.exists():
+            try:
+                shutil.copy2(nodes_file, backup_file)
+            except Exception:
+                pass
 
-    temp_file.replace(NODES_FILE)
+        temp_file.replace(nodes_file)
+        if HA_MANAGER:
+            try:
+                HA_MANAGER.bump_state_version()
+            except Exception:
+                pass
 
 
 def load_jobs_db():
-    ensure_directories()
-    if JOBS_FILE.exists():
-        try:
-            with open(JOBS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: Corrupt {JOBS_FILE} ({e}). Rolling back to backup...", file=sys.stderr)
-            if BACKUP_JOBS_FILE.exists():
-                try:
-                    with open(BACKUP_JOBS_FILE, "r", encoding="utf-8") as bf:
-                        return json.load(bf)
-                except Exception:
-                    pass
-    return {"jobs": {}}
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        jobs_file = paths.jobs_file
+        backup_file = paths.backup_jobs_file
+        if jobs_file.exists():
+            try:
+                with open(jobs_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Warning: Corrupt {jobs_file} ({e}). Rolling back to backup...", file=sys.stderr)
+                if backup_file.exists():
+                    try:
+                        with open(backup_file, "r", encoding="utf-8") as bf:
+                            recovered = json.load(bf)
+                        # Self-heal primary file from valid backup
+                        try:
+                            shutil.copy2(backup_file, jobs_file)
+                        except Exception:
+                            pass
+                        return recovered
+                    except Exception:
+                        pass
+        return {"jobs": {}}
 
 
 def save_jobs_db(db):
-    ensure_directories()
-    temp_file = JOBS_FILE.with_suffix(".tmp")
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2)
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        jobs_file = paths.jobs_file
+        backup_file = paths.backup_jobs_file
+        temp_file = jobs_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2)
 
-    if JOBS_FILE.exists():
-        try:
-            shutil.copy2(JOBS_FILE, BACKUP_JOBS_FILE)
-        except Exception:
-            pass
+        if jobs_file.exists():
+            try:
+                shutil.copy2(jobs_file, backup_file)
+            except Exception:
+                pass
 
-    temp_file.replace(JOBS_FILE)
+        temp_file.replace(jobs_file)
+        if HA_MANAGER:
+            try:
+                HA_MANAGER.bump_state_version()
+            except Exception:
+                pass
 
 
 def load_apps_db():
-    ensure_directories()
-    if APPS_FILE.exists():
-        try:
-            with open(APPS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: Corrupt {APPS_FILE} ({e}). Rolling back to backup...", file=sys.stderr)
-            if BACKUP_APPS_FILE.exists():
-                try:
-                    with open(BACKUP_APPS_FILE, "r", encoding="utf-8") as bf:
-                        return json.load(bf)
-                except Exception:
-                    pass
-    return {"apps": {}}
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        apps_file = paths.apps_file
+        backup_file = paths.backup_apps_file
+        if apps_file.exists():
+            try:
+                with open(apps_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Warning: Corrupt {apps_file} ({e}). Rolling back to backup...", file=sys.stderr)
+                if backup_file.exists():
+                    try:
+                        with open(backup_file, "r", encoding="utf-8") as bf:
+                            return json.load(bf)
+                    except Exception:
+                        pass
+        return {"apps": {}}
 
 
 def save_apps_db(db):
-    ensure_directories()
-    temp_file = APPS_FILE.with_suffix(".tmp")
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2)
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        apps_file = paths.apps_file
+        backup_file = paths.backup_apps_file
+        temp_file = apps_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2)
 
-    if APPS_FILE.exists():
-        try:
-            shutil.copy2(APPS_FILE, BACKUP_APPS_FILE)
-        except Exception:
-            pass
+        if apps_file.exists():
+            try:
+                shutil.copy2(apps_file, backup_file)
+            except Exception:
+                pass
 
-    temp_file.replace(APPS_FILE)
+        temp_file.replace(apps_file)
+        if HA_MANAGER:
+            try:
+                HA_MANAGER.bump_state_version()
+            except Exception:
+                pass
 
 
 def allocate_host_port(apps_db):
@@ -674,35 +796,43 @@ def hash_onboarding_code(code: str) -> str:
 
 
 def load_onboarding_codes_db():
-    ensure_directories()
-    if ONBOARDING_CODES_FILE.exists():
-        try:
-            with open(ONBOARDING_CODES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Warning: Corrupt {ONBOARDING_CODES_FILE} ({e}). Checking backup...", file=sys.stderr)
-            if BACKUP_ONBOARDING_CODES_FILE.exists():
-                try:
-                    with open(BACKUP_ONBOARDING_CODES_FILE, "r", encoding="utf-8") as bf:
-                        return json.load(bf)
-                except Exception:
-                    pass
-    return {"codes": {}}
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        codes_file = paths.onboarding_codes_file
+        backup_file = paths.backup_onboarding_codes_file
+        if codes_file.exists():
+            try:
+                with open(codes_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Warning: Corrupt {codes_file} ({e}). Checking backup...", file=sys.stderr)
+                if backup_file.exists():
+                    try:
+                        with open(backup_file, "r", encoding="utf-8") as bf:
+                            return json.load(bf)
+                    except Exception:
+                        pass
+        return {"codes": {}}
 
 
 def save_onboarding_codes_db(db):
-    ensure_directories()
-    temp_file = ONBOARDING_CODES_FILE.with_suffix(".tmp")
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2)
+    paths = get_controller_paths()
+    with DB_LOCK:
+        paths.ensure_directories()
+        codes_file = paths.onboarding_codes_file
+        backup_file = paths.backup_onboarding_codes_file
+        temp_file = codes_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2)
 
-    if ONBOARDING_CODES_FILE.exists():
-        try:
-            shutil.copy2(ONBOARDING_CODES_FILE, BACKUP_ONBOARDING_CODES_FILE)
-        except Exception:
-            pass
+        if codes_file.exists():
+            try:
+                shutil.copy2(codes_file, backup_file)
+            except Exception:
+                pass
 
-    temp_file.replace(ONBOARDING_CODES_FILE)
+        temp_file.replace(codes_file)
 
 
 def generate_onboarding_code(ttl_seconds=DEFAULT_ONBOARDING_TTL_SEC):
@@ -1115,8 +1245,18 @@ def sweep_expired_leases(jobs_db, nodes_db, timeout_seconds=DEFAULT_HEARTBEAT_TI
             attempt = job.get("attempt", 1)
             max_attempts = job.get("max_attempts", 3)
             reason = "Worker lease expired" if lease_expired else f"Worker node '{target_node}' went OFFLINE"
+            corr_id = job.get("correlation_id") or generate_correlation_id()
 
-            print(f"[CONTROLLER-RECOVERY] Job {job_id} on node '{target_node}' failure detected: {reason} (Attempt {attempt}/{max_attempts})")
+            controller_logger.warning(
+                "lease.expired",
+                f"Job {job_id} on node '{target_node}' failure detected: {reason} (Attempt {attempt}/{max_attempts})",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                reason=reason
+            )
 
             # Record history
             attempts_history = job.setdefault("attempts_history", [])
@@ -1129,12 +1269,19 @@ def sweep_expired_leases(jobs_db, nodes_db, timeout_seconds=DEFAULT_HEARTBEAT_TI
             })
 
             # Check if retry is allowed
-            if attempt < max_attempts:
+            is_retryable = job.get("retryable", True) is not False
+            if attempt < max_attempts and is_retryable:
                 job["attempt"] = attempt + 1
                 job["status"] = JOB_STATE_RECOVERING
                 job["retry_reason"] = reason
                 job["claimed_at"] = None
                 job["lease_expires_at"] = None
+
+                # Compute backoff
+                base_backoff = float(job.get("backoff_sec") if job.get("backoff_sec") is not None else getattr(ControllerHandler, "default_backoff_sec", 0.0))
+                backoff_sec = min(60.0, base_backoff * (2 ** (attempt - 1)))
+                job["retry_after"] = now_epoch + backoff_sec
+                job["retry_after_iso"] = datetime.fromtimestamp(now_epoch + backoff_sec, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 # Policy: Auto-target vs Explicit Target
                 target_mode = job.get("target", "auto")
@@ -1163,13 +1310,32 @@ def sweep_expired_leases(jobs_db, nodes_db, timeout_seconds=DEFAULT_HEARTBEAT_TI
                     }
                     print(f"[CONTROLLER-RECOVERY] Explicit target job {job_id} queued for recovery on '{target_mode}' (no migration).")
 
+                controller_logger.info(
+                    "job.recovery_rescheduled",
+                    f"Job {job_id} queued for retry attempt {job['attempt']}/{max_attempts} with backoff {backoff_sec:.1f}s",
+                    correlation_id=corr_id,
+                    job_id=job_id,
+                    node_id=job.get("target_node"),
+                    attempt=job["attempt"],
+                    max_attempts=max_attempts,
+                    backoff_sec=backoff_sec
+                )
+
             else:
-                # Max retries exhausted
+                # Max retries exhausted or non-retryable
                 job["status"] = JOB_STATE_FAILED
                 job["finished_at"] = now_iso
-                job["retry_reason"] = f"Max retries ({max_attempts}) exceeded after: {reason}"
+                job["retry_reason"] = f"Max retries ({max_attempts}) exceeded after: {reason}" if attempt >= max_attempts else f"Non-retryable failure: {reason}"
                 job["lease_expires_at"] = None
-                print(f"[CONTROLLER-RECOVERY] Job {job_id} permanently marked FAILED (max retries reached).")
+                print(f"[CONTROLLER-RECOVERY] Job {job_id} permanently marked FAILED ({job['retry_reason']}).")
+                controller_logger.error(
+                    "job.recovery_exhausted",
+                    f"Job {job_id} permanently marked FAILED ({job['retry_reason']}).",
+                    correlation_id=corr_id,
+                    job_id=job_id,
+                    node_id=target_node,
+                    reason=job["retry_reason"]
+                )
 
             changed = True
 
@@ -1201,12 +1367,17 @@ class ControllerHandler(BaseHTTPRequestHandler):
     heartbeat_timeout = DEFAULT_HEARTBEAT_TIMEOUT
 
     def send_json(self, status_code, data):
+        corr_id = getattr(self, "current_correlation_id", None)
+        if corr_id and isinstance(data, dict) and "correlation_id" not in data:
+            data["correlation_id"] = corr_id
         body = json.dumps(data, indent=2).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if corr_id:
+            self.send_header("X-Correlation-ID", corr_id)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Correlation-ID, X-Request-ID")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
@@ -1214,7 +1385,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Correlation-ID, X-Request-ID")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
 
@@ -1229,11 +1400,11 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if not token:
             return False
         enrollment_token = get_or_create_enrollment_token()
-        if token == enrollment_token:
+        if constant_time_compare(token, enrollment_token):
             return True
         nodes_db = load_nodes_db()
         for node in nodes_db.get("nodes", {}).values():
-            if node.get("auth_token") and node.get("auth_token") == token:
+            if node.get("auth_token") and constant_time_compare(node.get("auth_token"), token):
                 return True
         return False
 
@@ -1248,6 +1419,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return None
 
     def do_GET(self):
+        self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -1257,12 +1429,78 @@ class ControllerHandler(BaseHTTPRequestHandler):
             nodes_db = load_nodes_db()
             jobs_db = load_jobs_db()
             summary = get_cluster_summary(nodes_db, self.heartbeat_timeout)
+            jobs = jobs_db.get("jobs", {})
+            job_states = {}
+            for j in jobs.values():
+                st = j.get("status", "UNKNOWN")
+                job_states[st] = job_states.get(st, 0) + 1
+            recent_errors = len(controller_logger.get_recent_events(limit=50, level="ERROR"))
             self.send_json(200, {
                 "status": "online",
                 "service": "PersonalServer Controller",
                 "cluster": summary["cluster"],
-                "total_jobs": len(jobs_db.get("jobs", {})),
+                "total_jobs": len(jobs),
+                "job_states": job_states,
+                "recent_errors": recent_errors,
                 "timestamp": get_current_iso_timestamp()
+            })
+            return
+
+        # GET /ha/status or GET /api/ha/status
+        if path in ("/ha/status", "/api/ha/status"):
+            mgr = get_ha_manager()
+            self.send_json(200, mgr.get_status_dict())
+            return
+
+        # GET /ha/leader or GET /api/ha/leader
+        if path in ("/ha/leader", "/api/ha/leader"):
+            mgr = get_ha_manager()
+            self.send_json(200, {
+                "leader_id": mgr.current_leader_id,
+                "leader_url": mgr.current_leader_url,
+                "term": mgr.current_term,
+                "state_version": mgr.state_version,
+                "is_leader": mgr.is_leader,
+                "is_valid": mgr.current_lease.is_valid(),
+                "time_remaining_sec": round(mgr.current_lease.time_remaining_sec(), 1)
+            })
+            return
+
+        # GET /ha/sync or GET /api/ha/sync
+        if path in ("/ha/sync", "/api/ha/sync"):
+            token = self.parse_auth_token()
+            enrollment_token = get_or_create_enrollment_token()
+            if not self.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Authentication required for HA state sync"})
+                return
+            mgr = get_ha_manager()
+            snapshot = mgr.export_state_snapshot()
+            self.send_json(200, snapshot)
+            return
+
+        # GET /diagnostics
+        if path == "/diagnostics":
+            token = self.parse_auth_token()
+            enrollment_token = get_or_create_enrollment_token()
+            if not self.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Authentication required for diagnostics"})
+                return
+            limit = int(query.get("limit", [50])[0])
+            req_event = query.get("event", [None])[0]
+            req_corr = query.get("correlation_id", [None])[0]
+            req_job = query.get("job_id", [None])[0]
+            req_level = query.get("level", [None])[0]
+            events = controller_logger.get_recent_events(
+                limit=min(limit, 100),
+                event=req_event,
+                correlation_id=req_corr,
+                job_id=req_job,
+                level=req_level
+            )
+            self.send_json(200, {
+                "subsystem": "Controller",
+                "events_count": len(events),
+                "events": events
             })
             return
 
@@ -1324,7 +1562,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
 
             expected_auth = node.get("auth_token")
             enrollment_token = get_or_create_enrollment_token()
-            if not token or (token != expected_auth and token != enrollment_token):
+            if not token or (not constant_time_compare(token, expected_auth) and not constant_time_compare(token, enrollment_token)):
                 self.send_json(401, {"error": "Unauthorized: Invalid node authentication token"})
                 return
 
@@ -1332,10 +1570,17 @@ class ControllerHandler(BaseHTTPRequestHandler):
             # Perform sweep before claiming
             sweep_expired_leases(jobs_db, nodes_db, self.heartbeat_timeout)
 
-            # Find jobs waiting for this node
+            now_epoch = time.time()
+            # Find jobs waiting for this node (respecting retry_after backoff)
             claimable_jobs = [
                 j for j in jobs_db.get("jobs", {}).values()
-                if j.get("target_node") == node_id and j.get("status") in (JOB_STATE_QUEUED, JOB_STATE_RECOVERING)
+                if j.get("target_node") == node_id and (
+                    j.get("status") == JOB_STATE_QUEUED
+                    or (
+                        j.get("status") == JOB_STATE_RECOVERING
+                        and now_epoch >= j.get("retry_after", 0)
+                    )
+                )
             ]
 
             if not claimable_jobs:
@@ -1356,7 +1601,17 @@ class ControllerHandler(BaseHTTPRequestHandler):
 
             save_jobs_db(jobs_db)
 
-            print(f"[CONTROLLER] Job {next_job['job_id']} ({next_job['type']}) CLAIMED by node '{node_id}' (Attempt {next_job.get('attempt', 1)}, Lease {lease_duration}s)")
+            corr_id = next_job.get("correlation_id") or getattr(self, "current_correlation_id", None) or generate_correlation_id()
+            next_job["correlation_id"] = corr_id
+            controller_logger.info(
+                "job.claimed",
+                f"Job {next_job['job_id']} ({next_job['type']}) CLAIMED by node '{node_id}' (Attempt {next_job.get('attempt', 1)}, Lease {lease_duration}s)",
+                correlation_id=corr_id,
+                job_id=next_job["job_id"],
+                node_id=node_id,
+                attempt=next_job.get("attempt", 1),
+                lease_duration_sec=lease_duration
+            )
             self.send_json(200, {"job": next_job})
             return
 
@@ -1370,6 +1625,66 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
             eval_res = evaluate_node_deboarding_safety(node_id, nodes_db)
             self.send_json(200, eval_res)
+            return
+
+        # GET /nodes/<node_id>/diagnostics
+        if path.startswith("/nodes/") and path.endswith("/diagnostics"):
+            node_id = path[7:-12].strip()
+            nodes_db = load_nodes_db()
+            node = nodes_db.get("nodes", {}).get(node_id)
+            if not node:
+                self.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return
+
+            is_local = (node_id in ("local", "self") or (node and node.get("ip") in ("127.0.0.1", "localhost", "::1")))
+            if is_local:
+                try:
+                    from config.node_telemetry import run_live_diagnostics
+                    diag_res = run_live_diagnostics()
+                    self.send_json(200, {"node_id": node_id, "diagnostics": diag_res})
+                    return
+                except Exception:
+                    pass
+
+            node_ip = node.get("ip") if node else None
+            if node_ip and node_ip not in ("127.0.0.1", "localhost", "::1"):
+                try:
+                    req = urllib.request.Request(f"http://{node_ip}:8080/diagnostics", headers={"User-Agent": "PersonalServer-Controller/1.0"})
+                    with urllib.request.urlopen(req, timeout=2.5) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        self.send_json(200, {"node_id": node_id, "diagnostics": data.get("diagnostics", data)})
+                        return
+                except Exception:
+                    pass
+
+            hb = node.get("last_heartbeat", {}) if node else {}
+            hb_sys = hb.get("system", {})
+            bat = hb.get("battery") or hb_sys.get("battery") or {}
+            net = hb.get("network") or hb_sys.get("network") or {}
+            cpu = hb.get("cpu_details") or hb_sys.get("cpu_details") or {}
+            thm = hb.get("thermals") or hb_sys.get("thermals") or {}
+
+            ping_ms = None
+            if node_ip:
+                try:
+                    from config.node_telemetry import _measure_ping_latency_ms
+                    ping_ms = _measure_ping_latency_ms(node_ip, 8080, timeout=1.0)
+                except Exception:
+                    pass
+
+            diag_obj = {
+                "status": "cached",
+                "timestamp": hb.get("timestamp") or (node.get("last_seen") if node else None),
+                "battery": bat,
+                "network": {
+                    **net,
+                    "ip": node_ip or net.get("ip"),
+                    "ping_ms": ping_ms if ping_ms is not None else net.get("ping_ms")
+                },
+                "cpu": cpu,
+                "thermals": thm
+            }
+            self.send_json(200, {"node_id": node_id, "diagnostics": diag_obj})
             return
 
         # GET /nodes/<node_id>
@@ -1417,7 +1732,15 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if not job:
                 self.send_json(404, {"error": f"Job '{job_id}' not found"})
                 return
-            self.send_json(200, {"job": job})
+            diagnostics = {
+                "attempts_total": len(job.get("attempts_history", [])),
+                "current_attempt": job.get("attempt", 1),
+                "is_active": job.get("status") in (JOB_STATE_QUEUED, JOB_STATE_CLAIMED, JOB_STATE_RUNNING, JOB_STATE_RECOVERING),
+                "last_failure_reason": job.get("retry_reason"),
+                "correlation_id": job.get("correlation_id"),
+                "lease_active": bool(job.get("lease_expires_at") and time.time() < job.get("lease_expires_at")),
+            }
+            self.send_json(200, {"job": job, "diagnostics": diagnostics})
             return
 
         # GET /apps
@@ -1628,18 +1951,22 @@ class ControllerHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "Endpoint not found"})
 
     def do_POST(self):
+        self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         body = self.read_json_body()
+        if body and isinstance(body, dict):
+            self.current_correlation_id = extract_correlation_id(self.headers, body)
         if body is None:
             # Endpoints that do not strictly require a request body
             no_body_endpoints = (
+                path in ("/ha/heartbeat", "/ha/renew", "/ha/failover", "/ha/promote"),
                 (path.startswith("/nodes/") and path.endswith("/remove")),
                 (path.startswith("/nodes/") and path.endswith("/drain")),
                 (path.startswith("/nodes/") and path.endswith("/deboard")),
                 (path.startswith("/nodes/") and path.endswith("/resume")),
                 (path.startswith("/jobs/") and path.endswith("/cancel")),
-                (path.startswith("/apps/") and (path.endswith("/deploy") or path.endswith("/stop") or path.endswith("/restart")))
+                (path.startswith("/apps/") and (path.endswith("/deploy") or path.endswith("/stop") or path.endswith("/restart") or path.endswith("/rollback")))
             )
             if not any(no_body_endpoints):
                 self.send_json(400, {"error": "Invalid or missing JSON payload"})
@@ -1649,6 +1976,62 @@ class ControllerHandler(BaseHTTPRequestHandler):
         token = self.parse_auth_token()
         if not token and body:
             token = body.get("enrollment_token") or body.get("auth_token") or ""
+
+        # ----------------------------------------------------------------------
+        # High Availability Endpoints: POST /ha/...
+        # ----------------------------------------------------------------------
+        if path in ("/ha/heartbeat", "/ha/renew"):
+            token = self.parse_auth_token()
+            enrollment_token = get_or_create_enrollment_token()
+            if not self.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Authentication required for HA heartbeat"})
+                return
+            mgr = get_ha_manager()
+            standby_id = body.get("node_id") if body else None
+            standby_url = body.get("node_url") if body else None
+            standby_version = body.get("state_version", 0) if body else 0
+            if standby_id and standby_url:
+                mgr.register_standby_heartbeat(standby_id, standby_url, standby_version)
+            self.send_json(200, {
+                "status": "ok",
+                "role": mgr.state,
+                "term": mgr.current_term,
+                "state_version": mgr.state_version,
+                "leader_id": mgr.current_leader_id,
+                "leader_url": mgr.current_leader_url,
+                "lease_remaining_sec": round(mgr.current_lease.time_remaining_sec(), 1)
+            })
+            return
+
+        if path == "/ha/failover":
+            token = self.parse_auth_token()
+            enrollment_token = get_or_create_enrollment_token()
+            if not self.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Authentication required for HA failover"})
+                return
+            mgr = get_ha_manager()
+            target_url = body.get("target_url") if body else None
+            result = mgr.manual_failover(target_node_url=target_url)
+            self.send_json(200, result)
+            return
+
+        if path == "/ha/promote":
+            token = self.parse_auth_token()
+            enrollment_token = get_or_create_enrollment_token()
+            if not self.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Authentication required for HA promote"})
+                return
+            mgr = get_ha_manager()
+            reason = body.get("reason", "API promotion request") if body else "API promotion request"
+            mgr.elect_self(reason=reason)
+            self.send_json(200, {
+                "status": "promoted",
+                "node_id": mgr.node_id,
+                "role": mgr.state,
+                "term": mgr.current_term,
+                "state_version": mgr.state_version
+            })
+            return
 
         # ----------------------------------------------------------------------
         # 1. Node Registration: POST /register
@@ -1668,7 +2051,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     return
             else:
                 enrollment_token = get_or_create_enrollment_token()
-                if not token or token != enrollment_token:
+                if not token or not constant_time_compare(token, enrollment_token):
                     self.send_json(401, {"error": "Unauthorized: Invalid enrollment token"})
                     return
 
@@ -1708,7 +2091,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "resources": resources,
                 "capabilities": capabilities,
                 "auth_token": node_auth_token,
-                "ip": self.client_address[0] if (self.client_address and self.client_address[0] not in ("127.0.0.1", "localhost", "0.0.0.0")) else None,
+                "ip": (body.get("ip") or body.get("tailscale_ip") or (self.client_address[0] if (self.client_address and self.client_address[0] not in ("127.0.0.1", "localhost", "0.0.0.0")) else None)),
                 "status": STATE_ONLINE,
                 "registered_at": now,
                 "last_seen": now,
@@ -1722,7 +2105,16 @@ class ControllerHandler(BaseHTTPRequestHandler):
             nodes_db.setdefault("nodes", {})[node_id] = node_record
             save_nodes_db(nodes_db)
 
-            print(f"[CONTROLLER] Registered node: {node_id} ({node_name}, role: {node_role})")
+            controller_logger.info(
+                "node.registered",
+                f"Registered node: {node_id} ({node_name}, role: {node_role})",
+                correlation_id=self.current_correlation_id,
+                node_id=node_id,
+                role=node_role,
+                platform=platform,
+                architecture=arch,
+                ip=node_record.get("ip")
+            )
 
             self.send_json(200, {
                 "status": "registered",
@@ -1734,10 +2126,12 @@ class ControllerHandler(BaseHTTPRequestHandler):
             return
 
         # ----------------------------------------------------------------------
-        # 2. Node Heartbeat: POST /heartbeat
+        # 2. Node Heartbeat: POST /heartbeat or POST /nodes/<node_id>/heartbeat
         # ----------------------------------------------------------------------
-        if path == "/heartbeat":
+        if path == "/heartbeat" or (path.startswith("/nodes/") and path.endswith("/heartbeat")):
             node_id = body.get("node_id")
+            if not node_id and path.startswith("/nodes/"):
+                node_id = path[7:-10].strip()
             if not node_id:
                 self.send_json(400, {"error": "Missing required field 'node_id'"})
                 return
@@ -1755,7 +2149,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             expected_auth_token = node_entry.get("auth_token")
             enrollment_token = get_or_create_enrollment_token()
 
-            if not token or (token != expected_auth_token and token != enrollment_token):
+            if not token or (not constant_time_compare(token, expected_auth_token) and not constant_time_compare(token, enrollment_token)):
                 self.send_json(401, {"error": "Unauthorized: Invalid node authentication token"})
                 return
 
@@ -1764,15 +2158,13 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if current_st not in (STATE_DRAINING, STATE_DEBOARDING):
                 node_entry["status"] = STATE_ONLINE
             node_entry["last_seen"] = now
-            if self.client_address and self.client_address[0] not in ("127.0.0.1", "localhost", "0.0.0.0"):
+            reported_ip = body.get("ip") or body.get("tailscale_ip")
+            if reported_ip:
+                node_entry["ip"] = reported_ip
+            elif self.client_address and self.client_address[0] not in ("127.0.0.1", "localhost", "0.0.0.0"):
                 node_entry["ip"] = self.client_address[0]
             elif not node_entry.get("ip"):
-                if node_id == "server-f8b1485ecf458f74":
-                    node_entry["ip"] = "100.120.251.42"
-                elif node_id == "server-95bad5ff01424d4c8d184330d6d2e394":
-                    node_entry["ip"] = "100.73.52.72"
-                elif node_id == "server-5387a86bf36116b1":
-                    node_entry["ip"] = "100.85.108.5"
+                node_entry["ip"] = self.client_address[0] if self.client_address else "127.0.0.1"
 
             if "capabilities" in body and isinstance(body["capabilities"], dict):
                 node_entry.setdefault("capabilities", {}).update(body["capabilities"])
@@ -1781,7 +2173,11 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "timestamp": body.get("timestamp", now),
                 "services": body.get("services", {}),
                 "system": body.get("system", {}),
-                "workloads": body.get("workloads", {})
+                "workloads": body.get("workloads", {}),
+                "battery": body.get("battery") or body.get("system", {}).get("battery", {}),
+                "network": body.get("network") or body.get("system", {}).get("network", {}),
+                "cpu_details": body.get("cpu_details") or body.get("system", {}).get("cpu_details", {}),
+                "thermals": body.get("thermals") or body.get("system", {}).get("thermals", {})
             }
 
             save_nodes_db(nodes_db)
@@ -1800,7 +2196,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path == "/jobs":
             enrollment_token = get_or_create_enrollment_token()
             # Allow admin token or valid request
-            if token and token != enrollment_token:
+            if token and not constant_time_compare(token, enrollment_token):
                 pass  # allow web UI proxy if auth passes
 
             target = body.get("target") or body.get("target_node") or "auto"
@@ -1890,6 +2286,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
             job_record = {
                 "id": job_id,
                 "job_id": job_id,
+                "correlation_id": self.current_correlation_id,
                 "name": job_name,
                 "type": job_type,
                 "parameters": parameters,
@@ -1908,6 +2305,8 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "finished_at": None,
                 "status": JOB_STATE_QUEUED,
                 "state": JOB_STATE_QUEUED,
+                "retryable": bool(body.get("retryable", True)),
+                "backoff_sec": body.get("backoff_sec"),
                 "retry_reason": None,
                 "attempts_history": [],
                 "result": None
@@ -1917,7 +2316,17 @@ class ControllerHandler(BaseHTTPRequestHandler):
             jobs_db.setdefault("jobs", {})[job_id] = job_record
             save_jobs_db(jobs_db)
 
-            print(f"[CONTROLLER] Queued job {job_id} ({job_type}) for target node {target_node}")
+            controller_logger.info(
+                "job.scheduled",
+                f"Queued job {job_id} ({job_type}) for target node {target_node} [mode={scheduler_info['mode']}]",
+                correlation_id=self.current_correlation_id,
+                job_id=job_id,
+                node_id=target_node,
+                job_type=job_type,
+                mode=scheduler_info["mode"],
+                score=scheduler_info.get("score"),
+                reason=scheduler_info.get("reason")
+            )
             self.send_json(200, {
                 "status": JOB_STATE_QUEUED,
                 "job_id": job_id,
@@ -1946,15 +2355,48 @@ class ControllerHandler(BaseHTTPRequestHandler):
 
             expected_auth = node_entry.get("auth_token")
             enrollment_token = get_or_create_enrollment_token()
-            if not token or (token != expected_auth and token != enrollment_token):
+            if not token or (not constant_time_compare(token, expected_auth) and not constant_time_compare(token, enrollment_token)):
                 self.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
+                return
+
+            # Stale worker protection: check attempt number if provided
+            reported_attempt = body.get("attempt")
+            current_attempt = job.get("attempt", 1)
+            corr_id = job.get("correlation_id") or getattr(self, "current_correlation_id", None) or generate_correlation_id()
+            if reported_attempt is not None and int(reported_attempt) < current_attempt:
+                controller_logger.warning(
+                    "worker.stale_attempt",
+                    f"Stale worker result for job '{job_id}': reported attempt {reported_attempt} < current attempt {current_attempt}",
+                    correlation_id=corr_id,
+                    job_id=job_id,
+                    node_id=target_node,
+                    reported_attempt=reported_attempt,
+                    current_attempt=current_attempt
+                )
+                self.send_json(409, {
+                    "error": f"Stale worker result: reported attempt {reported_attempt} is older than current attempt {current_attempt}.",
+                    "job_id": job_id,
+                    "current_attempt": current_attempt,
+                    "stale_attempt": True
+                })
+                return
+
+            # Idempotency / Stale report protection: Ignore duplicate reports if job is already terminal
+            if job.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED) or (job.get("status") == JOB_STATE_FAILED and job.get("result") is not None and current_attempt >= job.get("max_attempts", 3)):
+                self.send_json(200, {
+                    "status": job.get("status"),
+                    "message": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Duplicate report ignored.",
+                    "job_id": job_id,
+                    "duplicate": True
+                })
                 return
 
             job_status = body.get("status", JOB_STATE_FAILED)
             now_iso = get_current_iso_timestamp()
+            now_epoch = time.time()
 
             # Record attempt
-            attempt = job.get("attempt", 1)
+            attempt = current_attempt
             max_attempts = job.get("max_attempts", 3)
             attempts_history = job.setdefault("attempts_history", [])
             attempts_history.append({
@@ -1967,14 +2409,25 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "finished_at": now_iso
             })
 
+            # Bounded output logs (64KB maximum)
+            stdout_bounded = redact_sensitive_text(str(body.get("stdout", ""))[:65536])
+            stderr_bounded = redact_sensitive_text(str(body.get("stderr", ""))[:65536])
+
             # Check for failure retry
-            if job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT) and attempt < max_attempts:
+            is_retryable = body.get("retryable", True) and (job.get("retryable", True) is not False)
+            if job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT) and attempt < max_attempts and is_retryable:
                 job["attempt"] = attempt + 1
                 job["status"] = JOB_STATE_RECOVERING
                 job["state"] = JOB_STATE_RECOVERING
                 job["retry_reason"] = f"Attempt {attempt} completed with status: {job_status}"
                 job["claimed_at"] = None
                 job["lease_expires_at"] = None
+
+                # Compute backoff
+                base_backoff = float(job.get("backoff_sec") if job.get("backoff_sec") is not None else getattr(ControllerHandler, "default_backoff_sec", 0.0))
+                backoff_sec = min(60.0, base_backoff * (2 ** (attempt - 1)))
+                job["retry_after"] = now_epoch + backoff_sec
+                job["retry_after_iso"] = datetime.fromtimestamp(now_epoch + backoff_sec, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 target_mode = job.get("target", "auto")
                 if target_mode == "auto":
@@ -1989,7 +2442,27 @@ class ControllerHandler(BaseHTTPRequestHandler):
                             "score": decision["score"],
                             "reason": f"Retry attempt {attempt+1} scheduled on {decision['selected_node']}"
                         }
-                print(f"[CONTROLLER-RETRY] Job {job_id} failed on node {target_node}. Queued for retry attempt {attempt+1}/{max_attempts}")
+
+                controller_logger.warning(
+                    "worker.failed",
+                    f"Job {job_id} failed on node {target_node} (attempt {attempt}/{max_attempts}): status={job_status}",
+                    correlation_id=corr_id,
+                    job_id=job_id,
+                    node_id=target_node,
+                    attempt=attempt,
+                    status=job_status,
+                    exit_code=body.get("exit_code", 0),
+                    duration_ms=body.get("duration_ms", 0)
+                )
+                controller_logger.info(
+                    "job.recovery_rescheduled",
+                    f"Queued retry attempt {attempt+1}/{max_attempts} for job '{job_id}' on node '{job['target_node']}' (backoff {backoff_sec:.1f}s)",
+                    correlation_id=corr_id,
+                    job_id=job_id,
+                    node_id=job["target_node"],
+                    attempt=attempt+1,
+                    backoff_sec=backoff_sec
+                )
 
             else:
                 # Terminal Success / Final Failure
@@ -1997,11 +2470,39 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 job["state"] = job_status
                 job["finished_at"] = now_iso
                 job["lease_expires_at"] = None
+                if not is_retryable and job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
+                    job["retry_reason"] = f"Non-retryable failure on attempt {attempt}: {body.get('stderr') or job_status}"
                 job["result"] = {
                     "status": job_status,
                     "exit_code": body.get("exit_code", 0),
-                    "stdout": body.get("stdout", ""),
-                    "stderr": body.get("stderr", ""),
+                    "stdout": stdout_bounded,
+                    "stderr": stderr_bounded,
+                    "duration_ms": body.get("duration_ms", 0),
+                }
+                if job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
+                    controller_logger.error(
+                        "job.failed_terminal",
+                        f"Job {job_id} failed permanently on node {target_node} after {attempt} attempt(s): {job.get('retry_reason')}",
+                        correlation_id=corr_id,
+                        job_id=job_id,
+                        node_id=target_node,
+                        status=job_status,
+                        exit_code=body.get("exit_code", 0)
+                    )
+                else:
+                    controller_logger.info(
+                        "job.succeeded",
+                        f"Job {job_id} SUCCEEDED on node {target_node} in {body.get('duration_ms', 0)}ms",
+                        correlation_id=corr_id,
+                        job_id=job_id,
+                        node_id=target_node,
+                        duration_ms=body.get("duration_ms", 0)
+                    )
+                job["result"] = {
+                    "status": job_status,
+                    "exit_code": body.get("exit_code", 0),
+                    "stdout": stdout_bounded,
+                    "stderr": stderr_bounded,
                     "duration_ms": body.get("duration_ms", 0),
                 }
 
@@ -2011,26 +2512,137 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 apps_db = load_apps_db()
                 app = apps_db.get("apps", {}).get(app_id)
                 if app:
-                    if job.get("type") in ("docker-deploy", "docker-build-deploy"):
+                    if job.get("type") == "image-build":
+                        if job_status == JOB_STATE_SUCCEEDED:
+                            meta = body.get("metadata") or {}
+                            img_ref = meta.get("image_ref") or job.get("parameters", {}).get("image_tag")
+                            img_digest = meta.get("digest")
+                            img_arch = meta.get("architecture") or "amd64"
+
+                            app["image"] = img_ref
+                            if img_digest:
+                                app["image_digest"] = img_digest
+                            app["architecture"] = img_arch
+                            app["status"] = APP_STATE_DEPLOYING
+                            app["updated_at"] = now_iso
+
+                            if app.get("deployments"):
+                                last_dep = app["deployments"][-1]
+                                last_dep["image"] = img_ref
+                                last_dep["digest"] = img_digest
+                                last_dep["architecture"] = img_arch
+                                last_dep["status"] = "DEPLOYING"
+
+                            # Stage 5 & 6: Architecture compatibility check and worker scheduling
+                            nodes_db = load_nodes_db()
+                            reqs = {
+                                "any_capabilities": ["container_runtime:docker", "container_runtime:udocker", "container_runtime"],
+                                "supported_architectures": [img_arch]
+                            }
+                            decision = ResourceScheduler.select_node(reqs, nodes_db, self.heartbeat_timeout)
+                            if decision.get("selected_node"):
+                                sel_node = decision["selected_node"]
+                                app["selected_node"] = sel_node
+                                deploy_job_id = f"job-{secrets.token_hex(6)}"
+                                container_env = dict(app.get("env", {}))
+                                for k, v in (app.get("env_vars") or {}).items():
+                                    if isinstance(v, dict):
+                                        container_env[k] = v.get("value", "")
+                                    else:
+                                        container_env[k] = str(v)
+
+                                dep_job_record = {
+                                    "id": deploy_job_id,
+                                    "job_id": deploy_job_id,
+                                    "name": f"deploy-{app['name']}",
+                                    "type": "docker-deploy",
+                                    "parameters": {
+                                        "app_id": app_id,
+                                        "image": img_ref,
+                                        "image_digest": img_digest,
+                                        "architecture": img_arch,
+                                        "container_name": app.get("container_id") or f"ps-{app['name']}",
+                                        "host_port": app["host_port"],
+                                        "container_port": app.get("container_port", 8000),
+                                        "env": container_env,
+                                        "cpu_limit": app.get("cpu_limit", "0.5"),
+                                        "memory_limit": app.get("memory_limit", "256m")
+                                    },
+                                    "requirements": reqs,
+                                    "target": sel_node,
+                                    "target_node": sel_node,
+                                    "assigned_node": sel_node,
+                                    "scheduler": {
+                                        "mode": "resource-aware-docker",
+                                        "selected_node": sel_node,
+                                        "score": decision["score"],
+                                        "reason": decision["reason"]
+                                    },
+                                    "timeout": 120,
+                                    "max_attempts": 2,
+                                    "attempt": 1,
+                                    "claimed_at": None,
+                                    "lease_expires_at": None,
+                                    "created_at": now_iso,
+                                    "started_at": None,
+                                    "finished_at": None,
+                                    "status": JOB_STATE_QUEUED,
+                                    "state": JOB_STATE_QUEUED,
+                                    "retry_reason": None,
+                                    "attempts_history": [],
+                                    "result": None
+                                }
+                                jobs_db.setdefault("jobs", {})[deploy_job_id] = dep_job_record
+                                print(f"[CONTROLLER] Automatically queued deploy job {deploy_job_id} after successful image-build for app '{app['name']}'")
+                            else:
+                                app["status"] = APP_STATE_FAILED
+                                app["failure_reason"] = f"No compatible node available for architecture {img_arch}"
+                                if app.get("deployments"):
+                                    app["deployments"][-1]["status"] = "FAILED"
+                        else:
+                            app["status"] = APP_STATE_FAILED
+                            app["error"] = body.get("stderr") or "Image build failed"
+                            app["failure_reason"] = app["error"]
+                            app["updated_at"] = now_iso
+                            if app.get("deployments"):
+                                app["deployments"][-1]["status"] = "FAILED"
+
+                    elif job.get("type") in ("docker-deploy", "docker-build-deploy"):
                         if job_status == JOB_STATE_SUCCEEDED:
                             app["status"] = APP_STATE_RUNNING
                             app["error"] = None
                             app["updated_at"] = now_iso
+                            if app.get("deployments"):
+                                last_dep = app["deployments"][-1]
+                                last_dep["status"] = "SUCCESS"
+                                last_dep["finished_at"] = now_iso
+                                last_dep["duration_ms"] = body.get("duration_ms", 0)
+                                last_dep["container_id"] = job.get("parameters", {}).get("container_name") or f"ps-{app['name']}"
+                                if job.get("parameters", {}).get("architecture"):
+                                    last_dep["architecture"] = job["parameters"]["architecture"]
+                                if job.get("parameters", {}).get("image_digest"):
+                                    last_dep["digest"] = job["parameters"]["image_digest"]
+                                app["active_deployment_id"] = last_dep.get("deployment_id")
                         elif job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
                             app["status"] = APP_STATE_FAILED
                             app["error"] = body.get("stderr") or f"Deployment job {job_status}"
                             app["failure_reason"] = app["error"]
                             app["updated_at"] = now_iso
+                            if app.get("deployments"):
+                                last_dep = app["deployments"][-1]
+                                last_dep["status"] = "FAILED"
+                                last_dep["finished_at"] = now_iso
+                                last_dep["duration_ms"] = body.get("duration_ms", 0)
 
-                        # Update deployment record if present
-                        if app.get("deployments"):
-                            last_dep = app["deployments"][-1]
-                            last_dep["status"] = "SUCCESS" if job_status == JOB_STATE_SUCCEEDED else "FAILED"
-                            last_dep["finished_at"] = now_iso
-                            last_dep["duration_ms"] = body.get("duration_ms", 0)
-                            if body.get("timings"):
-                                last_dep.setdefault("stage_timings", {}).update(body["timings"])
-                                last_dep["stage_timings"]["total_ms"] = body.get("duration_ms", 0) + last_dep["stage_timings"].get("scheduling_ms", 0)
+                            # Find previous working deployment for rollback preservation
+                            successful_deps = [
+                                d for d in app.get("deployments", [])
+                                if d.get("status") == "SUCCESS" and d.get("deployment_id") != (last_dep.get("deployment_id") if app.get("deployments") else None)
+                            ]
+                            if successful_deps:
+                                prev_working = successful_deps[-1]
+                                app["previous_working_deployment"] = prev_working["deployment_id"]
+                                print(f"[CONTROLLER-ROLLBACK] Preserving previous working deployment '{prev_working['deployment_id']}' for app '{app_id}'")
 
                     elif job.get("type") == "docker-stop" and job_status == JOB_STATE_SUCCEEDED:
                         app["status"] = APP_STATE_STOPPED
@@ -2047,6 +2659,93 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "ack": True,
                 "job_id": job_id,
                 "job_status": job["status"]
+            })
+            return
+
+        # ----------------------------------------------------------------------
+        # 5. Cancel Job: POST /jobs/<job_id>/cancel
+        # ----------------------------------------------------------------------
+        if path.startswith("/jobs/") and path.endswith("/cancel"):
+            job_id = path[6:-7].strip()
+            enrollment_token = get_or_create_enrollment_token()
+            if not self.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                self.send_json(401, {"error": "Unauthorized: Authentication required to cancel job"})
+                return
+
+            jobs_db = load_jobs_db()
+            job = jobs_db.get("jobs", {}).get(job_id)
+            if not job:
+                self.send_json(404, {"error": f"Job '{job_id}' not found"})
+                return
+
+            current_st = job.get("status")
+            if current_st in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED, JOB_STATE_REJECTED) or not validate_job_transition(current_st, JOB_STATE_CANCELLED):
+                self.send_json(400, {
+                    "error": f"Invalid state transition: Cannot cancel job '{job_id}' in terminal state '{current_st}'.",
+                    "status": current_st
+                })
+                return
+
+            now_iso = get_current_iso_timestamp()
+            job["status"] = JOB_STATE_CANCELLED
+            job["state"] = JOB_STATE_CANCELLED
+            job["cancelled_at"] = now_iso
+            job["finished_at"] = now_iso
+            job["lease_expires_at"] = None
+            reason = (body.get("reason") if body else "") or "Cancelled by client request"
+            job["cancel_reason"] = reason
+            save_jobs_db(jobs_db)
+
+            print(f"[CONTROLLER] Job {job_id} CANCELLED: {reason}")
+            self.send_json(200, {
+                "status": JOB_STATE_CANCELLED,
+                "job_id": job_id,
+                "message": f"Job '{job_id}' successfully cancelled.",
+                "job": job
+            })
+            return
+
+        # ----------------------------------------------------------------------
+        # 6. Update Job Status: POST /jobs/<job_id>/status (e.g. CLAIMED -> RUNNING)
+        # ----------------------------------------------------------------------
+        if path.startswith("/jobs/") and path.endswith("/status"):
+            job_id = path[6:-7].strip()
+            jobs_db = load_jobs_db()
+            job = jobs_db.get("jobs", {}).get(job_id)
+            if not job:
+                self.send_json(404, {"error": f"Job '{job_id}' not found"})
+                return
+
+            target_node = job.get("target_node")
+            nodes_db = load_nodes_db()
+            node_entry = nodes_db.get("nodes", {}).get(target_node, {})
+            expected_auth = node_entry.get("auth_token")
+            enrollment_token = get_or_create_enrollment_token()
+            if not token or (not constant_time_compare(token, expected_auth) and not constant_time_compare(token, enrollment_token)):
+                self.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
+                return
+
+            new_status = (body.get("status") or "").upper()
+            current_st = job.get("status")
+            if not validate_job_transition(current_st, new_status):
+                self.send_json(400, {
+                    "error": f"Invalid state transition from '{current_st}' to '{new_status}'.",
+                    "current_status": current_st,
+                    "target_status": new_status
+                })
+                return
+
+            now_iso = get_current_iso_timestamp()
+            job["status"] = new_status
+            job["state"] = new_status
+            if new_status == JOB_STATE_RUNNING and not job.get("started_at"):
+                job["started_at"] = now_iso
+            save_jobs_db(jobs_db)
+
+            self.send_json(200, {
+                "status": "ok",
+                "job_id": job_id,
+                "current_status": new_status
             })
             return
 
@@ -2501,20 +3200,14 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     job_record = {
                         "id": job_id,
                         "job_id": job_id,
-                        "name": f"build-deploy-{app['name']}",
-                        "type": "docker-build-deploy",
+                        "name": f"build-{app['name']}",
+                        "type": "image-build",
                         "parameters": {
                             "app_id": app_id,
                             "app_name": app["name"],
                             "source_dir": str(src_context),
                             "dockerfile": dockerfile_name,
-                            "image_tag": f"personalserver/{app['name']}:v{dep_num}",
-                            "container_name": app.get("container_id") or f"ps-{app['name']}",
-                            "host_port": app["host_port"],
-                            "container_port": app.get("container_port", 8000),
-                            "env": container_env,
-                            "cpu_limit": app.get("cpu_limit", "0.5"),
-                            "memory_limit": app.get("memory_limit", "256m")
+                            "image_tag": f"personalserver/{app['name']}:v{dep_num}"
                         },
                         "requirements": reqs,
                         "target": selected_node,
@@ -2542,6 +3235,14 @@ class ControllerHandler(BaseHTTPRequestHandler):
                     }
                 else:
                     # Direct image deployment
+                    parsed_img = validate_image_reference(app["image"])
+                    img_ref = parsed_img["raw"].split("@")[0]
+                    img_digest = parsed_img.get("digest")
+                    dep_record["image"] = img_ref
+                    if img_digest:
+                        dep_record["digest"] = img_digest
+                    dep_record["architecture"] = app.get("architecture") or "amd64"
+
                     job_record = {
                         "id": job_id,
                         "job_id": job_id,
@@ -2549,7 +3250,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
                         "type": "docker-deploy",
                         "parameters": {
                             "app_id": app_id,
-                            "image": app["image"],
+                            "image": img_ref,
+                            "image_digest": img_digest,
+                            "architecture": app.get("architecture"),
                             "container_name": app.get("container_id") or f"ps-{app['name']}",
                             "host_port": app["host_port"],
                             "container_port": app.get("container_port", 8000),
@@ -2685,6 +3388,167 @@ class ControllerHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "RUNNING", "app": app, "job_id": job_id})
             return
 
+        # ----------------------------------------------------------------------
+        # Application Rollback: POST /apps/<app_id>/rollback
+        # ----------------------------------------------------------------------
+        if path.startswith("/apps/") and path.endswith("/rollback"):
+            app_id = path[6:-9].strip()
+            with APPS_LOCK:
+                apps_db = load_apps_db()
+                app = apps_db.get("apps", {}).get(app_id)
+                if not app or app.get("status") == "DELETED":
+                    self.send_json(404, {"error": f"Application '{app_id}' not found"})
+                    return
+
+                deployments = app.get("deployments", [])
+                target_dep_id = (body.get("deployment_id") or body.get("target_deployment_id") if body else None)
+                target_dep = None
+
+                if target_dep_id:
+                    for d in deployments:
+                        if d.get("deployment_id") == target_dep_id:
+                            target_dep = d
+                            break
+                    if not target_dep:
+                        self.send_json(404, {"error": f"Specified deployment '{target_dep_id}' not found for application '{app_id}'"})
+                        return
+                else:
+                    # Find most recent successful deployment prior to active/failed deployment
+                    current_dep_id = app.get("active_deployment_id")
+                    candidate_deps = [
+                        d for d in deployments
+                        if d.get("status") == "SUCCESS" and d.get("deployment_id") != current_dep_id
+                    ]
+                    if not candidate_deps:
+                        # Fallback: any successful deployment
+                        candidate_deps = [d for d in deployments if d.get("status") == "SUCCESS"]
+
+                    if not candidate_deps:
+                        self.send_json(400, {
+                            "error": "No previous successful deployment found to roll back to.",
+                            "app_id": app_id,
+                            "deployments_count": len(deployments)
+                        })
+                        return
+                    target_dep = candidate_deps[-1]
+
+                now_iso = get_current_iso_timestamp()
+                rollback_img = target_dep.get("image") or app.get("image")
+                rollback_digest = target_dep.get("digest") or app.get("image_digest")
+                rollback_arch = target_dep.get("architecture") or app.get("architecture") or "amd64"
+
+                # Schedule onto container-capable node matching architecture
+                nodes_db = load_nodes_db()
+                reqs = {
+                    "any_capabilities": ["container_runtime:docker", "container_runtime:udocker", "container_runtime"],
+                    "supported_architectures": [rollback_arch] if rollback_arch else ["amd64", "arm64"]
+                }
+                decision = ResourceScheduler.select_node(reqs, nodes_db, self.heartbeat_timeout)
+                if not decision.get("selected_node"):
+                    reason = f"No container-capable node available for rollback: {decision.get('reason', '')}".strip()
+                    self.send_json(400, {
+                        "error": reason,
+                        "status": APP_STATE_FAILED,
+                        "app": mask_app_record(app)
+                    })
+                    return
+
+                selected_node = decision["selected_node"]
+                dep_num = len(deployments) + 1
+                dep_id = f"dep-{secrets.token_hex(4)}"
+
+                rollback_record = {
+                    "deployment_id": dep_id,
+                    "number": dep_num,
+                    "commit": target_dep.get("commit", "rollback"),
+                    "branch": target_dep.get("branch", "rollback"),
+                    "trigger": "rollback",
+                    "status": "DEPLOYING",
+                    "rollback_target": target_dep.get("deployment_id"),
+                    "image": rollback_img,
+                    "digest": rollback_digest,
+                    "architecture": rollback_arch,
+                    "started_at": now_iso,
+                    "finished_at": None,
+                    "duration_ms": None,
+                    "stage_timings": {
+                        "scheduling_ms": 0,
+                        "pull_image_ms": 0,
+                        "start_container_ms": 0,
+                        "health_check_ms": 0,
+                        "total_ms": 0
+                    }
+                }
+                app.setdefault("deployments", []).append(rollback_record)
+                app["status"] = APP_STATE_DEPLOYING
+                app["selected_node"] = selected_node
+                app["updated_at"] = now_iso
+                app["error"] = None
+                app["image"] = rollback_img
+                if rollback_digest:
+                    app["image_digest"] = rollback_digest
+                app["architecture"] = rollback_arch
+                save_apps_db(apps_db)
+
+                # Prepare environment variables
+                container_env = dict(app.get("env", {}))
+                for k, v in (app.get("env_vars") or {}).items():
+                    if isinstance(v, dict):
+                        container_env[k] = v.get("value", "")
+                    else:
+                        container_env[k] = str(v)
+
+                job_id = f"job-{secrets.token_hex(6)}"
+                job_record = {
+                    "id": job_id,
+                    "job_id": job_id,
+                    "name": f"rollback-{app['name']}",
+                    "type": "docker-deploy",
+                    "parameters": {
+                        "app_id": app_id,
+                        "image": rollback_img,
+                        "image_digest": rollback_digest,
+                        "architecture": rollback_arch,
+                        "container_name": app.get("container_id") or f"ps-{app['name']}",
+                        "host_port": app["host_port"],
+                        "container_port": app.get("container_port", 8000),
+                        "env": container_env,
+                        "cpu_limit": app.get("cpu_limit", "0.5"),
+                        "memory_limit": app.get("memory_limit", "256m")
+                    },
+                    "requirements": reqs,
+                    "target": selected_node,
+                    "target_node": selected_node,
+                    "assigned_node": selected_node,
+                    "scheduler": {
+                        "mode": "resource-aware-docker",
+                        "selected_node": selected_node,
+                        "score": decision["score"],
+                        "reason": f"Rollback to deployment {target_dep.get('deployment_id')}"
+                    },
+                    "timeout": 120,
+                    "max_attempts": 2,
+                    "attempt": 1,
+                    "claimed_at": None,
+                    "lease_expires_at": None,
+                    "created_at": now_iso,
+                    "status": JOB_STATE_QUEUED,
+                    "state": JOB_STATE_QUEUED
+                }
+
+                jobs_db = load_jobs_db()
+                jobs_db.setdefault("jobs", {})[job_id] = job_record
+                save_jobs_db(jobs_db)
+
+            print(f"[CONTROLLER] Queued rollback deployment {dep_id} for app '{app['name']}' restoring deployment {target_dep.get('deployment_id')}")
+            self.send_json(200, {
+                "status": APP_STATE_DEPLOYING,
+                "app": mask_app_record(app),
+                "job_id": job_id,
+                "rollback_target": target_dep.get("deployment_id")
+            })
+            return
+
         # POST /apps/<app_id>/files/mkdir
         if path.startswith("/apps/") and path.endswith("/files/mkdir"):
             if not self.is_authenticated_admin_or_node():
@@ -2810,7 +3674,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path.startswith("/jobs/") and path.endswith("/cancel"):
             job_id = path[6:-7].strip()
             enrollment_token = get_or_create_enrollment_token()
-            if token and token != enrollment_token:
+            if token and not constant_time_compare(token, enrollment_token):
                 pass
 
             jobs_db = load_jobs_db()
@@ -2846,7 +3710,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path.startswith("/nodes/") and path.endswith("/drain"):
             node_id = path[7:-6].strip()
             enrollment_token = get_or_create_enrollment_token()
-            if token != enrollment_token:
+            if not constant_time_compare(token, enrollment_token):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to drain a node"})
                 return
 
@@ -2903,7 +3767,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path.startswith("/nodes/") and path.endswith("/deboard"):
             node_id = path[7:-8].strip()
             enrollment_token = get_or_create_enrollment_token()
-            if token != enrollment_token:
+            if not constant_time_compare(token, enrollment_token):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to deboard a node"})
                 return
 
@@ -2940,7 +3804,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path.startswith("/nodes/") and path.endswith("/resume"):
             node_id = path[7:-7].strip()
             enrollment_token = get_or_create_enrollment_token()
-            if token != enrollment_token:
+            if not constant_time_compare(token, enrollment_token):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to resume a node"})
                 return
 
@@ -2971,7 +3835,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path.startswith("/nodes/") and path.endswith("/remove"):
             node_id = path[7:-7].strip()
             enrollment_token = get_or_create_enrollment_token()
-            if token != enrollment_token:
+            if not constant_time_compare(token, enrollment_token):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required to remove a node"})
                 return
 
@@ -3015,6 +3879,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "Endpoint not found"})
 
     def do_DELETE(self):
+        self.current_correlation_id = extract_correlation_id(self.headers)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         token = self.parse_auth_token()
@@ -3139,7 +4004,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
         if path.startswith("/nodes/"):
             node_id = path[7:].strip()
             enrollment_token = get_or_create_enrollment_token()
-            if token != enrollment_token:
+            if not constant_time_compare(token, enrollment_token):
                 self.send_json(401, {"error": "Unauthorized: Admin enrollment token required"})
                 return
 
@@ -3189,7 +4054,14 @@ class ControllerHandler(BaseHTTPRequestHandler):
 # CLI Actions
 # ------------------------------------------------------------------------------
 
-def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT_TIMEOUT):
+def start_server(host=None, port=None, timeout=None):
+    paths = get_controller_paths()
+    paths.validate()
+    cfg = get_controller_runtime_config()
+    host = host if host is not None else cfg.host
+    port = port if port is not None else cfg.port
+    timeout = timeout if timeout is not None else cfg.heartbeat_timeout
+
     ensure_directories()
     token = get_or_create_enrollment_token()
     ControllerHandler.heartbeat_timeout = timeout
@@ -3202,11 +4074,20 @@ def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT
     # Start background lease sweeper thread
     start_background_lease_sweeper(timeout)
 
+    # Initialize High Availability (HA) Manager
+    ha_role = os.environ.get("PERSONALSERVER_HA_ROLE", "auto")
+    ha_node_id = os.environ.get("PERSONALSERVER_NODE_ID", socket.gethostname() or "node-master")
+    ha_node_url = f"http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}"
+    ha_mgr = get_ha_manager(paths=paths, role=ha_role, node_id=ha_node_id, node_url=ha_node_url)
+    ha_mgr.initialize()
+    ha_mgr.start_monitor()
+
     print("==========================================")
     print(" PersonalServer Cluster Controller & Scheduler (v1.0)")
     print("==========================================")
     print(f"Controller listening on http://{host}:{port}")
     print(f"Heartbeat timeout:     {timeout} seconds")
+    print(f"HA Failover Role:      {ha_mgr.state.upper()} (Term {ha_mgr.current_term})")
     print(f"Enrollment token file: {ENROLLMENT_TOKEN_FILE}")
     print(f"Cluster database:      {NODES_FILE}")
     print(f"Jobs database:         {JOBS_FILE}")
@@ -3217,6 +4098,8 @@ def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=DEFAULT_HEARTBEAT
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nController shutting down...")
+    finally:
+        ha_mgr.stop_monitor()
         server.server_close()
 
 

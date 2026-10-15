@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 
 # ==============================================================================
 # PersonalServer - Node & Service Health Report
@@ -67,7 +67,7 @@ else
 fi
 
 # Check Cloudflare
-cf_pid=$(pgrep -f "cloudflared tunnel run" | head -n 1)
+cf_pid=$(pgrep -f "cloudflared tunnel" | head -n 1)
 if [ -n "$cf_pid" ]; then
     echo "Cloudflare: ONLINE (PID: $cf_pid, Tunnel: Active)"
 else

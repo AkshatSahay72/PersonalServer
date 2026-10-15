@@ -37,7 +37,18 @@ class TestPhase11DDockerRuntime(unittest.TestCase):
         cls.token = cls.token_file.read_text().strip() if cls.token_file.exists() else ""
         cls.controller_url = "http://127.0.0.1:8000"
 
+    @classmethod
+    def _is_controller_running(cls):
+        try:
+            req = urllib.request.Request(f"{cls.controller_url}/health", headers={"User-Agent": "HealthCheck"})
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
     def _api_request(self, path, method="GET", data=None):
+        if not self._is_controller_running():
+            raise unittest.SkipTest(f"PersonalServer controller not running at {self.controller_url}. Skipping live cluster test.")
         url = f"{self.controller_url}{path}"
         body = json.dumps(data).encode("utf-8") if data is not None else None
         headers = {
@@ -83,24 +94,45 @@ class TestPhase11DDockerRuntime(unittest.TestCase):
 
     def test_03_scheduler_capability_filtering(self):
         """Verify scheduler filters out non-docker nodes when container_runtime:docker is required."""
-        nodes_db = load_nodes_db()
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        test_cluster = {
+            "nodes": {
+                "server-f8b1485ecf458f74": {
+                    "node_id": "server-f8b1485ecf458f74",
+                    "name": "worker-docker-01",
+                    "status": "ONLINE",
+                    "last_seen": now_iso,
+                    "capabilities": {"compute": True, "storage": True, "container_runtime:docker": True},
+                    "resources": {"cpu_cores": 4, "ram_mb": 4096, "storage_gb": 32}
+                },
+                "server-5387a86bf36116b1": {
+                    "node_id": "server-5387a86bf36116b1",
+                    "name": "vivo-y31",
+                    "status": "ONLINE",
+                    "last_seen": now_iso,
+                    "capabilities": {"compute": True, "storage": True},
+                    "resources": {"cpu_cores": 8, "ram_mb": 5697, "storage_gb": 106}
+                }
+            }
+        }
         reqs = {
             "capabilities": ["container_runtime:docker"],
             "min_cpu_cores": 1,
             "min_ram_mb": 128
         }
-        decision = ResourceScheduler.select_node(reqs, nodes_db, timeout_seconds=60)
+        decision = ResourceScheduler.select_node(reqs, test_cluster, timeout_seconds=60)
         self.assertIsNotNone(decision.get("selected_node"))
         selected_node_id = decision["selected_node"]
-        
+        self.assertEqual(selected_node_id, "server-f8b1485ecf458f74")
+
         # Verify selected node has docker capability
-        node_record = nodes_db["nodes"][selected_node_id]
+        node_record = test_cluster["nodes"][selected_node_id]
         self.assertTrue(node_record.get("capabilities", {}).get("container_runtime:docker"))
 
         # Verify non-docker nodes are in rejected dict with missing capability reason
-        for nid, reason in decision.get("rejected", {}).items():
-            if nid in ["server-5387a86bf36116b1", "server-95bad5ff01424d4c8d184330d6d2e394"]:
-                self.assertIn("container_runtime:docker", reason)
+        self.assertIn("server-5387a86bf36116b1", decision.get("rejected", {}))
+        self.assertIn("container_runtime:docker", decision.get("rejected", {}).get("server-5387a86bf36116b1", ""))
 
     def test_04_docker_security_restrictions(self):
         """Verify job executor rejects volume mounts and unsafe parameters."""

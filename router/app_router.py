@@ -32,10 +32,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
-from config.platform_config import get_platform_config
-CONTROLLER_DATA_DIR = BASE_DIR / "controller" / "data"
-APPS_FILE = CONTROLLER_DATA_DIR / "apps.json"
-NODES_FILE = CONTROLLER_DATA_DIR / "nodes.json"
+from config.platform_config import get_platform_config, get_controller_paths
+PATHS = get_controller_paths()
+CONTROLLER_DATA_DIR = PATHS.data_dir
+APPS_FILE = PATHS.apps_file
+NODES_FILE = PATHS.nodes_file
+RUNTIME_DIR = PATHS.runtime_dir
 
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8088
@@ -212,12 +214,6 @@ class ApplicationRouter:
         target_host = "127.0.0.1"
         if selected_node != local_node_id:
             node_ip = node_record.get("ip") or node_record.get("tailscale_ip") or node_record.get("host")
-            if not node_ip:
-                # Tailscale fallback mapping for registered cluster nodes
-                if selected_node == "server-f8b1485ecf458f74":
-                    node_ip = "100.120.251.42"
-                elif selected_node == "server-95bad5ff01424d4c8d184330d6d2e394":
-                    node_ip = "100.73.52.72"
             if node_ip and node_ip not in ("127.0.0.1", "localhost", "0.0.0.0"):
                 target_host = node_ip
 

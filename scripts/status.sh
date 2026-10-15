@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 
 # ==============================================================================
 # PersonalServer - Service Status Script
@@ -37,7 +37,11 @@ except Exception:
 elif [ -f "$NODE_CONF" ]; then
     echo "  ID: $(grep '^NODE_ID=' "$NODE_CONF" | cut -d= -f2)"
     echo "  Name: $(grep '^NODE_NAME=' "$NODE_CONF" | cut -d= -f2)"
-    echo "  Platform: termux"
+    if [ -d "/data/data/com.termux" ]; then
+        echo "  Platform: termux"
+    else
+        echo "  Platform: $(uname -s)"
+    fi
     echo "  Architecture: $(uname -m)"
 else
     echo "  ID: unknown"
@@ -108,7 +112,7 @@ if [ -n "$cf_pid" ] && kill -0 "$cf_pid" 2>/dev/null && ps -p "$cf_pid" -o args=
     echo "  Process: running"
     echo "  PID: $cf_pid"
 else
-    detected_cf_pid=$(pgrep -f "cloudflared tunnel run" | head -n 1)
+    detected_cf_pid=$(pgrep -f "cloudflared tunnel" | head -n 1)
     if [ -n "$detected_cf_pid" ]; then
         echo "  Process: running (untracked PID)"
         echo "  PID: $detected_cf_pid"

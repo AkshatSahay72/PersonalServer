@@ -263,13 +263,26 @@ def extract_node_telemetry(node, status=None, node_jobs=None):
 
     capabilities_info = node.get("capabilities", {}) or {}
 
+    battery_info = hb_system.get("battery") or last_hb.get("battery") or {}
+    network_info = hb_system.get("network") or last_hb.get("network") or {}
+    thermals_info = hb_system.get("thermals") or last_hb.get("thermals") or {}
+    cpu_details_info = hb_system.get("cpu_details") or last_hb.get("cpu_details") or {}
+
+    if "temperature_c" in thermals_info and thermals_info["temperature_c"] is not None:
+        cpu_info["temperature_c"] = thermals_info["temperature_c"]
+        cpu_info["thermal_status"] = thermals_info.get("status", "Normal")
+
     return {
         "status": liveness,
         "cpu": cpu_info,
         "memory": memory_info,
         "storage": storage_info,
         "workloads": workloads_info,
-        "capabilities": capabilities_info
+        "capabilities": capabilities_info,
+        "battery": battery_info,
+        "network": network_info,
+        "thermals": thermals_info,
+        "cpu_details": cpu_details_info
     }
 
 

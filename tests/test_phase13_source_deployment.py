@@ -92,7 +92,18 @@ class TestPhase13SourceDeployment(unittest.TestCase):
         if cls.test_fixtures_dir.exists():
             shutil.rmtree(cls.test_fixtures_dir, ignore_errors=True)
 
+    @classmethod
+    def _is_controller_running(cls):
+        try:
+            req = urllib.request.Request(f"{cls.controller_url}/health", headers={"User-Agent": "HealthCheck"})
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
     def _api_request(self, path, method="GET", data=None):
+        if not self._is_controller_running():
+            raise unittest.SkipTest(f"PersonalServer controller not running at {self.controller_url}. Skipping live cluster test.")
         url = f"{self.controller_url}{path}"
         body = json.dumps(data).encode("utf-8") if data is not None else None
         headers = {

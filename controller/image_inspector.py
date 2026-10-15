@@ -8,8 +8,10 @@ compatibility, inspects exposed application ports, and manages caching.
 
 import re
 import json
+import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 # Standard architecture aliases mapped to canonical identifiers
@@ -41,6 +43,8 @@ IMAGE_REF_REGEX = re.compile(
     re.IGNORECASE
 )
 
+LOCAL_IMAGE_STORE_DIR = Path(__file__).resolve().parent.parent / "storage" / "images"
+
 
 def normalize_architecture(arch: Optional[str]) -> str:
     """Normalizes arbitrary architecture strings (e.g. 'aarch64', 'linux/arm64') to canonical form."""
@@ -50,16 +54,19 @@ def normalize_architecture(arch: Optional[str]) -> str:
     return ARCH_MAP.get(clean, clean.split("/")[-1])
 
 
-def validate_image_reference(image_str: str) -> Dict[str, str]:
+def validate_image_reference(image_str: str) -> Dict[str, Any]:
     """
-    Validates container image reference syntax.
+    Validates container image reference syntax, supporting tags and immutable sha256 digests.
     Returns parsed dictionary:
     {
-      "raw": "username/app:tag",
+      "raw": "username/app:tag[@sha256:...]",
       "registry": "docker.io" or custom,
       "repository": "username/app",
       "image_name": "app",
-      "tag": "tag" (defaults to "latest")
+      "tag": "tag" (defaults to "latest"),
+      "digest": "sha256:..." or None,
+      "immutable": bool,
+      "canonical_ref": "..."
     }
     Raises ValueError on invalid or malicious image references.
     """
@@ -77,23 +84,32 @@ def validate_image_reference(image_str: str) -> Dict[str, str]:
     if cleaned.startswith("-"):
         raise ValueError("Image reference cannot start with a hyphen.")
 
-    if not IMAGE_REF_REGEX.match(cleaned):
-        raise ValueError(f"Invalid container image format: '{cleaned}'. Expected format: [user/]repository[:tag]")
+    digest_part = None
+    if "@" in cleaned:
+        base_part, digest_part = cleaned.rsplit("@", 1)
+        if not re.match(r'^sha256:[a-fA-F0-9]{64}$', digest_part):
+            raise ValueError(f"Invalid image digest format: '{digest_part}'. Expected sha256:<64-hex-digits>")
+        ref_to_validate = base_part
+    else:
+        ref_to_validate = cleaned
+
+    if not IMAGE_REF_REGEX.match(ref_to_validate):
+        raise ValueError(f"Invalid container image format: '{cleaned}'. Expected format: [user/]repository[:tag][@sha256:digest]")
 
     # Extract tag (only from the final segment after the last '/')
-    if "/" in cleaned:
-        path_prefix, last_segment = cleaned.rsplit("/", 1)
+    if "/" in ref_to_validate:
+        path_prefix, last_segment = ref_to_validate.rsplit("/", 1)
         if ":" in last_segment:
             repo_tail, tag_part = last_segment.rsplit(":", 1)
             repo_part = f"{path_prefix}/{repo_tail}"
         else:
-            repo_part = cleaned
+            repo_part = ref_to_validate
             tag_part = "latest"
     else:
-        if ":" in cleaned:
-            repo_part, tag_part = cleaned.rsplit(":", 1)
+        if ":" in ref_to_validate:
+            repo_part, tag_part = ref_to_validate.rsplit(":", 1)
         else:
-            repo_part = cleaned
+            repo_part = ref_to_validate
             tag_part = "latest"
 
     # Extract registry and repository
@@ -111,28 +127,86 @@ def validate_image_reference(image_str: str) -> Dict[str, str]:
         repo = "/".join(segments[1:])
         image_name = segments[-1]
 
+    raw_val = f"{repo_part}:{tag_part}@{digest_part}" if digest_part else f"{repo_part}:{tag_part}"
+    canon_ref = f"{registry}/{repo}:{tag_part}@{digest_part}" if digest_part else f"{registry}/{repo}:{tag_part}"
+
     return {
-        "raw": f"{repo_part}:{tag_part}",
+        "raw": raw_val,
         "registry": registry,
         "repository": repo,
         "image_name": image_name,
-        "tag": tag_part
+        "tag": tag_part,
+        "digest": digest_part,
+        "immutable": bool(digest_part),
+        "canonical_ref": canon_ref
     }
 
 
-def is_architecture_compatible(node_arch: str, supported_architectures: List[str]) -> bool:
+def save_local_image_metadata(
+    image_ref: str,
+    digest: str,
+    architecture: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    store_dir: Optional[Path] = None
+) -> Dict[str, Any]:
+    """
+    Persists immutable image metadata into local image store.
+    Enables offline tracking, version pinning, and reproducible local builds.
+    """
+    store = (store_dir or LOCAL_IMAGE_STORE_DIR).resolve()
+    store.mkdir(parents=True, exist_ok=True)
+
+    parsed = validate_image_reference(image_ref)
+    clean_key = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{parsed['repository']}_{parsed['tag']}")
+    meta_path = store / f"{clean_key}.json"
+
+    record = {
+        "image_ref": image_ref,
+        "repository": parsed["repository"],
+        "tag": parsed["tag"],
+        "digest": digest,
+        "architecture": normalize_architecture(architecture),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "metadata": metadata or {}
+    }
+    meta_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def get_local_image_metadata(
+    image_ref: str,
+    store_dir: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
+    """Retrieves cached metadata from the local image store if available."""
+    try:
+        parsed = validate_image_reference(image_ref)
+        store = (store_dir or LOCAL_IMAGE_STORE_DIR).resolve()
+        clean_key = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"{parsed['repository']}_{parsed['tag']}")
+        meta_path = store / f"{clean_key}.json"
+        if meta_path.exists() and meta_path.is_file():
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return None
+
+
+def is_architecture_compatible(node_arch: str, supported_architectures: Any) -> bool:
     """Checks whether a node's architecture is satisfied by the image's supported architectures."""
     if not supported_architectures:
         return True  # If unknown, allow scheduling and let node verify
+
+    if isinstance(supported_architectures, str):
+        supported_architectures = [supported_architectures]
 
     norm_node = normalize_architecture(node_arch)
     norm_supported = {normalize_architecture(a) for a in supported_architectures if a}
     return norm_node in norm_supported
 
 
-def detect_image_architectures(image_ref: str, timeout: int = 5) -> List[str]:
+def detect_image_architectures(image_ref: str, timeout: int = 5, store_dir: Optional[Path] = None) -> List[str]:
     """
-    Discovers supported architectures for a public container image via Docker Hub API.
+    Discovers supported architectures for an image reference.
+    Checks local image store first, then queries public Docker Hub if online.
     Returns list of normalized architectures (e.g. ['amd64', 'arm64']).
     Falls back to universal ['amd64', 'arm64'] if unreachable or offline.
     """
@@ -141,7 +215,12 @@ def detect_image_architectures(image_ref: str, timeout: int = 5) -> List[str]:
     except ValueError:
         return []
 
-    # If Docker Hub registry
+    # 1. Check local image store
+    local_meta = get_local_image_metadata(image_ref, store_dir)
+    if local_meta and local_meta.get("architecture"):
+        return [local_meta["architecture"]]
+
+    # 2. If Docker Hub registry
     if parsed["registry"] == "docker.io":
         repo = parsed["repository"]
         tag = parsed["tag"]

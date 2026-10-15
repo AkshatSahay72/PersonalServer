@@ -1,0 +1,68 @@
+[project]
+name = "personalserver"
+version = "1.5.0"
+description = "Lightweight, self-hosted personal server for heterogeneous edge devices"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "PersonalServer Authors" }
+]
+# Core runtime is dependency-free using the Python standard library.
+# PyYAML is optional for enhanced YAML parsing (built-in fallback parser included).
+dependencies = []
+
+[project.optional-dependencies]
+yaml = [
+    "pyyaml>=6.0.1,<7.0.0"
+]
+dev = [
+    "pytest>=8.0.0,<10.0.0",
+    "ruff>=0.8.0,<1.0.0",
+    "pyyaml>=6.0.1,<7.0.0"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    "scratch",
+    "runtime",
+    "storage",
+    "install",
+    "data",
+    "controller/data",
+    ".venv",
+    "backups",
+    "node_modules"
+]
+markers = [
+    "unit: Fast, isolated unit tests with zero external dependencies, sockets, or background threads",
+    "integration: Subsystem and protocol integration tests (HTTP, lifecycle, worker simulation)",
+    "slow: Tests with extensive timeouts or multi-node stress simulation"
+]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+exclude = [
+    "scratch",
+    "runtime",
+    "storage",
+    "install",
+    "data",
+    "controller/data",
+    ".venv",
+    "backups",
+    "node_modules"
+]
+
+[tool.ruff.lint]
+select = ["F", "E", "W"]
+ignore = [
+    "E501",  # Line too long (handled gracefully by developer formatting)
+    "E722",  # Bare except (legacy compatibility in certain handlers)
+    "E402",  # Module level import not at top (needed for sys.path setups)
+    "F403",  # Star imports (used in test fixtures/legacy modules)
+    "F405"   # Name may be undefined, or defined from star imports
+]

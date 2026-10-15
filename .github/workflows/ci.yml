@@ -1,0 +1,52 @@
+name: PersonalServer CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} - Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Setup safe sample configuration
+        run: |
+          python -c "import shutil, os; shutil.copy('.env.example', '.env'); os.makedirs('config/secrets', exist_ok=True); shutil.copy('config/secrets/enrollment.token.example', 'config/secrets/enrollment.token')"
+
+      - name: Static code quality and lint checks
+        run: python scripts/run_tests.py --lint
+
+      - name: Run isolated unit tests
+        run: python scripts/run_tests.py --unit -v
+
+      - name: Run simulated multi-node & protocol integration tests
+        run: python scripts/run_tests.py --integration
+
+      - name: Verify backup & restore pipeline
+        run: |
+          python scripts/backup_restore.py backup --output backups/ci_backup.tar.gz
+          python scripts/backup_restore.py verify backups/ci_backup.tar.gz
+          python scripts/backup_restore.py restore backups/ci_backup.tar.gz --dry-run
