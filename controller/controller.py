@@ -122,6 +122,7 @@ def get_ha_manager(paths=None, role="auto", node_id=None, node_url=None, force_r
             role=role,
             paths=curr_paths
         )
+        HA_MANAGER.initialize()
     return HA_MANAGER
 def constant_time_compare(val1, val2) -> bool:
     """
@@ -1349,6 +1350,9 @@ def start_background_lease_sweeper(timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
         while True:
             try:
                 time.sleep(3)
+                mgr = get_ha_manager()
+                if mgr and (not mgr.is_leader or not mgr.current_lease.is_valid()):
+                    continue  # Standby and fenced controllers do not sweep or reschedule leases
                 jobs_db = load_jobs_db()
                 nodes_db = load_nodes_db()
                 sweep_expired_leases(jobs_db, nodes_db, timeout_seconds)
@@ -1407,6 +1411,59 @@ class ControllerHandler(BaseHTTPRequestHandler):
             if node.get("auth_token") and constant_time_compare(node.get("auth_token"), token):
                 return True
         return False
+
+    def check_leader_write_permission(self) -> bool:
+        """
+        Guards cluster mutating routes (POST, PUT, DELETE).
+        Rejects mutating operations when controller is in STANDBY or FENCED to prevent split-brain.
+        """
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        # Exempt HA election and heartbeat management routes
+        if path in (
+            "/ha/promote", "/ha/failover", "/ha/heartbeat", "/ha/renew",
+            "/api/ha/promote", "/api/ha/failover", "/api/ha/heartbeat", "/api/ha/renew"
+        ):
+            return True
+
+        mgr = get_ha_manager()
+        if mgr.state == HAState.FENCED:
+            self.send_json(503, {
+                "error": "Leader lease expired. Controller is self-fenced to prevent split-brain.",
+                "role": "fenced",
+                "leader_id": mgr.current_leader_id,
+                "leader_url": mgr.current_leader_url,
+                "term": mgr.current_term,
+                "lease_valid": False
+            })
+            return False
+
+        if not mgr.is_leader:
+            self.send_json(503, {
+                "error": "Controller is in STANDBY mode. Mutating operations are rejected.",
+                "role": mgr.state,
+                "leader_id": mgr.current_leader_id,
+                "leader_url": mgr.current_leader_url,
+                "term": mgr.current_term,
+                "lease_valid": mgr.current_lease.is_valid()
+            })
+            return False
+
+        if not mgr.current_lease.is_valid():
+            if mgr.state == HAState.LEADER and (not mgr.current_leader_id or mgr.current_leader_id == mgr.node_id):
+                mgr.renew_lease()
+            else:
+                self.send_json(503, {
+                    "error": "Leader lease expired. Controller is self-fenced to prevent split-brain.",
+                    "role": "fenced",
+                    "leader_id": mgr.current_leader_id,
+                    "leader_url": mgr.current_leader_url,
+                    "term": mgr.current_term,
+                    "lease_valid": False
+                })
+                return False
+
+        return True
 
     def read_json_body(self):
         try:
@@ -2031,6 +2088,13 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 "term": mgr.current_term,
                 "state_version": mgr.state_version
             })
+            return
+
+        # ----------------------------------------------------------------------
+        # Leader Lease & Standby Write-Gating Check
+        # Standby and fenced controllers reject mutations to prevent split-brain writes.
+        # ----------------------------------------------------------------------
+        if not self.check_leader_write_permission():
             return
 
         # ----------------------------------------------------------------------
@@ -3884,6 +3948,9 @@ class ControllerHandler(BaseHTTPRequestHandler):
         path = parsed.path
         token = self.parse_auth_token()
 
+        if not self.check_leader_write_permission():
+            return
+
         if path.startswith("/apps/"):
             if not self.is_authenticated_admin_or_node():
                 self.send_json(401, {"error": "Unauthorized: Authentication required"})
@@ -4054,7 +4121,7 @@ class ControllerHandler(BaseHTTPRequestHandler):
 # CLI Actions
 # ------------------------------------------------------------------------------
 
-def start_server(host=None, port=None, timeout=None):
+def start_server(host=None, port=None, timeout=None, role=None):
     paths = get_controller_paths()
     paths.validate()
     cfg = get_controller_runtime_config()
@@ -4075,10 +4142,10 @@ def start_server(host=None, port=None, timeout=None):
     start_background_lease_sweeper(timeout)
 
     # Initialize High Availability (HA) Manager
-    ha_role = os.environ.get("PERSONALSERVER_HA_ROLE", "auto")
+    ha_role = role or os.environ.get("PERSONALSERVER_HA_ROLE", "auto")
     ha_node_id = os.environ.get("PERSONALSERVER_NODE_ID", socket.gethostname() or "node-master")
     ha_node_url = f"http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}"
-    ha_mgr = get_ha_manager(paths=paths, role=ha_role, node_id=ha_node_id, node_url=ha_node_url)
+    ha_mgr = get_ha_manager(paths=paths, role=ha_role, node_id=ha_node_id, node_url=ha_node_url, force_reload=True)
     ha_mgr.initialize()
     ha_mgr.start_monitor()
 
@@ -4421,6 +4488,7 @@ def main():
     p_start.add_argument("--host", default=DEFAULT_HOST, help=f"Host to bind (default: {DEFAULT_HOST})")
     p_start.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port to bind (default: {DEFAULT_PORT})")
     p_start.add_argument("--timeout", type=int, default=DEFAULT_HEARTBEAT_TIMEOUT, help=f"Heartbeat timeout in seconds (default: {DEFAULT_HEARTBEAT_TIMEOUT})")
+    p_start.add_argument("--role", choices=["auto", "leader", "standby"], default=None, help="HA failover role (default: auto)")
 
     # nodes command
     p_nodes = subparsers.add_parser("nodes", help="List cluster nodes")
@@ -4477,7 +4545,8 @@ def main():
         host = getattr(args, "host", DEFAULT_HOST)
         port = getattr(args, "port", DEFAULT_PORT)
         timeout = getattr(args, "timeout", DEFAULT_HEARTBEAT_TIMEOUT)
-        start_server(host, port, timeout)
+        role = getattr(args, "role", None)
+        start_server(host, port, timeout, role)
     elif args.command == "nodes":
         list_nodes(getattr(args, "status", None))
     elif args.command == "node":

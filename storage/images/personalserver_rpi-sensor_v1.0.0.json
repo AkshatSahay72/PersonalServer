@@ -4,7 +4,7 @@
   "tag": "v1.0.0",
   "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "architecture": "arm64",
-  "created_at": "2026-10-15T16:07:51Z",
+  "created_at": "2026-10-15T17:56:34Z",
   "metadata": {
     "target_platform": "linux/arm64",
     "tested_hardware": "Raspberry Pi 4B (Simulated)",

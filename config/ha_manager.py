@@ -34,7 +34,16 @@ class HAState:
     LEADER = "leader"
     STANDBY = "standby"
     CANDIDATE = "candidate"
+    FENCED = "fenced"
     DISABLED = "disabled"
+
+
+class HAFailureMode:
+    HEALTHY = "HEALTHY"
+    PROCESS_DEAD = "PROCESS_DEAD"
+    NETWORK_PARTITION = "NETWORK_PARTITION"
+    API_ERROR = "API_ERROR"
+    UNKNOWN = "UNKNOWN"
 
 
 def get_current_iso_timestamp() -> str:
@@ -137,7 +146,9 @@ class HAManager:
         paths=None,
         auth_token: Optional[str] = None,
         on_promotion_callback: Optional[Callable[[], None]] = None,
-        on_demotion_callback: Optional[Callable[[], None]] = None
+        on_demotion_callback: Optional[Callable[[], None]] = None,
+        partition_safe: Optional[bool] = None,
+        peer_probe_ports: Optional[List[int]] = None
     ):
         self._lock = threading.RLock()
         self.paths = paths or get_controller_paths()
@@ -161,6 +172,15 @@ class HAManager:
 
         self.on_promotion_callback = on_promotion_callback
         self.on_demotion_callback = on_demotion_callback
+
+        # Multi-signal failure detection & partition safety
+        self.partition_safe = (
+            str(os.environ.get("PERSONALSERVER_HA_PARTITION_SAFE", "1")).lower() in ("1", "true", "yes")
+            if partition_safe is None else bool(partition_safe)
+        )
+        self.peer_probe_ports: List[int] = list(peer_probe_ports or [8080, 8088, 8022])
+        self.last_failure_mode: str = HAFailureMode.UNKNOWN
+        self.consecutive_partition_events: int = 0
 
         # State fields
         self.state: str = HAState.STANDBY if self.configured_role == "standby" else HAState.LEADER
@@ -210,7 +230,7 @@ class HAManager:
 
             if self.configured_role == "leader":
                 # Forced primary leader
-                new_term = max(1, disk_lease.term + 1)
+                new_term = max(1, disk_lease.term + (1 if disk_lease.leader_id and disk_lease.leader_id != self.node_id else 0))
                 self.current_lease = LeaderLease(
                     term=new_term,
                     leader_id=self.node_id,
@@ -434,8 +454,47 @@ class HAManager:
                 "timestamp": get_current_iso_timestamp()
             }
 
-    def check_remote_leader(self) -> bool:
-        """Pings current leader /ha/status. Returns True if alive."""
+    def probe_host_connectivity(self, target_url: str, timeout: float = 1.5) -> bool:
+        """
+        Probes whether the host device of target_url is reachable on any secondary
+        service port (Node API: 8080, Router: 8088, SSH: 8022, etc.).
+        Returns True if host/network is alive, False if network is partitioned or host down.
+        """
+        try:
+            parsed = urllib.parse.urlparse(target_url)
+            host = parsed.hostname
+            if not host:
+                return False
+            # Loopback is always reachable locally
+            if host in ("127.0.0.1", "localhost", "::1"):
+                return True
+
+            for port in self.peer_probe_ports:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(timeout)
+                    err = s.connect_ex((host, port))
+                    s.close()
+                    # 0 = Connected; 111 (Linux ECONNREFUSED) / 10061 (Windows WSAECONNREFUSED)
+                    # Connection refused means the OS kernel on the destination device actively answered with RST!
+                    # That is definitive proof that Tailscale and the remote host device are alive!
+                    if err in (0, 111, 10061):
+                        return True
+                except (ConnectionRefusedError, socket.error):
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def check_remote_leader(self) -> Tuple[bool, str]:
+        """
+        Pings current leader /ha/status (and fallback /health).
+        Returns (is_alive, failure_mode):
+          is_alive: bool
+          failure_mode: HAFailureMode constant (HEALTHY, PROCESS_DEAD, NETWORK_PARTITION, API_ERROR)
+        """
         leader_url = self.current_leader_url
         if not leader_url or leader_url == self.node_url:
             discovered_url, leader_info = find_active_leader(self.candidate_urls, exclude_url=self.node_url)
@@ -448,12 +507,13 @@ class HAManager:
                         self.current_lease.lease_expires_at = time.time() + leader_info.get("time_remaining_sec", self.lease_duration_sec)
                 leader_url = discovered_url
             else:
-                return False
+                return False, HAFailureMode.UNKNOWN
 
         url = f"{leader_url}/ha/status"
         req = urllib.request.Request(url, headers={"User-Agent": "PersonalServer-HAManager/1.0"})
+        probe_timeout = min(2.5, max(0.4, self.check_interval_sec * 2.0))
         try:
-            with urllib.request.urlopen(req, timeout=2.5) as resp:
+            with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
                     remote_term = data.get("term", 0)
@@ -464,37 +524,95 @@ class HAManager:
                         with self._lock:
                             self.current_lease.lease_expires_at = time.time() + data.get("lease_remaining_sec", self.lease_duration_sec)
                             self.missed_checks = 0
+                            self.consecutive_partition_events = 0
                             # If remote state is newer, trigger sync
                             if remote_version > self.state_version:
                                 self.sync_state_from_leader(leader_url)
-                        return True
+                        return True, HAFailureMode.HEALTHY
+                    else:
+                        return False, HAFailureMode.API_ERROR
+        except urllib.error.HTTPError as e:
+            if e.code in (500, 502, 503, 504):
+                return False, HAFailureMode.API_ERROR
         except Exception:
             pass
 
-        with self._lock:
-            self.missed_checks += 1
-        return False
+        # Controller did not answer /ha/status. Test host liveness on peer ports to differentiate
+        # Process Dead vs Network Partition.
+        is_host_alive = self.probe_host_connectivity(leader_url)
+        if is_host_alive:
+            return False, HAFailureMode.PROCESS_DEAD
+        else:
+            return False, HAFailureMode.NETWORK_PARTITION
 
     def trigger_failover_evaluation(self):
         """Called periodically by monitor loop. Triggers failover if leader is dead."""
         with self._lock:
             if self.state == HAState.LEADER:
+                # Check if current lease has expired without renewal (self-fencing)
+                if not self.current_lease.is_valid():
+                    controller_logger.warning(
+                        "HA_FENCED",
+                        "Leader lease expired for %s (Term %d). Self-fencing local controller to prevent split-brain.",
+                        self.node_id, self.current_term
+                    )
+                    self.state = HAState.FENCED
+                    if self.on_demotion_callback:
+                        try:
+                            self.on_demotion_callback()
+                        except Exception as e:
+                            controller_logger.error("HA_CALLBACK_ERROR", "Error in on_demotion_callback: %s", e)
+                    return
                 # Renew local lease
                 self.renew_lease()
                 return
 
-            if self.state == HAState.STANDBY:
-                alive = self.check_remote_leader()
-                if not alive:
-                    # Check lease expiration on disk and missed check counter
-                    lease_expired = not self.current_lease.is_valid()
+            if self.state in (HAState.STANDBY, HAState.FENCED):
+                alive, failure_mode = self.check_remote_leader()
+                self.last_failure_mode = failure_mode
+
+                if alive:
+                    self.missed_checks = 0
+                    self.consecutive_partition_events = 0
+                    if self.state == HAState.FENCED:
+                        self.state = HAState.STANDBY
+                    return
+
+                self.missed_checks += 1
+                lease_expired = not self.current_lease.is_valid()
+
+                if failure_mode == HAFailureMode.PROCESS_DEAD:
+                    # Controller process is confirmed dead while host device is reachable
                     if self.missed_checks >= self.max_missed_checks or lease_expired:
                         controller_logger.warning(
                             "HA_FAILOVER",
-                            "Master at %s is DOWN (missed checks: %d, lease valid: %s). Promoting self!",
-                            self.current_leader_url, self.missed_checks, not lease_expired
+                            "Leader controller process on %s is CONFIRMED DEAD (host alive, missed checks: %d). Promoting self!",
+                            self.current_leader_url, self.missed_checks
                         )
-                        self.elect_self(reason=f"Master {self.current_leader_url} unreachable")
+                        self.elect_self(reason=f"Leader process at {self.current_leader_url} terminated")
+                elif failure_mode == HAFailureMode.NETWORK_PARTITION:
+                    self.consecutive_partition_events += 1
+                    if self.partition_safe:
+                        controller_logger.warning(
+                            "HA_PARTITION",
+                            "Suspected network/Tailscale partition to leader %s (consecutive: %d). Holding STANDBY to prevent split-brain.",
+                            self.current_leader_url, self.consecutive_partition_events
+                        )
+                    else:
+                        # Non-partition-safe override
+                        if self.missed_checks >= self.max_missed_checks and lease_expired:
+                            self.elect_self(reason=f"Leader unreachable (partition override)")
+                elif failure_mode == HAFailureMode.API_ERROR:
+                    if self.missed_checks >= self.max_missed_checks and lease_expired:
+                        controller_logger.warning(
+                            "HA_FAILOVER",
+                            "Leader at %s returned API errors. Promoting self!",
+                            self.current_leader_url
+                        )
+                        self.elect_self(reason=f"Leader API failure on {self.current_leader_url}")
+                elif failure_mode == HAFailureMode.UNKNOWN:
+                    if self.missed_checks >= self.max_missed_checks and lease_expired and not self.partition_safe:
+                        self.elect_self(reason=f"Leader unreachable (unknown failure)")
 
     def manual_failover(self, target_node_url: Optional[str] = None) -> Dict[str, Any]:
         """Manually transfers leadership or forces local election."""
@@ -556,6 +674,8 @@ class HAManager:
                 "lease_valid": self.current_lease.is_valid(),
                 "lease_remaining_sec": round(self.current_lease.time_remaining_sec(), 1),
                 "missed_checks": self.missed_checks,
+                "last_failure_mode": self.last_failure_mode,
+                "partition_safe": self.partition_safe,
                 "candidate_urls": self.candidate_urls,
                 "standbys_count": len(self.standby_nodes),
                 "standbys": list(self.standby_nodes.values()),

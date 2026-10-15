@@ -4,15 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PersonalServer - Server Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=1.4.0">
+  <link rel="stylesheet" href="/static/style.css?v=1.5.0">
 </head>
 <body>
   <div class="app-layout">
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
     <!-- Minimal Sidebar -->
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       <div class="sidebar-brand">
-        <span class="brand-title">PersonalServer</span>
-        <span class="brand-ver mono">v1.1</span>
+        <div class="brand-left">
+          <span class="brand-title">PersonalServer</span>
+          <span class="brand-ver mono">v1.1</span>
+        </div>
+        <button type="button" class="sidebar-close-btn" id="sidebar-close-btn" aria-label="Close navigation menu">✕</button>
       </div>
       
       <nav class="sidebar-nav">
@@ -58,9 +62,14 @@
     <main class="main-panel">
       <!-- Minimal Topbar -->
       <header class="topbar">
-        <div class="topbar-title-wrap">
-          <h1 class="topbar-heading" id="page-heading">Dashboard</h1>
-          <span class="topbar-sub mono cell-muted" id="page-subheading">Cluster overview</span>
+        <div class="topbar-left">
+          <button type="button" class="mobile-nav-toggle" id="mobile-nav-toggle" aria-label="Toggle navigation menu" aria-expanded="false">
+            <span class="nav-toggle-icon">☰</span>
+          </button>
+          <div class="topbar-title-wrap">
+            <h1 class="topbar-heading" id="page-heading">Dashboard</h1>
+            <span class="topbar-sub mono cell-muted" id="page-subheading">Cluster overview</span>
+          </div>
         </div>
         <div class="topbar-actions mono">
           <div class="topbar-meta-item">
@@ -71,11 +80,11 @@
             <span class="cell-muted">Cluster:</span>
             <span id="topbar-cluster-status" class="text-online">2 online</span>
           </div>
-          <div class="topbar-meta-item">
+          <div class="topbar-meta-item verbose">
             <span class="cell-muted">Updated:</span>
             <span id="last-updated-text">-</span>
           </div>
-          <div class="topbar-meta-item">
+          <div class="topbar-meta-item verbose">
             <span class="cell-muted">User:</span>
             <span id="topbar-user-email">Local Admin</span>
           </div>
@@ -913,6 +922,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=1.5.0"></script>
+  <script src="/static/app.js?v=1.6.0"></script>
 </body>
 </html>

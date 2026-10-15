@@ -112,8 +112,8 @@ if [ "$cloudflared_running" = false ]; then
         elif [ ! -f "$TOKEN_FILE" ]; then
             echo "FAILED (Token missing at $TOKEN_FILE)"
         else
-            CF_PROTOCOL="${CLOUDFLARED_PROTOCOL:-http2}"
-            nohup cloudflared tunnel run --protocol "$CF_PROTOCOL" --token-file "$TOKEN_FILE" >> "$CLOUDFLARED_LOG" 2>&1 &
+            export GODEBUG="netdns=go"
+            nohup cloudflared tunnel --no-prechecks run --token-file "$TOKEN_FILE" >> "$CLOUDFLARED_LOG" 2>&1 &
             new_cf_pid=$!
             echo "$new_cf_pid" > "$CLOUDFLARED_PID_FILE"
 

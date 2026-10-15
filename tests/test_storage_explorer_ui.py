@@ -18,6 +18,7 @@ import json
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import unittest
 
 NODE_API_URL = "http://100.85.108.5:8080" # Node 01 local endpoint

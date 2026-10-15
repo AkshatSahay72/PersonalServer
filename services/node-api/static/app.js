@@ -93,6 +93,39 @@ document.getElementById("refresh-btn")?.addEventListener("click", () => {
   navigate();
 });
 
+// Mobile Navigation Drawer Toggle & Escape Handling
+const mobileToggle = document.getElementById("mobile-nav-toggle");
+const sidebar = document.getElementById("sidebar");
+const backdrop = document.getElementById("sidebar-backdrop");
+const sidebarCloseBtn = document.getElementById("sidebar-close-btn");
+
+function toggleMobileNav(force) {
+  if (!sidebar) return;
+  const isOpen = force !== undefined ? force : !sidebar.classList.contains("open");
+  sidebar.classList.toggle("open", isOpen);
+  if (backdrop) backdrop.classList.toggle("active", isOpen);
+  if (mobileToggle) {
+    mobileToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
+  }
+}
+
+mobileToggle?.addEventListener("click", () => toggleMobileNav());
+sidebarCloseBtn?.addEventListener("click", () => toggleMobileNav(false));
+backdrop?.addEventListener("click", () => toggleMobileNav(false));
+
+// Close mobile sidebar on link click or Escape key
+document.querySelectorAll(".sidebar .nav-link").forEach(link => {
+  link.addEventListener("click", () => {
+    if (window.innerWidth <= 768) toggleMobileNav(false);
+  });
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && sidebar?.classList.contains("open")) {
+    toggleMobileNav(false);
+  }
+});
+
 // Formatters
 function formatBytes(bytes) {
   if (bytes === 0 || bytes === "0") return "0 B";
@@ -940,10 +973,6 @@ window.runNodeDetailDiagnostics = function() {
   }
 };
 
-  panel.style.display = "block";
-  panel.scrollIntoView({ behavior: "smooth" });
-};
-
 window.closeNodeDetail = function() {
   const panel = document.getElementById("node-detail-panel");
   if (panel) panel.style.display = "none";
@@ -1088,7 +1117,20 @@ async function loadJobs() {
     if (countHdr) countHdr.textContent = `${cachedJobs.length} total jobs`;
 
     if (cachedJobs.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="8" class="cell-muted">No workload jobs recorded.</td></tr>`;
+      tbody.innerHTML = `
+        <tr>
+          <td colspan="8">
+            <div class="empty-state">
+              <div class="empty-state-icon">⚡</div>
+              <div class="empty-state-title">No Workload Jobs Recorded</div>
+              <div class="empty-state-desc">No jobs have been submitted yet. Dispatch a bash command or Python workload across cluster nodes.</div>
+              <div class="empty-state-action">
+                <button class="btn btn-sm btn-primary" onclick="document.getElementById('job-cmd')?.focus()">Submit First Job</button>
+              </div>
+            </div>
+          </td>
+        </tr>
+      `;
       return;
     }
 
@@ -1786,7 +1828,20 @@ async function loadApps() {
     }
 
     if (cachedApps.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="7" class="cell-muted" style="text-align:center; padding: 20px;">No applications created yet. Click "+ Deploy from GitHub" above to deploy your first application.</td></tr>`;
+      tbody.innerHTML = `
+        <tr>
+          <td colspan="7">
+            <div class="empty-state">
+              <div class="empty-state-icon">📦</div>
+              <div class="empty-state-title">No Applications Deployed</div>
+              <div class="empty-state-desc">Deploy Git repositories, static sites, or containerized APIs across cluster nodes with reverse proxy routing.</div>
+              <div class="empty-state-action">
+                <button class="btn btn-sm btn-primary" onclick="openDeployModal()">+ Deploy from GitHub</button>
+              </div>
+            </div>
+          </td>
+        </tr>
+      `;
       return;
     }
 

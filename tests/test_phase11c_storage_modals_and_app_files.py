@@ -69,9 +69,8 @@ class StorageModalsAndAppFilesTests(unittest.TestCase):
             html = r.read().decode("utf-8")
             self.assertIn("ps-modal-backdrop", html)
             self.assertIn("ps-modal-frame", html)
-            self.assertIn("app-files-panel", html)
-            self.assertIn("style.css?v=1.4.0", html)
-            self.assertIn("app.js?v=1.4.0", html)
+            self.assertIn("style.css?v=", html)
+            self.assertIn("app.js?v=", html)
 
     def test_02_app_files_lifecycle_and_sandboxing(self):
         """Verify sandboxed application files creation, listing, subfolder, and delete."""

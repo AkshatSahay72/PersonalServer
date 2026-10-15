@@ -128,6 +128,8 @@ class TestHAFailover(unittest.TestCase):
 
     def test_ha_manager_initialization_and_lease_renewal(self):
         """Tests that HAManager claims leadership when no remote leader exists and renews lease."""
+        if self.master_paths.leader_lease_file.exists():
+            self.master_paths.leader_lease_file.unlink()
         mgr = HAManager(
             node_id="master-pc",
             node_url="http://127.0.0.1:8000",
@@ -388,6 +390,8 @@ class TestHAFailover(unittest.TestCase):
         Tests that an old partitioned master that recovers sees a higher term
         from the new leader, demotes itself to STANDBY, and yields authority.
         """
+        if self.master_paths.leader_lease_file.exists():
+            self.master_paths.leader_lease_file.unlink()
         mgr = HAManager(
             node_id="old-master",
             node_url="http://127.0.0.1:8000",
@@ -424,6 +428,227 @@ class TestHAFailover(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_tailscale_partition_simulation_fails_closed(self):
+        """
+        Simulates a Tailscale partition where both the controller AND host secondary ports
+        are unreachable. Verifies that standby refuses to auto-promote under partition_safe=True
+        to prevent split-brain.
+        """
+        standby_mgr = HAManager(
+            node_id="node-standby-partition-test",
+            node_url="http://127.0.0.1:8002",
+            candidate_urls=["http://127.0.0.1:19991", "http://127.0.0.1:8002"],
+            role="standby",
+            lease_duration_sec=0.2,
+            check_interval_sec=0.05,
+            partition_safe=True,
+            paths=self.standby_paths
+        )
+        standby_mgr.current_lease.leader_url = "http://127.0.0.1:19991"
+        standby_mgr.current_lease.leader_id = "node-01"
+        # Mock probe_host_connectivity to return False (host completely unreachable over partitioned Tailscale)
+        standby_mgr.probe_host_connectivity = lambda url, timeout=1.5: False
+
+        # Simulate 5 monitoring cycles during a network partition
+        for _ in range(5):
+            standby_mgr.trigger_failover_evaluation()
+
+        # Standby must FAIL CLOSED: Remain STANDBY to prevent split-brain
+        self.assertFalse(standby_mgr.is_leader)
+        self.assertTrue(standby_mgr.is_standby)
+        self.assertEqual(standby_mgr.last_failure_mode, "NETWORK_PARTITION")
+        self.assertGreaterEqual(standby_mgr.consecutive_partition_events, 4)
+
+    def test_stale_leader_mutation_rejection_and_self_fencing(self):
+        """
+        Verifies that when a leader's lease expires without renewal, mutating endpoints
+        reject writes with HTTP 503 and transition to FENCED state to prevent split-brain writes.
+        """
+        server = HTTPServer(("127.0.0.1", 0), ControllerHandler)
+        port = server.server_address[1]
+        server_url = f"http://127.0.0.1:{port}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        try:
+            mgr = get_ha_manager()
+            # Force lease expiration
+            mgr.current_lease.lease_expires_at = time.time() - 5.0
+            self.assertFalse(mgr.current_lease.is_valid())
+            mgr.trigger_failover_evaluation()
+            self.assertEqual(mgr.state, HAState.FENCED)
+
+            # Attempt to submit a node registration to fenced leader
+            req = urllib.request.Request(
+                f"{server_url}/register",
+                data=json.dumps({"node_id": "rogue-worker", "enrollment_token": self.enrollment_token}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.enrollment_token}"},
+                method="POST"
+            )
+
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=2.0)
+            self.assertEqual(ctx.exception.code, 503)
+            err_data = json.loads(ctx.exception.read().decode("utf-8"))
+            self.assertIn("lease expired", err_data.get("error", "").lower())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_standby_mutation_rejection(self):
+        """
+        Verifies that a controller running in STANDBY role rejects all mutating operations
+        (POST /register, POST /jobs, DELETE /apps) with HTTP 503 and returns leader coordinates.
+        """
+        server = HTTPServer(("127.0.0.1", 0), ControllerHandler)
+        port = server.server_address[1]
+        server_url = f"http://127.0.0.1:{port}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        try:
+            mgr = get_ha_manager()
+            mgr.state = HAState.STANDBY
+            mgr.current_lease.leader_url = "http://100.85.108.5:8000"
+
+            # Attempt POST to standby controller
+            req = urllib.request.Request(
+                f"{server_url}/register",
+                data=json.dumps({"node_id": "test-worker", "enrollment_token": self.enrollment_token}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.enrollment_token}"},
+                method="POST"
+            )
+
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=2.0)
+            self.assertEqual(ctx.exception.code, 503)
+            err_data = json.loads(ctx.exception.read().decode("utf-8"))
+            self.assertEqual(err_data.get("role"), "standby")
+            self.assertEqual(err_data.get("leader_url"), "http://100.85.108.5:8000")
+        finally:
+            # Restore leader state
+            mgr.state = HAState.LEADER
+            mgr.renew_lease()
+            server.shutdown()
+            server.server_close()
+
+    def test_node_reboot_and_worker_reconnection(self):
+        """
+        Tests that when controller process stops (simulating reboot) and restarts,
+        the worker reconnects cleanly without data loss.
+        """
+        server = HTTPServer(("127.0.0.1", 0), ControllerHandler)
+        port = server.server_address[1]
+        ctrl_url = f"http://127.0.0.1:{port}"
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+
+        worker = SimulatedWorker(
+            node_id="worker-reboot-test",
+            controller_url=ctrl_url,
+            enrollment_token=self.enrollment_token
+        )
+        worker.candidate_controller_urls = [ctrl_url]
+        reg_resp = worker.register()
+        self.assertIn("auth_token", reg_resp)
+
+        # 1. Controller terminates abruptly (reboot)
+        server.shutdown()
+        server.server_close()
+
+        # 2. Worker heartbeat fails
+        with self.assertRaises(Exception):
+            worker.send_heartbeat()
+
+        # 3. Controller recovers after reboot
+        server_restarted = HTTPServer(("127.0.0.1", port), ControllerHandler)
+        threading.Thread(target=server_restarted.serve_forever, daemon=True).start()
+
+        try:
+            # Worker re-establishes connection and succeeds
+            reconnected = worker.register()
+            self.assertIn("auth_token", reconnected)
+            hb = worker.send_heartbeat()
+            self.assertIn(hb.get("status"), ("ok", "online"))
+        finally:
+            server_restarted.shutdown()
+            server_restarted.server_close()
+
+    def test_node_03_completely_offline_failover_succeeds(self):
+        """
+        Verifies that Node 03 (Windows PC / optional worker) being completely OFFLINE
+        does not impede failover or leader election between Node 01 and Node 02.
+        """
+        offline_node_03 = "http://127.0.0.1:19992"  # Offline Node 03 on closed port
+
+        # Master controller (Node 01)
+        master_server = HTTPServer(("127.0.0.1", 0), ControllerHandler)
+        m_port = master_server.server_address[1]
+        master_url = f"http://127.0.0.1:{m_port}"
+        threading.Thread(target=master_server.serve_forever, daemon=True).start()
+
+        # Standby controller (Node 02) includes offline Node 03 in candidate list
+        standby_mgr = HAManager(
+            node_id="node-02-standby",
+            node_url="http://127.0.0.1:8002",
+            candidate_urls=[master_url, "http://127.0.0.1:8002", offline_node_03],
+            role="standby",
+            lease_duration_sec=0.5,
+            check_interval_sec=0.1,
+            auth_token=self.enrollment_token,
+            paths=self.standby_paths
+        )
+        sync_ok = standby_mgr.sync_state_from_leader(master_url, self.enrollment_token)
+        self.assertTrue(sync_ok)
+
+        try:
+            # Crash Node 01
+            master_server.shutdown()
+            master_server.server_close()
+
+            # Manual promotion of Node 02 succeeds without requiring Node 03
+            res = standby_mgr.manual_failover()
+            self.assertEqual(res["status"], "success")
+            self.assertTrue(standby_mgr.is_leader)
+            self.assertEqual(standby_mgr.current_leader_id, "node-02-standby")
+        finally:
+            pass
+
+    def test_state_persistence_across_process_restart(self):
+        """
+        Verifies that cluster databases (nodes, jobs, applications) persist across
+        process termination and can be recovered completely upon cold restart.
+        """
+        save_nodes_db({
+            "cluster_name": "PersonalServer-Persistence",
+            "nodes": {"worker-p1": {"node_id": "worker-p1", "name": "Vivo", "status": "ONLINE"}}
+        })
+        save_jobs_db({
+            "jobs": {"job-p1": {"job_id": "job-p1", "type": "health-check", "status": JOB_STATE_QUEUED}}
+        })
+        save_apps_db({
+            "apps": {"app-p1": {"id": "app-p1", "name": "PersistentApp", "port": 8090}}
+        })
+
+        # Simulate cold process restart by reloading databases directly from disk files
+        loaded_nodes = load_nodes_db()
+        loaded_jobs = load_jobs_db()
+        loaded_apps = load_apps_db()
+
+        self.assertIn("worker-p1", loaded_nodes.get("nodes", {}))
+        self.assertEqual(loaded_nodes["nodes"]["worker-p1"]["name"], "Vivo")
+        self.assertIn("job-p1", loaded_jobs.get("jobs", {}))
+        self.assertIn("app-p1", loaded_apps.get("apps", {}))
+        self.assertEqual(loaded_apps["apps"]["app-p1"]["port"], 8090)
+
+    def test_both_controllers_unavailable_fails_closed(self):
+        """
+        Tests that when both controller candidates are unreachable, worker discovery
+        and clients fail closed without corrupting local data or creating conflicting state.
+        """
+        dead_candidates = ["http://127.0.0.1:19001", "http://127.0.0.1:19002"]
+        leader_url, leader_data = find_active_leader(dead_candidates, timeout=0.2)
+        self.assertIsNone(leader_url)
+        self.assertIsNone(leader_data)
 
 
 if __name__ == "__main__":
