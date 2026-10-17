@@ -5,10 +5,9 @@ config/controller.json
 config/network.json
 config/services.json
 
-# Scratch & temporary test scripts
-scratch/
-
-# Secrets
+# Environment variables & secrets
+.env
+!.env.example
 config/secrets/*
 !config/secrets/*.example*
 !config/secrets/.gitkeep
@@ -17,6 +16,11 @@ config/secrets/*
 *.token
 !*.example.token
 *.secret
+
+# Scratch & temporary development scripts
+scratch/*
+!scratch/README.md
+!scratch/*.py
 
 # Runtime & Persistence
 logs/
@@ -27,23 +31,33 @@ backups/
 *.tar.gz
 *.tar
 *.zip
-.pytest_cache/
-.ruff_cache/
 *.pid
 *.bak
 
+# Testing & quality artifacts
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Python bytecode & cache
+# Python bytecode & virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+.venv/
+venv/
+env/
+ENV/
 
-# Ephemeral application sandboxes
+# Ephemeral application sandboxes & storage runtime
 storage/applications/*/
 !storage/applications/.gitkeep
-storage/
+storage/uploads/
+storage/temp/
+!storage/images/
+!storage/images/*.json
 
 # IDE and OS files
 .vscode/

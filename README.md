@@ -76,114 +76,135 @@
 
 ---
 
-## 3. Quick Start Guide
+## 3. Platform Capability & Support Matrix
 
-### Step 1: Start the Cluster Controller
+PersonalServer is designed to run across diverse, asymmetric compute nodes without requiring root privileges or uniform hardware.
 
-On your controller host (e.g., laptop or home server):
+| Platform / Environment | Tested Role(s) | Python Workloads | Docker Containers | Storage Service | Telemetry Engine | Verification Status |
+|---|---|---|---|---|---|---|
+| **Android / Termux** (unrooted) | Worker, Controller | ✅ Native Python 3.9+ | ❌ Kernel cgroup restricted | ✅ Sandboxed | ✅ Battery, WiFi dBm, thermals | Verified on physical hardware (Vivo Y31, Realme 5 Pro) |
+| **Linux (Debian / Ubuntu / x86_64 / aarch64)** | Worker, Controller, Standby | ✅ Native Python 3.9+ | ✅ Native Docker / udocker | ✅ Sandboxed | ✅ System `/proc` & `sysfs` | Verified in CI (Ubuntu-latest) & multi-node simulator |
+| **Raspberry Pi OS (arm64 / armhf)** | Worker, Storage | ✅ Native Python 3.9+ | ✅ Docker engine | ✅ Sandboxed | ✅ `vcgencmd` & thermal sysfs | Architecture normalization verified in test suites |
+| **Windows 10/11 (Development PC)** | Dev Controller, Local Worker | ✅ Native via `LocalWorker` | ⚠️ Docker Desktop required | ✅ Sandboxed | ✅ Win32 GlobalMemoryStatusEx | Verified in CI (windows-latest) & `test_local_worker.py` |
 
-```bash
-# Start Controller service
-python controller/controller.py start --host 0.0.0.0 --port 8000 --timeout 60
-```
+> [!NOTE]
+> When a node lacks Docker capabilities (such as unrooted Android/Termux), PersonalServer advertises `container_runtime:docker: false`. The resource-aware scheduler routes container tasks only to nodes with verified Docker capability, and workers reject unsupported container jobs with clear status errors rather than crashing.
 
-### Step 2: Onboard a New Node
+---
 
-Generate a one-time onboarding code on the Controller:
+## 4. Repository Structure & Directory Catalog
 
-```bash
-python controller/controller.py onboard-code
-```
 ```text
-==========================================
-Onboarding code: PS-WYR9-3LYT
-Expires in:      15 minutes
-==========================================
-```
-
-Run onboarding on the new device (Android / Termux / Linux):
-
-```bash
-cd ~/PersonalServer
-python agent/node-agent.py onboard \
-  --controller http://<CONTROLLER_IP>:8000 \
-  --code PS-WYR9-3LYT
-```
-The agent automatically detects hardware, configures identity, registers with the controller, starts local services, and begins heartbeats.
-
-### Step 3: Manage Cluster & Workloads
-
-```bash
-# Check cluster inventory & rich telemetry
-python controller/controller.py nodes
-
-# Submit a workload job to the cluster
-python controller/controller.py submit --node auto --type system-info
-
-# Check execution logs
-python controller/controller.py jobs
+PersonalServer/
+├── agent/                  # Node agent daemon, LocalWorker, and sandboxed JobExecutor
+├── common/                 # Shared, dependency-free utilities (time, crypto, arch, storage)
+├── config/                 # Centralized configuration, HA consensus manager, telemetry
+│   ├── platform.yaml       # Platform public hostnames, routing domain, scheme
+│   ├── node.example.json   # Template node identity and capability configuration
+│   └── secrets/            # Local node tokens and secrets (strictly git-ignored)
+├── controller/             # Master Controller HTTP service, scheduler, and API routes
+│   └── stores/             # Atomic JSON persistence stores (nodes, jobs, apps, onboarding)
+├── docs/                   # Architectural guides, operational runbooks, and threat models
+├── install/                # Hardware detection (`detect.sh`) and Termux setup (`termux.sh`)
+├── router/                 # Application reverse proxy and path-based router (:8088)
+├── scheduler/              # Constraint-based and resource-aware workload scheduler
+├── scripts/                # Canonical service management scripts and test runner CLI
+├── scratch/                # Development-only live hardware diagnostic scripts (non-CI)
+├── services/node-api/      # Node API web service and Web Operations Console dashboard
+├── storage/                # Node application sandbox storage and OCI image cache
+└── tests/                  # Deterministic offline unit and integration test suites
 ```
 
 ---
 
-## 4. Multi-Node Storage Subsystem
+## 5. Canonical Service Management & Startup
 
-All files reside securely in `~/PersonalServer/storage/` on each node. Access files locally or across remote nodes via the Web Console or REST API:
+PersonalServer uses standardized shell scripts on Linux and Termux, and direct Python commands on Windows:
 
-| Method | Endpoint | Description |
+| Lifecycle Action | Canonical Shell Command (Linux / Termux) | Native Windows Command |
 |---|---|---|
-| `GET` | `/storage/nodes` | List all discovered cluster storage nodes & available space |
-| `GET` | `/storage/list?node=<name>&path=<dir>` | List files and folders on target node |
-| `GET` | `/storage/download?node=<name>&path=<file>` | Download file from target node |
-| `POST` | `/storage/upload?node=<name>&path=<dir>` | Upload file to target node |
-| `POST` | `/storage/mkdir?node=<name>` | Create new folder (`{"name": "...", "path": "..."}`) |
-| `POST` | `/storage/rename?node=<name>` | Rename file or folder (`{"path": "...", "new_name": "..."}`) |
-| `DELETE` | `/storage?node=<name>&path=<item>` | Delete file or directory |
-| `GET` | `/storage/usage?node=<name>` | Storage telemetry and free space |
+| **Start Services** | `bash scripts/start.sh` | `python controller/controller.py start` |
+| **Stop Services** | `bash scripts/stop.sh` | Terminate background process / Ctrl+C |
+| **Restart Services** | `bash scripts/restart.sh` | Restart command |
+| **Service Status** | `bash scripts/status.sh` | `python controller/controller.py nodes` |
+| **Health Check** | `bash scripts/health.sh` | `python controller/controller.py health` |
+| **HA Cluster Status** | `bash scripts/ha-status.sh` | `python controller/controller.py ha` |
+| **Node Telemetry** | `bash scripts/node-info.sh` | `python agent/node-agent.py status` |
 
 ---
 
-## 5. Operations Web Console
+## 6. Verification & Automated Testing
 
-Access the high-density administration console at `http://<NODE_IP>:8080/` (or via Cloudflare Tunnel over HTTPS):
+All automated tests run completely offline without contacting physical nodes or external network resources.
 
-* **Dashboard**: Cluster metrics, online node count, active workloads, and HA Master badge.
-* **Nodes**: Detailed hardware inventory, CPU cores, RAM, storage, battery %, WiFi dBm, and CPU temperature.
-* **Jobs**: Dispatch allowlisted workloads and inspect execution logs.
-* **Storage**: Multi-node switcher, directory browser, uploads, downloads, and file management.
-* **Settings**: Cluster configuration, network routing, and HA failover simulation.
+### Canonical Test Commands
+
+```bash
+# 1. Fast isolated unit tests (pure in-memory, < 3s)
+python scripts/run_tests.py --unit
+
+# 2. Multi-node simulation, lifecycle, routing, and HA integration tests
+python scripts/run_tests.py --integration
+
+# 3. Complete automated test suite (all 29 suites, 296 tests)
+python scripts/run_tests.py --all
+
+# 4. Standard unittest discovery (matches scripts/run_tests.py --all)
+python -m unittest discover -s tests -p "test_*.py"
+
+# 5. Static code syntax & AST lint checks
+python scripts/run_tests.py --lint
+
+# 6. Web Console JavaScript syntax check
+node -c services/node-api/static/app.js
+```
 
 ---
 
-## 6. Complete Documentation
+## 7. Device Configuration Without Hardcoding
 
-Comprehensive technical guides are maintained in the [`docs/`](file:///d:/Coding/Major%20Project/PersonalServer/docs/README.md) directory:
+PersonalServer avoids hardcoding device hostnames, Tailscale IPs, or tokens into source files. Every node dynamically resolves its configuration using:
+
+1. **Environment Variables**:
+   - `PERSONALSERVER_CONTROLLER_URL`: URL of the active cluster controller (e.g. `http://100.85.108.5:8000`).
+   - `PERSONALSERVER_BASE_DIR`: Base installation directory (defaults to `~/PersonalServer`).
+   - `STORAGE_INTEGRATION_URL`: Configurable target for storage UI integration tests.
+2. **Configuration Files** (git-ignored for machine-specific deployment):
+   - `config/node.json`: Auto-generated on onboarding via `detect.sh` or `node-agent.py onboard`.
+   - `config/secrets/enrollment.token`: Local enrollment authentication secret.
+   - `config/platform.yaml`: Centralized public domain and ingress routing specification.
+
+---
+
+## 8. Complete Documentation
+
+Comprehensive technical guides are maintained in the [`docs/`](file:///docs/README.md) directory:
 
 ### Core Architecture & HA
-* [Technical Documentation Catalog](file:///d:/Coding/Major%20Project/PersonalServer/docs/README.md)
-* [System Architecture](file:///d:/Coding/Major%20Project/PersonalServer/docs/architecture.md)
-* [High Availability (HA) & Master Failover](file:///d:/Coding/Major%20Project/PersonalServer/docs/high_availability_failover.md)
-* [Controller Reference & API](file:///d:/Coding/Major%20Project/PersonalServer/docs/controller.md)
-* [Node Agent & Telemetry Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/node-agent.md)
-* [Resource-Aware Scheduling](file:///d:/Coding/Major%20Project/PersonalServer/docs/scheduling.md)
-* [Multi-Node Storage Subsystem](file:///d:/Coding/Major%20Project/PersonalServer/docs/storage.md)
+* [Technical Documentation Catalog](file:///docs/README.md)
+* [System Architecture](file:///docs/architecture.md)
+* [High Availability (HA) & Master Failover](file:///docs/high_availability_failover.md)
+* [Controller Reference & API](file:///docs/controller.md)
+* [Node Agent & Telemetry Guide](file:///docs/node-agent.md)
+* [Resource-Aware Scheduling](file:///docs/scheduling.md)
+* [Multi-Node Storage Subsystem](file:///docs/storage.md)
 
 ### Workloads, Reliability & Containers
-* [Job Reliability & Failure Recovery](file:///d:/Coding/Major%20Project/PersonalServer/docs/reliability.md)
-* [Job Lifecycle FSM & Recovery Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/job_lifecycle_recovery.md)
-* [Workload Jobs & Allowlist](file:///d:/Coding/Major%20Project/PersonalServer/docs/jobs.md)
-* [OCI Image Build & Deployment Workflow](file:///d:/Coding/Major%20Project/PersonalServer/docs/image_build_deploy_workflow.md)
-* [Application Routing & Gateway](file:///d:/Coding/Major%20Project/PersonalServer/docs/domain_migration.md)
+* [Job Reliability & Failure Recovery](file:///docs/reliability.md)
+* [Job Lifecycle FSM & Recovery Guide](file:///docs/job_lifecycle_recovery.md)
+* [Workload Jobs & Allowlist](file:///docs/jobs.md)
+* [OCI Image Build & Deployment Workflow](file:///docs/image_build_deploy_workflow.md)
+* [Application Routing & Gateway](file:///docs/domain_migration.md)
 
 ### Setup, Security & Migration
-* [Getting Started Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/getting-started.md)
-* [Node Enrollment & Onboarding](file:///d:/Coding/Major%20Project/PersonalServer/docs/node-enrollment.md)
-* [Troubleshooting & Runbook](file:///d:/Coding/Major%20Project/PersonalServer/docs/troubleshooting.md)
-* [Security Model & Threat Assessment](file:///d:/Coding/Major%20Project/PersonalServer/docs/security.md)
-* [Networking & Ingress Architecture](file:///d:/Coding/Major%20Project/PersonalServer/docs/networking.md)
-* [Hardware Migration Plan (Raspberry Pi & Android)](file:///d:/Coding/Major%20Project/PersonalServer/docs/hardware_migration_plan.md)
-* [Raspberry Pi OS Deployment & FHS Mapping](file:///d:/Coding/Major%20Project/PersonalServer/docs/raspberry_pi_migration.md)
-* [Multi-Node Simulation Suite](file:///d:/Coding/Major%20Project/PersonalServer/docs/multi_node_simulation.md)
-* [Reproducible Development, CI & Backup](file:///d:/Coding/Major%20Project/PersonalServer/docs/reproducible_setup.md)
-* [Development & Testing Guide](file:///d:/Coding/Major%20Project/PersonalServer/docs/development.md)
-* [Evolution & Roadmap](file:///d:/Coding/Major%20Project/PersonalServer/docs/roadmap.md)
+* [Getting Started Guide](file:///docs/getting-started.md)
+* [Node Enrollment & Onboarding](file:///docs/node-enrollment.md)
+* [Troubleshooting & Runbook](file:///docs/troubleshooting.md)
+* [Security Model & Threat Assessment](file:///docs/security.md)
+* [Networking & Ingress Architecture](file:///docs/networking.md)
+* [Hardware Migration Plan (Raspberry Pi & Android)](file:///docs/hardware_migration_plan.md)
+* [Raspberry Pi OS Deployment & FHS Mapping](file:///docs/raspberry_pi_migration.md)
+* [Multi-Node Simulation Suite](file:///docs/multi_node_simulation.md)
+* [Reproducible Development, CI & Backup](file:///docs/reproducible_setup.md)
+* [Development & Testing Guide](file:///docs/development.md)
+* [Evolution & Roadmap](file:///docs/roadmap.md)

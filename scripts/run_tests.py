@@ -30,14 +30,22 @@ UNIT_TEST_FILES = [
     "tests/test_reproducibility.py",
     "tests/test_security_audit.py",
     "tests/test_logging_diagnostics.py",
+    "tests/test_node_telemetry.py",
 ]
 
-# Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing
+# Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing, HA
 INTEGRATION_TEST_FILES = [
     "tests/test_reliable_job_lifecycle.py",
     "tests/test_multi_node_simulation.py",
     "tests/test_image_build_deploy.py",
     "tests/test_local_worker.py",
+    "tests/test_ha_failover.py",
+    "tests/test_ha_global_header.py",
+    "tests/test_ha_leader_identity_audit.py",
+    "tests/test_jobs_cancellation_and_pagination.py",
+    "tests/test_nodes_diagnostics_and_failover.py",
+    "tests/test_shell_layout_stability.py",
+    "tests/test_dashboard_js_syntax.py",
     "tests/test_phase15a_image_deployment.py",
     "tests/test_phase14c_deboarding.py",
     "tests/test_phase14b_telemetry.py",
