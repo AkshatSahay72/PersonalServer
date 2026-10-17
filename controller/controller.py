@@ -31,6 +31,20 @@ sys.path.insert(0, str(BASE_DIR))
 from common.time_utils import get_current_iso_timestamp
 from common.crypto_utils import constant_time_compare
 from common.storage_utils import resolve_safe_path, validate_app_id
+from controller.stores import (
+    DB_LOCK,
+    ONBOARDING_LOCK,
+    APPS_LOCK,
+    load_nodes_db,
+    save_nodes_db,
+    load_jobs_db,
+    save_jobs_db,
+    load_apps_db,
+    save_apps_db,
+    load_onboarding_codes_db,
+    save_onboarding_codes_db,
+    set_state_version_bumper,
+)
 
 # Import ResourceScheduler
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness, extract_node_telemetry
@@ -100,9 +114,6 @@ DEFAULT_ONBOARDING_TTL_SEC = RUNTIME_CFG.onboarding_ttl_sec # 15 minutes (second
 PORT_RANGE_START = 18000
 PORT_RANGE_END = 18999
 
-DB_LOCK = threading.RLock()
-ONBOARDING_LOCK = threading.Lock()
-APPS_LOCK = threading.Lock()
 APP_STORAGE_ROOT = (PATHS.storage_dir / "applications").resolve()
 
 # High Availability (HA) Manager
@@ -115,6 +126,16 @@ from config.ha_manager import (
 )
 
 HA_MANAGER = None
+
+
+def _bump_ha_state_version():
+    if HA_MANAGER:
+        try:
+            HA_MANAGER.bump_state_version()
+        except Exception:
+            pass
+
+set_state_version_bumper(_bump_ha_state_version)
 
 
 def get_ha_manager(paths=None, role="auto", node_id=None, node_url=None, force_reload=False):
@@ -266,149 +287,8 @@ def get_or_create_enrollment_token():
     return token
 
 
-# ------------------------------------------------------------------------------
-# Storage Helpers
-# ------------------------------------------------------------------------------
-
-def load_nodes_db():
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        nodes_file = paths.nodes_file
-        backup_file = paths.backup_nodes_file
-        if nodes_file.exists():
-            try:
-                with open(nodes_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Warning: Corrupt {nodes_file} ({e}). Attempting rollback to backup...", file=sys.stderr)
-                if backup_file.exists():
-                    try:
-                        with open(backup_file, "r", encoding="utf-8") as bf:
-                            return json.load(bf)
-                    except Exception:
-                        pass
-        return {"cluster_name": "PersonalServer", "nodes": {}}
-
-
-def save_nodes_db(db):
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        nodes_file = paths.nodes_file
-        backup_file = paths.backup_nodes_file
-        temp_file = nodes_file.with_suffix(".tmp")
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(db, f, indent=2)
-
-        if nodes_file.exists():
-            try:
-                shutil.copy2(nodes_file, backup_file)
-            except Exception:
-                pass
-
-        temp_file.replace(nodes_file)
-        if HA_MANAGER:
-            try:
-                HA_MANAGER.bump_state_version()
-            except Exception:
-                pass
-
-
-def load_jobs_db():
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        jobs_file = paths.jobs_file
-        backup_file = paths.backup_jobs_file
-        if jobs_file.exists():
-            try:
-                with open(jobs_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Warning: Corrupt {jobs_file} ({e}). Rolling back to backup...", file=sys.stderr)
-                if backup_file.exists():
-                    try:
-                        with open(backup_file, "r", encoding="utf-8") as bf:
-                            recovered = json.load(bf)
-                        # Self-heal primary file from valid backup
-                        try:
-                            shutil.copy2(backup_file, jobs_file)
-                        except Exception:
-                            pass
-                        return recovered
-                    except Exception:
-                        pass
-        return {"jobs": {}}
-
-
-def save_jobs_db(db):
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        jobs_file = paths.jobs_file
-        backup_file = paths.backup_jobs_file
-        temp_file = jobs_file.with_suffix(".tmp")
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(db, f, indent=2)
-
-        if jobs_file.exists():
-            try:
-                shutil.copy2(jobs_file, backup_file)
-            except Exception:
-                pass
-
-        temp_file.replace(jobs_file)
-        if HA_MANAGER:
-            try:
-                HA_MANAGER.bump_state_version()
-            except Exception:
-                pass
-
-
-def load_apps_db():
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        apps_file = paths.apps_file
-        backup_file = paths.backup_apps_file
-        if apps_file.exists():
-            try:
-                with open(apps_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Warning: Corrupt {apps_file} ({e}). Rolling back to backup...", file=sys.stderr)
-                if backup_file.exists():
-                    try:
-                        with open(backup_file, "r", encoding="utf-8") as bf:
-                            return json.load(bf)
-                    except Exception:
-                        pass
-        return {"apps": {}}
-
-
-def save_apps_db(db):
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        apps_file = paths.apps_file
-        backup_file = paths.backup_apps_file
-        temp_file = apps_file.with_suffix(".tmp")
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(db, f, indent=2)
-
-        if apps_file.exists():
-            try:
-                shutil.copy2(apps_file, backup_file)
-            except Exception:
-                pass
-
-        temp_file.replace(apps_file)
-        if HA_MANAGER:
-            try:
-                HA_MANAGER.bump_state_version()
-            except Exception:
-                pass
+# Note: Persistence store helpers (load_nodes_db, save_nodes_db, load_jobs_db,
+# save_jobs_db, load_apps_db, save_apps_db) have been extracted to controller.stores.
 
 
 def allocate_host_port(apps_db):
@@ -780,44 +660,7 @@ def hash_onboarding_code(code: str) -> str:
     return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
 
 
-def load_onboarding_codes_db():
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        codes_file = paths.onboarding_codes_file
-        backup_file = paths.backup_onboarding_codes_file
-        if codes_file.exists():
-            try:
-                with open(codes_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Warning: Corrupt {codes_file} ({e}). Checking backup...", file=sys.stderr)
-                if backup_file.exists():
-                    try:
-                        with open(backup_file, "r", encoding="utf-8") as bf:
-                            return json.load(bf)
-                    except Exception:
-                        pass
-        return {"codes": {}}
-
-
-def save_onboarding_codes_db(db):
-    paths = get_controller_paths()
-    with DB_LOCK:
-        paths.ensure_directories()
-        codes_file = paths.onboarding_codes_file
-        backup_file = paths.backup_onboarding_codes_file
-        temp_file = codes_file.with_suffix(".tmp")
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(db, f, indent=2)
-
-        if codes_file.exists():
-            try:
-                shutil.copy2(codes_file, backup_file)
-            except Exception:
-                pass
-
-        temp_file.replace(codes_file)
+# Note: load_onboarding_codes_db and save_onboarding_codes_db have been extracted to controller.stores.
 
 
 def generate_onboarding_code(ttl_seconds=DEFAULT_ONBOARDING_TTL_SEC):

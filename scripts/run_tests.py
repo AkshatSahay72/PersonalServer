@@ -24,6 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Unit test suites: Pure Python, in-memory, no sockets, no background threads
 UNIT_TEST_FILES = [
     "tests/test_common_utils.py",
+    "tests/test_persistence_stores.py",
     "tests/test_platform_config.py",
     "tests/test_portable_config.py",
     "tests/test_reproducibility.py",
