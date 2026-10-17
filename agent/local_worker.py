@@ -28,6 +28,7 @@ from typing import Dict, Any, Optional, Set
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from common.arch_utils import get_canonical_architecture
 from config.platform_config import get_controller_paths, redact_sensitive_dict
 from agent.job_executor import (
     JobExecutor,
@@ -83,20 +84,6 @@ DOCKER_WORKLOADS: Set[str] = {
 }
 
 
-def get_canonical_architecture() -> str:
-    """Normalize local CPU architecture to cluster standard."""
-    machine = platform.machine().strip().lower()
-    mapping = {
-        "amd64": "amd64",
-        "x86_64": "amd64",
-        "x64": "amd64",
-        "arm64": "arm64",
-        "aarch64": "arm64",
-        "armv7l": "armv7",
-        "i386": "386",
-        "x86": "386"
-    }
-    return mapping.get(machine, machine)
 
 
 def probe_hardware_resources(base_dir: Optional[Path] = None) -> Dict[str, Any]:

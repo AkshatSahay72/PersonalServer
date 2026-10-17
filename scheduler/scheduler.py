@@ -11,6 +11,12 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from common.arch_utils import ARCH_MAP, normalize_architecture
+
 # Centralized Node State Constants
 STATE_ONLINE = "ONLINE"
 STATE_DRAINING = "DRAINING"
@@ -21,31 +27,6 @@ STATE_REMOVED = "REMOVED"
 STATE_UNKNOWN = "UNKNOWN"
 
 DEFAULT_HEARTBEAT_TIMEOUT = 60  # seconds
-
-ARCH_MAP = {
-    "aarch64": "arm64",
-    "arm64": "arm64",
-    "arm64v8": "arm64",
-    "linux/arm64": "arm64",
-    "x86_64": "amd64",
-    "amd64": "amd64",
-    "x64": "amd64",
-    "linux/amd64": "amd64",
-    "armv7": "armv7",
-    "armv7l": "armv7",
-    "armhf": "armv7",
-    "i386": "386",
-    "x86": "386",
-    "386": "386"
-}
-
-
-def normalize_architecture(arch):
-    """Normalize node or image architecture string to canonical form."""
-    if not arch or not isinstance(arch, str):
-        return ""
-    clean = arch.strip().lower()
-    return ARCH_MAP.get(clean, clean.split("/")[-1])
 
 
 def parse_memory_mb(mem_str):

@@ -6,6 +6,7 @@ Validates container image references, determines target architecture
 compatibility, inspects exposed application ports, and manages caching.
 """
 
+import sys
 import re
 import json
 import time
@@ -14,25 +15,15 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
-# Standard architecture aliases mapped to canonical identifiers
-ARCH_MAP = {
-    "aarch64": "arm64",
-    "arm64": "arm64",
-    "arm64v8": "arm64",
-    "linux/arm64": "arm64",
-    "x86_64": "amd64",
-    "amd64": "amd64",
-    "x64": "amd64",
-    "linux/amd64": "amd64",
-    "armv7": "armv7",
-    "armv7l": "armv7",
-    "armhf": "armv7",
-    "linux/arm/v7": "armv7",
-    "i386": "386",
-    "x86": "386",
-    "386": "386",
-    "linux/386": "386"
-}
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from common.arch_utils import (
+    ARCH_MAP,
+    normalize_architecture,
+    is_architecture_compatible,
+)
 
 # Image reference regex matching standard OCI/Docker image format:
 # [registry/][user/]image[:tag]
@@ -44,14 +35,6 @@ IMAGE_REF_REGEX = re.compile(
 )
 
 LOCAL_IMAGE_STORE_DIR = Path(__file__).resolve().parent.parent / "storage" / "images"
-
-
-def normalize_architecture(arch: Optional[str]) -> str:
-    """Normalizes arbitrary architecture strings (e.g. 'aarch64', 'linux/arm64') to canonical form."""
-    if not arch or not isinstance(arch, str):
-        return ""
-    clean = arch.strip().lower()
-    return ARCH_MAP.get(clean, clean.split("/")[-1])
 
 
 def validate_image_reference(image_str: str) -> Dict[str, Any]:
@@ -190,17 +173,6 @@ def get_local_image_metadata(
     return None
 
 
-def is_architecture_compatible(node_arch: str, supported_architectures: Any) -> bool:
-    """Checks whether a node's architecture is satisfied by the image's supported architectures."""
-    if not supported_architectures:
-        return True  # If unknown, allow scheduling and let node verify
-
-    if isinstance(supported_architectures, str):
-        supported_architectures = [supported_architectures]
-
-    norm_node = normalize_architecture(node_arch)
-    norm_supported = {normalize_architecture(a) for a in supported_architectures if a}
-    return norm_node in norm_supported
 
 
 def detect_image_architectures(image_ref: str, timeout: int = 5, store_dir: Optional[Path] = None) -> List[str]:

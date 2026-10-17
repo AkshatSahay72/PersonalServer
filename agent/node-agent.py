@@ -55,8 +55,7 @@ HEALTH_SCRIPT = SCRIPTS_DIR / "health.sh"
 DEFAULT_CONTROLLER_URL = os.environ.get("PERSONALSERVER_CONTROLLER_URL", "http://127.0.0.1:8000")
 
 
-def get_current_iso_timestamp():
-    return datetime.now(timezone.utc).isoformat()
+from common.time_utils import get_current_iso_timestamp
 
 
 import shlex

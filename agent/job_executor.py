@@ -17,16 +17,22 @@ import urllib.error
 import threading
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 from config.structured_logger import redact_sensitive_text, extract_correlation_id
-from controller.image_inspector import (
-    validate_image_reference,
+from common.arch_utils import (
     normalize_architecture,
     is_architecture_compatible,
+    get_canonical_architecture,
+)
+from controller.image_inspector import (
+    validate_image_reference,
     save_local_image_metadata,
-    get_local_image_metadata
+    get_local_image_metadata,
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
 RUNTIME_DIR = BASE_DIR / "runtime"
 JOBS_RUNTIME_DIR = RUNTIME_DIR / "jobs"
@@ -106,21 +112,6 @@ def is_image_cached(image: str, runtime: str = "docker") -> bool:
     return False
 
 
-def get_canonical_architecture() -> str:
-    """Returns normalized CPU architecture for the current machine."""
-    import platform
-    machine = platform.machine().strip().lower()
-    mapping = {
-        "amd64": "amd64",
-        "x86_64": "amd64",
-        "x64": "amd64",
-        "arm64": "arm64",
-        "aarch64": "arm64",
-        "armv7l": "armv7",
-        "i386": "386",
-        "x86": "386"
-    }
-    return mapping.get(machine, machine)
 
 
 def validate_docker_identifier(val, name="Identifier"):

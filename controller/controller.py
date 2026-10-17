@@ -28,6 +28,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from common.time_utils import get_current_iso_timestamp
+from common.crypto_utils import constant_time_compare
+from common.storage_utils import resolve_safe_path, validate_app_id
+
 # Import ResourceScheduler
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness, extract_node_telemetry
 from config.platform_config import (
@@ -127,32 +131,14 @@ def get_ha_manager(paths=None, role="auto", node_id=None, node_url=None, force_r
         )
         HA_MANAGER.initialize()
     return HA_MANAGER
-def constant_time_compare(val1, val2) -> bool:
-    """
-    Constant-time comparison for secrets and tokens to prevent timing attacks.
-    Returns False if either operand is empty, None, or not a string/bytes.
-    """
-    if not val1 or not val2:
-        return False
-    if not isinstance(val1, (str, bytes)) or not isinstance(val2, (str, bytes)):
-        return False
-    try:
-        return hmac.compare_digest(val1, val2)
-    except Exception:
-        return False
-
-
-
 def resolve_safe_app_storage_path(app_id, rel_path=""):
     """
     Resolves and sandboxes paths strictly within the application's storage namespace:
     ~/PersonalServer/storage/applications/<app_id>/
     """
-    if not app_id or not re.match(r'^[a-zA-Z0-9_-]+$', app_id):
-        raise ValueError("Invalid application ID")
-    
+    validate_app_id(app_id)
     app_base = (APP_STORAGE_ROOT / app_id).resolve()
-    
+
     # Initialize starter structure if app directory does not exist yet
     if not app_base.exists():
         app_base.mkdir(parents=True, exist_ok=True)
@@ -169,14 +155,11 @@ def resolve_safe_app_storage_path(app_id, rel_path=""):
                 encoding="utf-8"
             )
 
-    rel_clean = (rel_path or "").replace("\\", "/").strip().lstrip("/")
-    target = (app_base / rel_clean).resolve()
-    
     try:
-        target.relative_to(app_base)
+        target = resolve_safe_path(app_base, rel_path)
     except ValueError:
         raise ValueError("Access Denied: Path escapes application storage sandbox")
-        
+
     return target, app_base
 
 
@@ -256,8 +239,6 @@ ALLOWLISTED_WORKLOADS = {
 }
 
 
-def get_current_iso_timestamp():
-    return datetime.now(timezone.utc).isoformat()
 
 
 def ensure_directories():

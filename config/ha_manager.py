@@ -46,8 +46,7 @@ class HAFailureMode:
     UNKNOWN = "UNKNOWN"
 
 
-def get_current_iso_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from common.time_utils import get_current_iso_timestamp
 
 
 def resolve_controller_node_id(node_id: Optional[str] = None, paths=None) -> str:

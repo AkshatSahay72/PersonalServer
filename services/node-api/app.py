@@ -29,6 +29,9 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE_DIR))
+from common.time_utils import get_current_iso_timestamp
+from common.crypto_utils import constant_time_compare
+from common.storage_utils import resolve_safe_path
 from config.platform_config import get_platform_config
 from config.structured_logger import (
     extract_correlation_id,
@@ -255,19 +258,6 @@ def load_config():
     return config
 
 
-def constant_time_compare(val1, val2) -> bool:
-    """
-    Constant-time comparison for secrets and tokens to prevent timing attacks.
-    Returns False if either operand is empty, None, or not a string/bytes.
-    """
-    if not val1 or not val2:
-        return False
-    if not isinstance(val1, (str, bytes)) or not isinstance(val2, (str, bytes)):
-        return False
-    try:
-        return hmac.compare_digest(val1, val2)
-    except Exception:
-        return False
 
 
 def command(cmd):
@@ -366,7 +356,7 @@ def get_health(correlation_id=None):
         },
         "system": get_system_info(),
         "correlation_id": correlation_id or generate_correlation_id(),
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": get_current_iso_timestamp()
     }
 
 
@@ -377,38 +367,7 @@ def resolve_safe_storage_path(relative_path_str: str) -> Path:
     and outside directory access.
     """
     ensure_storage_root()
-    
-    if not relative_path_str:
-        return STORAGE_ROOT
-
-    # Reject null bytes
-    if "\0" in relative_path_str:
-        raise ValueError("Invalid path: Null byte detected")
-
-    # Reject absolute path escapes or drive letters
-    if relative_path_str.startswith("/") or relative_path_str.startswith("\\") or (len(relative_path_str) > 1 and relative_path_str[1] == ":"):
-        raise ValueError("Access Denied: Absolute path escape detected")
-
-    # Normalize backslashes to forward slashes
-    clean_path = relative_path_str.replace("\\", "/")
-
-    # Check for prohibited segments
-    parts = Path(clean_path).parts
-    if ".." in parts or any(".." in p for p in parts):
-        raise ValueError("Access Denied: Path traversal detected")
-
-    norm_rel = os.path.normpath(clean_path).lstrip("./\\")
-    target = (STORAGE_ROOT / norm_rel).resolve()
-
-    # Strict containment check
-    try:
-        common = os.path.commonpath([str(target), str(STORAGE_ROOT)])
-        if os.path.abspath(common) != str(STORAGE_ROOT):
-            raise ValueError("Access Denied: Path escapes storage root")
-    except Exception as e:
-        raise ValueError(f"Access Denied: Path verification failed ({e})")
-
-    return target
+    return resolve_safe_path(STORAGE_ROOT, relative_path_str)
 
 
 class NodeAPIHandler(BaseHTTPRequestHandler):
