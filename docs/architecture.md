@@ -67,7 +67,9 @@ PersonalServer is a modular, lightweight, distributed edge computing and cluster
 
 ### 2.1 Modular Cluster Controller & High Availability (`controller/`, `config/ha_manager.py`)
 * **Decoupled Architecture**: Structured into clean, testable domain modules:
-  * `controller/controller.py`: HTTP entry point, API endpoint routing, and CLI dispatch.
+  * `controller/controller.py`: Thin entry point (<350 lines) and compatibility facade re-exporting public symbols.
+  * `controller/cli.py`: Administrative CLI dispatch and server launcher.
+  * `controller/http/`: Standardized BaseHandler, domain route handlers (`ha_routes`, `node_routes`, `job_routes`, `app_routes`), and ControllerHandler.
   * `controller/constants.py`: Centralized node, job, and app lifecycle state machines.
   * `controller/ha_helper.py`: Leader lease versioning and HAManager singleton resolution.
   * `controller/blueprints.py`: PersonalServer blueprint validation, host port allocation, and GitHub source fetcher.

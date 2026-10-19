@@ -8,7 +8,15 @@ The Controller is the central orchestrator for node discovery, liveness tracking
 
 The controller package is structured into decoupled, maintainable domain modules:
 
-- **`controller/controller.py`**: Central HTTP entry point, route dispatch, API handlers, CLI command implementations, and server loop.
+- **`controller/controller.py`**: Thin application entry point and backward-compatibility facade (<350 lines) re-exporting public interfaces and constants.
+- **`controller/cli.py`**: Administrative command-line interface (CLI) dispatch and server startup logic.
+- **`controller/http/`**: Modular HTTP request handling and routing package:
+  - `base_handler.py`: Base HTTP handler providing standardized JSON responses, CORS headers, auth token parsing, and leader write permission guarding.
+  - `ha_routes.py`: Health checks, High Availability (HA) status, leader election, lease heartbeats, and standby synchronization.
+  - `node_routes.py`: Node registration, heartbeat ingestion, cluster telemetry, deboarding safety evaluation, and node removal.
+  - `job_routes.py`: Workload job submission, worker lease claims (`/nodes/<id>/jobs/next`), execution result reporting, exponential retry backoff, and cancellation.
+  - `app_routes.py`: Containerized application lifecycle (`/apps`), GitHub source inspection, blueprint validation, environment variable management, and application storage file explorer.
+  - `handler.py`: `ControllerHandler` class dispatching incoming requests across the domain route modules.
 - **`controller/constants.py`**: Node, job, and application lifecycle states (`STATE_*`, `JOB_STATE_*`, `APP_STATE_*`), state transition validation (`validate_job_transition`), workload allowlists, and port range constraints.
 - **`controller/ha_helper.py`**: Centralized High Availability (HA) state versioning callbacks and singleton `HAManager` instance resolution.
 - **`controller/blueprints.py`**: Application blueprint validation (`personalserver.yaml`), host port allocation (`PORT_RANGE_START`..`PORT_RANGE_END`), route collision avoidance, sandboxed GitHub source fetching, and secret masking.
