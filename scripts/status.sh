@@ -12,6 +12,7 @@ CONFIG_DIR="$BASE_DIR/config"
 NODE_JSON="$CONFIG_DIR/node.json"
 NODE_CONF="$CONFIG_DIR/node.conf"
 NODE_API_PID_FILE="$RUNTIME_DIR/node-api.pid"
+NODE_WORKER_PID_FILE="$RUNTIME_DIR/node-worker.pid"
 CLOUDFLARED_PID_FILE="$RUNTIME_DIR/cloudflared.pid"
 CLOUDFLARED_LOG="$LOGS_DIR/cloudflared.log"
 
@@ -100,7 +101,33 @@ fi
 echo
 
 # ------------------------------------------------------------------------------
-# 2. Cloudflare Tunnel Status
+# 2. Node Worker Status
+# ------------------------------------------------------------------------------
+echo "Node Worker"
+worker_pid=""
+if [ -f "$NODE_WORKER_PID_FILE" ]; then
+    worker_pid=$(cat "$NODE_WORKER_PID_FILE" 2>/dev/null)
+fi
+
+if [ -n "$worker_pid" ] && kill -0 "$worker_pid" 2>/dev/null && ps -p "$worker_pid" -o args= 2>/dev/null | grep -q "agent/node-agent.py work"; then
+    echo "  Process: running"
+    echo "  PID: $worker_pid"
+else
+    detected_worker_pid=$(pgrep -f "agent/node-agent.py work" | head -n 1)
+    if [ -n "$detected_worker_pid" ]; then
+        echo "  Process: running (untracked PID)"
+        echo "  PID: $detected_worker_pid"
+    else
+        echo "  Process: stopped"
+        echo "  PID: -"
+        all_healthy=false
+    fi
+fi
+
+echo
+
+# ------------------------------------------------------------------------------
+# 3. Cloudflare Tunnel Status
 # ------------------------------------------------------------------------------
 echo "Cloudflare"
 cf_pid=""

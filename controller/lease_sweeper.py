@@ -24,6 +24,7 @@ from controller.constants import (
     STATE_REMOVED,
 )
 from controller.ha_helper import get_ha_manager
+from controller.notifications import notify_job_failure
 from controller.stores import load_jobs_db, load_nodes_db, save_jobs_db
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness
 
@@ -76,6 +77,9 @@ def sweep_expired_leases(
                 max_attempts=max_attempts,
                 reason=reason
             )
+
+            # Deduplicated failure alert
+            notify_job_failure(job, reason, is_terminal=False)
 
             # Record history
             attempts_history = job.setdefault("attempts_history", [])
@@ -155,6 +159,7 @@ def sweep_expired_leases(
                     node_id=target_node,
                     reason=job["retry_reason"]
                 )
+                notify_job_failure(job, job["retry_reason"], is_terminal=True)
 
             changed = True
 

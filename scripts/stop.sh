@@ -7,6 +7,7 @@
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUNTIME_DIR="$BASE_DIR/runtime"
 NODE_API_PID_FILE="$RUNTIME_DIR/node-api.pid"
+NODE_WORKER_PID_FILE="$RUNTIME_DIR/node-worker.pid"
 CLOUDFLARED_PID_FILE="$RUNTIME_DIR/cloudflared.pid"
 
 echo "=========================================="
@@ -75,11 +76,14 @@ stop_process() {
 stop_process "Node API" "$NODE_API_PID_FILE" "services/node-api/app.py"
 node_api_stopped=$?
 
+stop_process "Node Worker" "$NODE_WORKER_PID_FILE" "agent/node-agent.py work"
+node_worker_stopped=$?
+
 stop_process "Cloudflare Tunnel" "$CLOUDFLARED_PID_FILE" "cloudflared"
 cloudflared_stopped=$?
 
 echo "=========================================="
-if [ $node_api_stopped -eq 0 ] && [ $cloudflared_stopped -eq 0 ]; then
+if [ $node_api_stopped -eq 0 ] && [ $node_worker_stopped -eq 0 ] && [ $cloudflared_stopped -eq 0 ]; then
     echo "PersonalServer services stopped successfully."
     exit 0
 else

@@ -13,11 +13,14 @@ SECRETS_DIR="$CONFIG_DIR/secrets"
 mkdir -p "$RUNTIME_DIR" "$LOGS_DIR"
 
 NODE_API_PID_FILE="$RUNTIME_DIR/node-api.pid"
+NODE_WORKER_PID_FILE="$RUNTIME_DIR/node-worker.pid"
 CLOUDFLARED_PID_FILE="$RUNTIME_DIR/cloudflared.pid"
 NODE_API_LOG="$LOGS_DIR/node-api.log"
+NODE_WORKER_LOG="$LOGS_DIR/node-worker.log"
 CLOUDFLARED_LOG="$LOGS_DIR/cloudflared.log"
 TOKEN_FILE="$SECRETS_DIR/cloudflared.token"
 NODE_API_SCRIPT="$BASE_DIR/services/node-api/app.py"
+NODE_AGENT_SCRIPT="$BASE_DIR/agent/node-agent.py"
 
 echo "=========================================="
 echo " PersonalServer - Starting Services"
@@ -129,8 +132,50 @@ if [ "$cloudflared_running" = false ]; then
     fi
 fi
 
+# ------------------------------------------------------------------------------
+# 3. Start Node Worker Daemon
+# ------------------------------------------------------------------------------
+echo -n "Starting Node Worker... "
+
+node_worker_running=false
+if [ -f "$NODE_WORKER_PID_FILE" ]; then
+    stored_worker_pid=$(cat "$NODE_WORKER_PID_FILE" 2>/dev/null)
+    if is_pid_running "$stored_worker_pid" "agent/node-agent.py work"; then
+        echo "already running (PID: $stored_worker_pid)"
+        node_worker_running=true
+    else
+        rm -f "$NODE_WORKER_PID_FILE"
+    fi
+fi
+
+if [ "$node_worker_running" = false ]; then
+    existing_worker_pid=$(pgrep -f "agent/node-agent.py work" | head -n 1)
+    if [ -n "$existing_worker_pid" ]; then
+        echo "$existing_worker_pid" > "$NODE_WORKER_PID_FILE"
+        echo "already running (PID: $existing_worker_pid, PID file recovered)"
+        node_worker_running=true
+    else
+        if [ ! -f "$NODE_AGENT_SCRIPT" ]; then
+            echo "FAILED (Script missing: $NODE_AGENT_SCRIPT)"
+        else
+            nohup python "$NODE_AGENT_SCRIPT" work --daemon >> "$NODE_WORKER_LOG" 2>&1 &
+            new_worker_pid=$!
+            echo "$new_worker_pid" > "$NODE_WORKER_PID_FILE"
+
+            sleep 1
+            if is_pid_running "$new_worker_pid" "agent/node-agent.py work"; then
+                echo "started (PID: $new_worker_pid)"
+                node_worker_running=true
+            else
+                echo "FAILED to start. Check $NODE_WORKER_LOG"
+                rm -f "$NODE_WORKER_PID_FILE"
+            fi
+        fi
+    fi
+fi
+
 echo "=========================================="
-if [ "$node_api_running" = true ] && [ "$cloudflared_running" = true ]; then
+if [ "$node_api_running" = true ] && [ "$node_worker_running" = true ] && [ "$cloudflared_running" = true ]; then
     echo "PersonalServer services started successfully."
     exit 0
 else

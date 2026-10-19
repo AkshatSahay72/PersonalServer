@@ -13,7 +13,7 @@ from config.structured_logger import extract_correlation_id
 from controller.http.app_routes import handle_app_delete, handle_app_get, handle_app_post
 from controller.http.base_handler import BaseHandler, DEFAULT_HEARTBEAT_TIMEOUT
 from controller.http.ha_routes import handle_ha_get, handle_ha_post
-from controller.http.job_routes import handle_job_get, handle_job_post
+from controller.http.job_routes import handle_job_delete, handle_job_get, handle_job_post
 from controller.http.node_routes import handle_node_delete, handle_node_get, handle_node_post
 
 
@@ -98,11 +98,15 @@ class ControllerHandler(BaseHandler):
         if not self.check_leader_write_permission():
             return
 
-        # 1. Application Deletion Routes
+        # 1. Job Deletion Routes
+        if handle_job_delete(self, path, token):
+            return
+
+        # 2. Application Deletion Routes
         if handle_app_delete(self, path, token, query):
             return
 
-        # 2. Node Removal Routes
+        # 3. Node Removal Routes
         if handle_node_delete(self, path, token):
             return
 

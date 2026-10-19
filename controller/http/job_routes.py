@@ -46,6 +46,7 @@ from controller.constants import (
 RUNTIME_CFG = get_controller_runtime_config()
 DEFAULT_LEASE_GRACE_SEC = RUNTIME_CFG.lease_grace_sec
 from controller.lease_sweeper import sweep_expired_leases
+from controller.notifications import notify_job_failure
 from controller.onboarding import get_or_create_enrollment_token
 from controller.stores import (
     load_apps_db,
@@ -508,6 +509,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 attempt=attempt+1,
                 backoff_sec=backoff_sec
             )
+            notify_job_failure(job, f"Attempt {attempt} failed: {job_status}", is_terminal=False)
 
         else:
             # Terminal Success / Final Failure
@@ -534,6 +536,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     status=job_status,
                     exit_code=body.get("exit_code", 0)
                 )
+                notify_job_failure(job, job.get("retry_reason") or f"Job permanently failed with {job_status}", is_terminal=True)
             else:
                 controller_logger.info(
                     "job.succeeded",
@@ -823,7 +826,63 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
     return False
 
 
+def handle_job_delete(handler: Any, path: str, token: str) -> bool:
+    """
+    Handles DELETE requests for removing jobs from execution history.
+    Returns True if handled, False otherwise.
+    """
+    if not path.startswith("/jobs/"):
+        return False
+
+    job_id = path[6:].strip()
+    # Reject sub-paths if any
+    if not job_id or "/" in job_id:
+        return False
+
+    enrollment_token = get_or_create_enrollment_token()
+    if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+        handler.send_json(401, {"error": "Unauthorized: Authentication required to delete jobs"})
+        return True
+
+    jobs_db = load_jobs_db()
+    job = jobs_db.get("jobs", {}).get(job_id)
+    if not job:
+        handler.send_json(404, {"error": f"Job '{job_id}' not found"})
+        return True
+
+    # Guard: Active running / claimed jobs cannot be deleted without cancelling first
+    status = (job.get("status") or job.get("state") or "").upper()
+    if status in (JOB_STATE_RUNNING, JOB_STATE_CLAIMED):
+        handler.send_json(409, {
+            "error": f"Cannot delete job '{job_id}' while in {status} state. Cancel the job first.",
+            "status": status,
+            "job_id": job_id
+        })
+        return True
+
+    # Delete job from database
+    del jobs_db["jobs"][job_id]
+    save_jobs_db(jobs_db)
+
+    corr_id = job.get("correlation_id") or getattr(handler, "current_correlation_id", None) or generate_correlation_id()
+    controller_logger.info(
+        "job.deleted",
+        f"Job '{job_id}' ({job.get('type')}) deleted successfully from history.",
+        correlation_id=corr_id,
+        job_id=job_id,
+        status=status
+    )
+
+    handler.send_json(200, {
+        "status": "DELETED",
+        "job_id": job_id,
+        "message": f"Job '{job_id}' deleted successfully."
+    })
+    return True
+
+
 __all__ = [
     "handle_job_get",
     "handle_job_post",
+    "handle_job_delete",
 ]

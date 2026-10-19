@@ -334,6 +334,25 @@ def cancel_job(job_id: str) -> int:
     return 0
 
 
+def delete_job(job_id: str, force: bool = False) -> int:
+    """Deletes a job from execution history."""
+    jobs_db = load_jobs_db()
+    job = jobs_db.get("jobs", {}).get(job_id)
+    if not job:
+        print(f"Error: Job '{job_id}' not found.", file=sys.stderr)
+        return 1
+
+    status = (job.get("status") or job.get("state") or "").upper()
+    if status in (JOB_STATE_RUNNING, JOB_STATE_CLAIMED) and not force:
+        print(f"Error: Job '{job_id}' is currently in active state '{status}'. Cancel it first or pass force=True.", file=sys.stderr)
+        return 1
+
+    del jobs_db["jobs"][job_id]
+    save_jobs_db(jobs_db)
+    print(f"Job '{job_id}' deleted successfully from history.")
+    return 0
+
+
 def list_nodes(filter_status: Optional[str] = None) -> None:
     """Lists registered cluster nodes."""
     nodes_db = load_nodes_db()
@@ -487,6 +506,11 @@ def main(args_list: Optional[list] = None) -> None:
     p_cancel = subparsers.add_parser("cancel", help="Cancel a queued or running job")
     p_cancel.add_argument("job_id", help="Job ID to cancel")
 
+    # delete-job command
+    p_del_job = subparsers.add_parser("delete-job", help="Delete a job from execution history")
+    p_del_job.add_argument("job_id", help="Job ID to delete")
+    p_del_job.add_argument("--force", action="store_true", help="Force deletion even if active")
+
     # token command
     subparsers.add_parser("token", help="Display enrollment token file path")
 
@@ -520,6 +544,8 @@ def main(args_list: Optional[list] = None) -> None:
         sys.exit(show_job_details(args.job_id))
     elif args.command == "cancel":
         sys.exit(cancel_job(args.job_id))
+    elif args.command == "delete-job":
+        sys.exit(delete_job(args.job_id, getattr(args, "force", False)))
     elif args.command == "token":
         get_or_create_enrollment_token()
         print(f"Enrollment token stored at: {ENROLLMENT_TOKEN_FILE}")
@@ -540,6 +566,7 @@ __all__ = [
     "list_jobs",
     "show_job_details",
     "cancel_job",
+    "delete_job",
     "list_nodes",
     "show_node_details",
     "show_cluster",

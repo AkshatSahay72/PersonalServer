@@ -1301,6 +1301,7 @@ def start_heartbeat_reporter(interval_seconds=15):
                         sys_info = get_system_info()
                         services_info = {
                             "node_api": "running",
+                            "node_worker": "running" if (is_service_running("agent/node-agent.py work") or is_service_running("node-agent.py work") or is_service_running("local_worker")) else "stopped",
                             "cloudflare": "running" if is_service_running("cloudflared") else "stopped"
                         }
 

@@ -179,6 +179,7 @@ from controller.http import (
 # CLI Administration & Server Launcher
 from controller.cli import (
     cancel_job,
+    delete_job,
     list_jobs,
     list_nodes,
     main,
@@ -292,6 +293,7 @@ __all__ = [
     "list_jobs",
     "show_job_details",
     "cancel_job",
+    "delete_job",
     "list_nodes",
     "show_node_details",
     "show_cluster",

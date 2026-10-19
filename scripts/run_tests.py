@@ -32,6 +32,8 @@ UNIT_TEST_FILES = [
     "tests/test_logging_diagnostics.py",
     "tests/test_node_telemetry.py",
     "tests/test_cross_platform_reliability.py",
+    "tests/test_notifications.py",
+    "tests/test_job_deletion.py",
 ]
 
 # Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing, HA

@@ -1300,17 +1300,8 @@ def cmd_registration_status(args):
     return 0
 
 
-def cmd_work(args):
-    """Fetch and execute pending jobs assigned to this node by the controller."""
-    reg_state = load_registration_state()
-    if not reg_state or not reg_state.get("registered"):
-        print("Error: Node is not registered. Run 'python agent/node-agent.py register' first.", file=sys.stderr)
-        return 1
-
-    controller_url = (args.controller or reg_state.get("controller_url") or get_default_controller_url()).rstrip("/")
-    auth_token = reg_state.get("auth_token", "")
-    node_id = reg_state.get("node_id", "")
-
+def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon=False):
+    """Polls controller for the next job assigned to node_id, executes it, and submits results."""
     fetch_url = f"{controller_url}/nodes/{node_id}/jobs/next"
     req = urllib.request.Request(
         fetch_url,
@@ -1320,15 +1311,17 @@ def cmd_work(args):
         }
     )
 
-    print(f"Checking for pending jobs at {controller_url}...")
+    if not is_daemon:
+        print(f"Checking for pending jobs at {controller_url}...")
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode("utf-8"))
             job = data.get("job")
 
             if not job:
-                print("No pending jobs assigned to this node.")
-                return 0
+                if not is_daemon:
+                    print("No pending jobs assigned to this node.")
+                return False, True
 
             job_id = job.get("job_id")
             corr_id = job.get("correlation_id") or extract_correlation_id(body=job)
@@ -1375,16 +1368,70 @@ def cmd_work(args):
 
             with urllib.request.urlopen(res_req, timeout=5) as res_resp:
                 ack_data = json.loads(res_resp.read().decode("utf-8"))
-                print(f"-> Result reported to controller: {ack_data.get('job_status')}")
+                ack_status = ack_data.get("job_status") or ack_data.get("status") or "ACK"
+                print(f"-> Result reported to controller: {ack_status}")
 
-            return 0
+            return True, True
 
     except urllib.error.HTTPError as e:
         print(f"HTTP Error (HTTP {e.code}): {e.reason}", file=sys.stderr)
-        return 1
+        return False, False
     except Exception as e:
         print(f"Work Execution Error: {e}", file=sys.stderr)
+        return False, False
+
+
+def cmd_work(args):
+    """Fetch and execute pending jobs assigned to this node by the controller."""
+    reg_state = load_registration_state()
+    if not reg_state or not reg_state.get("registered"):
+        print("Error: Node is not registered. Run 'python agent/node-agent.py register' first.", file=sys.stderr)
         return 1
+
+    controller_url = (args.controller or reg_state.get("controller_url") or get_default_controller_url()).rstrip("/")
+    auth_token = reg_state.get("auth_token", "")
+    node_id = reg_state.get("node_id", "")
+    is_daemon = getattr(args, "daemon", False)
+    interval = max(1, getattr(args, "interval", 5))
+
+    if not is_daemon:
+        job_processed, success = _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon=False)
+        return 0 if success else 1
+
+    print("==========================================")
+    print(" PersonalServer Node Worker Daemon")
+    print("==========================================")
+    print(f"Node ID:        {node_id}")
+    print(f"Controller:     {controller_url}")
+    print(f"Poll Interval:  {interval}s")
+    print("Worker daemon running. Press Ctrl+C to stop.")
+    print("==========================================")
+
+    try:
+        while True:
+            # Refresh registration in case URL or token updated
+            curr_reg = load_registration_state()
+            if curr_reg and curr_reg.get("registered"):
+                auth_token = curr_reg.get("auth_token", auth_token)
+                if not args.controller:
+                    controller_url = (curr_reg.get("controller_url") or controller_url).rstrip("/")
+
+            job_processed, success = _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon=True)
+
+            if not success and not args.controller:
+                # Attempt HA failover if controller is unreachable
+                new_url = failover_active_controller()
+                if new_url and new_url != controller_url:
+                    print(f"-> Worker failover: switched active controller to {new_url}")
+                    controller_url = new_url
+
+            if job_processed:
+                time.sleep(0.5)
+            else:
+                time.sleep(interval)
+    except (KeyboardInterrupt, SystemExit):
+        print("\nStopping Node Worker daemon cleanly...")
+        return 0
 
 
 def cmd_exec_local(args):
@@ -1480,6 +1527,8 @@ def main():
     # Workload execution commands
     p_work = subparsers.add_parser("work", help="Poll and execute pending assigned jobs from controller")
     p_work.add_argument("--controller", help="Override controller URL")
+    p_work.add_argument("--daemon", action="store_true", help="Run continuously as a worker daemon polling for jobs")
+    p_work.add_argument("--interval", type=int, default=5, help="Polling interval in seconds (default: 5)")
 
     p_exec_local = subparsers.add_parser("exec-local", help="Directly test safe workload execution locally")
     p_exec_local.add_argument("--type", required=True, choices=list(ALLOWLISTED_WORKLOADS.keys()), help="Workload type")

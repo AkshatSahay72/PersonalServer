@@ -421,7 +421,7 @@
                   <th>Attempt</th>
                   <th>Duration</th>
                   <th>Submitted</th>
-                  <th style="width: 130px; text-align: right;">Actions</th>
+                  <th style="width: 180px; text-align: right;">Actions</th>
                 </tr>
               </thead>
               <tbody id="jobs-tbody">
@@ -459,6 +459,7 @@
             </div>
             <div style="display: flex; align-items: center; gap: 6px;">
               <button id="job-detail-cancel-btn" class="btn btn-sm btn-cancel-job" style="display:none;" onclick="cancelJobFromDetail()">Cancel Job</button>
+              <button id="job-detail-delete-btn" class="btn btn-sm btn-danger" style="display:none;" onclick="deleteJobFromDetail()">Delete Job</button>
               <button class="btn btn-sm" onclick="closeJobDetail()">Close</button>
             </div>
           </div>

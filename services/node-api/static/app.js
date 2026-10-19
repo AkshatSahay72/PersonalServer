@@ -151,6 +151,39 @@ function formatDuration(sec) {
   return parseFloat(sec).toFixed(2) + "s";
 }
 
+function formatDateIST(val, includeSeconds = true) {
+  if (!val) return "-";
+  try {
+    const d = (typeof val === "number") ? new Date(val * 1000) : new Date(val);
+    if (isNaN(d.getTime())) return String(val);
+
+    const fmt = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      ...(includeSeconds ? { second: "2-digit" } : {}),
+      hour12: true
+    });
+
+    const parts = {};
+    fmt.formatToParts(d).forEach(p => { parts[p.type] = p.value; });
+    const day = parts.day || "";
+    const month = parts.month || "";
+    const year = parts.year || "";
+    const hour = parts.hour || "";
+    const minute = parts.minute || "";
+    const second = parts.second ? `:${parts.second}` : "";
+    const dayPeriod = (parts.dayPeriod || "").toUpperCase();
+
+    return `${day} ${month} ${year}, ${hour}:${minute}${second} ${dayPeriod} IST`;
+  } catch {
+    return String(val);
+  }
+}
+
 function timeAgo(isoStr) {
   if (!isoStr) return "-";
   try {
@@ -208,7 +241,7 @@ function renderStatusPill(state) {
 
 function updateLastRefreshed() {
   const el = document.getElementById("last-updated-text");
-  if (el) el.textContent = new Date().toLocaleTimeString();
+  if (el) el.textContent = formatDateIST(new Date());
 }
 
 // 0. Session Info
@@ -1357,7 +1390,7 @@ window.viewNodeById = function(nodeId) {
     <div class="detail-item"><span class="detail-label">Battery &amp; Thermal</span><span class="detail-value mono">${bat.percentage != null ? bat.percentage + '% (' + bat.status + ')' : 'AC Connected'} · Temp: ${tempC ? tempC + '°C' : 'Optimal'}</span></div>
     <div class="detail-item"><span class="detail-label">Workloads</span><span class="detail-value mono">${wlStr}</span></div>
     <div class="detail-item"><span class="detail-label">Capabilities</span><span class="detail-value mono">${caps}</span></div>
-    <div class="detail-item"><span class="detail-label">Last Heartbeat</span><span class="detail-value mono">${node.last_seen || '-'} (${timeAgo(node.last_seen)})</span></div>
+    <div class="detail-item"><span class="detail-label">Last Heartbeat</span><span class="detail-value mono">${formatDateIST(node.last_seen)} (${timeAgo(node.last_seen)})</span></div>
     <div class="detail-item"><span class="detail-label">Services</span><span class="detail-value mono">API: ${srv.node_api || srv['node-api'] || 'running'} · Tunnel: ${srv.cloudflare || 'connected'}</span></div>
     <div class="detail-item"><span class="detail-label">Uptime</span><span class="detail-value mono">${sys.uptime ? formatDuration(sys.uptime) : 'active'}</span></div>
   `;
@@ -1506,7 +1539,7 @@ window.openNodeDiagnosticsModal = async function(nodeId) {
               <div class="telemetry-meta-row"><span>Node Name</span><span class="cell-main">${node.name || nodeId}</span></div>
               <div class="telemetry-meta-row"><span>Role</span><span>${node.role || 'compute'}</span></div>
               <div class="telemetry-meta-row"><span>Heartbeat Age</span><span>${timeAgo(node.last_seen)}</span></div>
-              <div class="telemetry-meta-row"><span>Timestamp</span><span class="cell-muted" style="font-size: 10px;">${diag.timestamp || 'Not recorded'}</span></div>
+              <div class="telemetry-meta-row"><span>Timestamp</span><span class="cell-muted" style="font-size: 10px;">${formatDateIST(diag.timestamp)}</span></div>
             </div>
           </div>
         </div>
@@ -1834,7 +1867,7 @@ async function loadJobs() {
       const target = j.assigned_node || j.target_node || j.target || "auto";
       const res = j.result || {};
       const duration = res.duration_ms !== undefined ? `${res.duration_ms}ms` : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
-      const createdStr = j.created_at || j.submitted_at ? new Date(j.created_at || j.submitted_at).toLocaleTimeString() : "-";
+      const createdStr = j.created_at || j.submitted_at ? formatDateIST(j.created_at || j.submitted_at) : "-";
       const attemptStr = `${j.attempt || 1}/${j.max_attempts || 3}`;
       const st = (j.status || j.state || "").toUpperCase();
       const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING");
@@ -1847,13 +1880,17 @@ async function loadJobs() {
           <td>${renderStatusPill(st)}</td>
           <td class="mono cell-muted">${attemptStr}</td>
           <td class="mono cell-muted">${duration}</td>
-          <td class="mono cell-muted">${createdStr}</td>
+          <td class="mono cell-muted" style="white-space: nowrap;">${createdStr}</td>
           <td style="text-align: right;">
             <div class="job-actions-cell">
               <button class="btn btn-sm" onclick="viewJobById('${escapeHtml(jobId)}')">Details</button>
               ${isCancellable
                 ? `<button class="btn btn-sm btn-cancel-job" onclick="confirmCancelJob('${escapeHtml(jobId)}')" title="Cancel active job">Cancel</button>`
                 : `<button class="btn btn-sm btn-cancel-job" disabled title="Job is terminal (${st})">Cancel</button>`
+              }
+              ${!isCancellable
+                ? `<button class="btn btn-sm btn-danger" onclick="confirmDeleteJob('${escapeHtml(jobId)}')" title="Permanently delete job">Delete</button>`
+                : `<button class="btn btn-sm btn-danger" disabled title="Cannot delete active job (cancel first)">Delete</button>`
               }
             </div>
           </td>
@@ -1928,6 +1965,35 @@ window.cancelJobFromDetail = function() {
   }
 };
 
+window.confirmDeleteJob = async function(jobId) {
+  const confirmed = await showCustomConfirm({
+    title: "Delete Job",
+    message: `Are you sure you want to permanently delete job "${jobId}"?\n\nThis will remove the job and its execution records from the cluster database. This action cannot be undone.`,
+    confirmText: "Delete Job",
+    isDanger: true
+  });
+
+  if (!confirmed) return;
+
+  try {
+    await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+    showCustomAlert({ title: "Job Deleted", message: `Job "${jobId}" deleted successfully.` });
+    if (activeDetailJobId === jobId) {
+      closeJobDetail();
+    }
+    cachedJobs = cachedJobs.filter(j => (j.job_id !== jobId && j.id !== jobId));
+    loadJobs();
+  } catch (err) {
+    showCustomAlert({ title: "Delete Failed", message: err.message || "Failed to delete job.", isError: true });
+  }
+};
+
+window.deleteJobFromDetail = function() {
+  if (activeDetailJobId) {
+    confirmDeleteJob(activeDetailJobId);
+  }
+};
+
 window.viewJobById = function(jobId) {
   activeDetailJobId = jobId;
   const job = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
@@ -1935,6 +2001,7 @@ window.viewJobById = function(jobId) {
   const title = document.getElementById("job-detail-title");
   const statusPill = document.getElementById("job-detail-status-pill");
   const cancelBtn = document.getElementById("job-detail-cancel-btn");
+  const deleteBtn = document.getElementById("job-detail-delete-btn");
   const sumGrid = document.getElementById("job-detail-summary");
   const paramsBox = document.getElementById("job-detail-params");
   const stdoutBox = document.getElementById("job-detail-stdout");
@@ -1949,14 +2016,17 @@ window.viewJobById = function(jobId) {
     if (cancelBtn) {
       cancelBtn.style.display = isCancellable ? "inline-block" : "none";
     }
+    if (deleteBtn) {
+      deleteBtn.style.display = !isCancellable ? "inline-block" : "none";
+    }
 
     const sched = j.scheduler || {};
     const res = j.result || {};
     const targetNode = j.target_node || j.target || "auto";
     const assignedNode = j.assigned_node || j.target_node || "-";
     const durationStr = res.duration_ms !== undefined ? `${res.duration_ms}ms` : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
-    const submittedStr = j.submitted_at || j.created_at || "-";
-    const finishedStr = j.finished_at || j.cancelled_at || "-";
+    const submittedStr = j.submitted_at || j.created_at ? formatDateIST(j.submitted_at || j.created_at) : "-";
+    const finishedStr = j.finished_at || j.cancelled_at ? formatDateIST(j.finished_at || j.cancelled_at) : "-";
     const retryReason = j.retry_reason || (j.diagnostics && j.diagnostics.failure_reason) || "None";
     const cancelReason = j.cancel_reason || "None";
 
@@ -2358,9 +2428,7 @@ function renderStorageTable() {
     const isDir = item.is_dir;
     const typeCategory = getFileTypeCategory(item.name, isDir);
     const icon = getFileIcon(item.name, isDir);
-    const modStr = item.modified ? new Date(item.modified * 1000).toLocaleString(undefined, {
-      year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-    }) : "-";
+    const modStr = item.modified ? formatDateIST(item.modified) : "-";
     const sizeStr = isDir ? "—" : formatBytes(item.size_bytes);
 
     const downloadUrl = isLocal
@@ -2599,7 +2667,7 @@ window.viewStorageProperties = function(itemRelPath, isDir) {
   const nodeName = nodeObj ? (nodeObj.name || nodeObj.node_id) : (selectedStorageNode || "vivo-y31");
   const status = (nodeObj?.status || "ONLINE").toUpperCase();
   const sizeStr = item ? (isDir ? "—" : formatBytes(item.size_bytes)) : "—";
-  const modStr = item?.modified ? new Date(item.modified * 1000).toLocaleString() : "-";
+  const modStr = item?.modified ? formatDateIST(item.modified) : "-";
   const typeStr = isDir ? "Folder" : getFileTypeCategory(itemName, false);
   const physPath = `~/PersonalServer/storage/${itemRelPath}`;
 
@@ -3398,7 +3466,7 @@ function renderAppOverview(app) {
     <div class="sys-kv-row"><span class="sys-kv-k">Public Route</span><span class="sys-kv-v">${routePath !== '-' ? `<a href="${publicUrl}" target="_blank" class="text-online">${publicUrl}</a>` : 'Disabled'}</span></div>
     <div class="sys-kv-row"><span class="sys-kv-k">Container ID</span><span class="sys-kv-v">${escapeHtml(app.container_id || `ps-${app.name}`)}</span></div>
     <div class="sys-kv-row"><span class="sys-kv-k">Resource Limits</span><span class="sys-kv-v">${escapeHtml(app.cpu_limit || '0.5')} CPU · ${escapeHtml(app.memory_limit || '256m')} RAM</span></div>
-    <div class="sys-kv-row"><span class="sys-kv-k">Created At</span><span class="sys-kv-v cell-muted">${escapeHtml(app.created_at || '-')}</span></div>
+    <div class="sys-kv-row"><span class="sys-kv-k">Created At</span><span class="sys-kv-v cell-muted">${formatDateIST(app.created_at)}</span></div>
   `;
 }
 
@@ -3432,7 +3500,7 @@ function renderAppDeployments(app) {
         <td class="mono cell-muted">${escapeHtml(d.trigger || 'manual')}</td>
         <td>${statusPill}</td>
         <td class="mono">${durStr}${stageBreakdown}</td>
-        <td class="cell-muted">${escapeHtml(d.started_at || '-')}</td>
+        <td class="cell-muted">${formatDateIST(d.started_at)}</td>
       </tr>
     `;
   }).join("");
