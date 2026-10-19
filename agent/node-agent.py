@@ -941,8 +941,12 @@ def execute_script(script_path):
     if not script_path.exists():
         print(f"Error: Script not found: {script_path}", file=sys.stderr)
         return 1
-    res = subprocess.run(["bash", str(script_path)])
-    return res.returncode
+    try:
+        res = subprocess.run(["bash", str(script_path)])
+        return res.returncode
+    except FileNotFoundError:
+        print("Error: 'bash' executable not found on this system. Lifecycle scripts require a Bash shell (Linux/Termux).", file=sys.stderr)
+        return 1
 
 
 def cmd_start(args):

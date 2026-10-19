@@ -4,7 +4,22 @@ The Controller is the central orchestrator for node discovery, liveness tracking
 
 ---
 
-## 1. Controller CLI Commands
+## 1. Modular Subsystem Architecture
+
+The controller package is structured into decoupled, maintainable domain modules:
+
+- **`controller/controller.py`**: Central HTTP entry point, route dispatch, API handlers, CLI command implementations, and server loop.
+- **`controller/constants.py`**: Node, job, and application lifecycle states (`STATE_*`, `JOB_STATE_*`, `APP_STATE_*`), state transition validation (`validate_job_transition`), workload allowlists, and port range constraints.
+- **`controller/ha_helper.py`**: Centralized High Availability (HA) state versioning callbacks and singleton `HAManager` instance resolution.
+- **`controller/blueprints.py`**: Application blueprint validation (`personalserver.yaml`), host port allocation (`PORT_RANGE_START`..`PORT_RANGE_END`), route collision avoidance, sandboxed GitHub source fetching, and secret masking.
+- **`controller/onboarding.py`**: Node pairing code generation (`PS-XXXX-XXXX`), SHA-256 code hashing, single-use validation, and cluster enrollment token management.
+- **`controller/node_manager.py`**: Node record sanitization, storage isolation inspection, safe deboarding verification (`evaluate_node_deboarding_safety`), cluster inventory summaries, and active capacity utilization computation.
+- **`controller/lease_sweeper.py`**: Background lease sweeper thread, worker failure detection, exponential retry backoff calculation, and transparent auto-rescheduling.
+- **`controller/stores/`**: Modular persistence stores (`nodes_store`, `jobs_store`, `apps_store`, `onboarding_store`, `base`) providing atomic writes, backup preservation, and thread-safe locking.
+
+---
+
+## 2. Controller CLI Commands
 
 ```bash
 # Start the Controller service
@@ -43,9 +58,9 @@ python controller/controller.py cancel <job_id>
 
 ---
 
-## 2. HTTP API Reference
+## 3. HTTP API Reference
 
-### 2.1 Cluster & Node Management
+### 3.1 Cluster & Node Management
 - `GET /cluster`: Returns cluster-wide metrics, active nodes count, running job counts, and storage usage.
 - `GET /nodes`: List sanitized node records (auth tokens stripped). Includes hardware specifications and real-time telemetry.
 - `GET /nodes/<node_id>`: Detailed telemetry of specific node, including battery level, network signal dBm, and thermal state.
@@ -53,7 +68,7 @@ python controller/controller.py cancel <job_id>
 - `POST /heartbeat`: Node liveness and telemetry reporting. Accepts battery, network, and temperature metrics.
 - `POST /nodes/<node_id>/remove`: Node removal, credential invalidation, and automatic task recovery.
 
-### 2.2 High Availability (HA) & Master Failover
+### 3.2 High Availability (HA) & Master Failover
 - `GET /ha/status` (or `GET /api/ha/status`): Returns HA state (`leader`, `standby`), current `term`, `state_version`, leader URL, lease validity, time remaining, and registered standbys.
 - `GET /ha/leader`: Fast endpoint returning current leader URL and term.
 - `GET /ha/sync` (or `GET /api/ha/sync`): Authenticated cluster state snapshot export for standby synchronization (returns atomic dump of `nodes`, `jobs`, `apps`, and `onboarding_codes`).
@@ -62,7 +77,7 @@ python controller/controller.py cancel <job_id>
 - `POST /ha/failover`: Triggers manual or test failover. Demotes current leader or elects specified node.
 - `POST /ha/promote`: Standby promotion endpoint.
 
-### 2.3 Workload Jobs & Recovery
+### 3.3 Workload Jobs & Recovery
 - `POST /jobs`: Submit a workload job with optional scheduler requirements (cores, memory, role, container runtime, architecture).
 - `GET /jobs`: Query submitted workload jobs with optional filtering by status and target node.
 - `GET /jobs/<job_id>`: Query detailed status, attempt history, scheduler decision, duration, and captured stdout/stderr.
@@ -70,20 +85,20 @@ python controller/controller.py cancel <job_id>
 - `POST /jobs/<job_id>/result`: Worker execution result submission (exit code, output, error, duration).
 - `POST /jobs/<job_id>/cancel`: Explicit administrative job cancellation.
 
-### 2.4 Application Management & Deployment
+### 3.4 Application Management & Deployment
 - `GET /applications` (or `GET /api/applications`): List registered containerized applications, routes, targets, and health states.
 - `POST /applications`: Register a new containerized application with image reference, port, route, and environment variables.
 - `POST /applications/<name>/deploy`: Trigger image pull, container execution, and dynamic route registration.
 - `POST /applications/<name>/stop`: Gracefully stop a running application container.
 - `DELETE /applications/<name>`: Unregister application and remove dynamic route.
 
-### 2.5 Diagnostics & Telemetry
+### 3.5 Diagnostics & Telemetry
 - `GET /diagnostics` (or `GET /api/diagnostics`): In-memory ring-buffer diagnostic event logs with correlation IDs.
 - `GET /health`: Basic controller liveness check.
 
 ---
 
-## 3. Node Telemetry Payload Schema
+## 4. Node Telemetry Payload Schema
 
 During heartbeats, nodes report rich device telemetry via `POST /heartbeat`:
 

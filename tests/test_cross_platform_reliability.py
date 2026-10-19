@@ -321,6 +321,19 @@ class TestNonDockerGracefulRejection(unittest.TestCase):
         finally:
             job_executor.detect_container_runtime = original_detect
 
+    def test_execute_script_missing_bash_handles_gracefully(self):
+        """When bash is not found on Windows/minimal environments, execute_script returns code 1 with error message."""
+        import pathlib
+        from unittest.mock import patch, MagicMock
+        mock_path = MagicMock(spec=pathlib.Path)
+        mock_path.exists.return_value = True
+
+        import io
+        with patch("subprocess.run", side_effect=FileNotFoundError("bash not found")), patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+            res = NODE_AGENT.execute_script(mock_path)
+            self.assertEqual(res, 1)
+            self.assertIn("executable not found", mock_err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

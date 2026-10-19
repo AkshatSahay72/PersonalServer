@@ -65,7 +65,16 @@ PersonalServer is a modular, lightweight, distributed edge computing and cluster
 
 ## 2. Core Subsystems
 
-### 2.1 Cluster Controller & High Availability (`controller/controller.py`, `config/ha_manager.py`)
+### 2.1 Modular Cluster Controller & High Availability (`controller/`, `config/ha_manager.py`)
+* **Decoupled Architecture**: Structured into clean, testable domain modules:
+  * `controller/controller.py`: HTTP entry point, API endpoint routing, and CLI dispatch.
+  * `controller/constants.py`: Centralized node, job, and app lifecycle state machines.
+  * `controller/ha_helper.py`: Leader lease versioning and HAManager singleton resolution.
+  * `controller/blueprints.py`: PersonalServer blueprint validation, host port allocation, and GitHub source fetcher.
+  * `controller/onboarding.py`: Ephemeral cryptographic pairing codes and enrollment tokens.
+  * `controller/node_manager.py`: Deboarding safety inspection, telemetry sanitization, and cluster summaries.
+  * `controller/lease_sweeper.py`: Periodic worker failure detection, lease sweeping, and exponential backoff.
+  * `controller/stores/`: JSON file persistence stores with atomic write guarantees and backup fallbacks.
 * **Cluster Inventory**: Maintains registered nodes, roles (`compute`, `storage`), hardware specs, runtime capabilities (`docker`, `python`), and liveness status in `controller/data/nodes.json`.
 * **High Availability & Master Failover**:
   * **Leader Lease**: Atomic lease tracking (`term`, `leader_id`, `lease_expires_at`, `state_version`) saved safely on disk and held in memory.
