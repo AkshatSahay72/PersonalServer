@@ -139,6 +139,55 @@ class TestJobDeletion(unittest.TestCase):
         saved_db = mock_save.call_args[0][0]
         self.assertNotIn("job-cli-test", saved_db["jobs"])
 
+    @patch("controller.http.job_routes.load_jobs_db")
+    def test_delete_unauthorized_returns_401(self, mock_load):
+        self.handler.is_authenticated_admin_or_node.return_value = False
+        with patch("controller.http.job_routes.get_or_create_enrollment_token", return_value="valid-token"):
+            handled = handle_job_delete(self.handler, "/jobs/job-succeeded-1", token="wrong-invalid-token")
+            self.assertTrue(handled)
+            self.assertEqual(self.handler.sent_status, 401)
+            self.assertIn("Authentication required", self.handler.sent_json["error"])
+
+    @patch("controller.http.job_routes.load_jobs_db")
+    @patch("controller.http.job_routes.save_jobs_db")
+    @patch("controller.http.job_routes.controller_logger")
+    def test_delete_job_audit_logging(self, mock_logger, mock_save, mock_load):
+        jobs_db = {
+            "jobs": {
+                "job-audit-1": {
+                    "job_id": "job-audit-1",
+                    "status": JOB_STATE_CANCELLED,
+                    "type": "timeout-test",
+                    "target_node": "test-node",
+                    "correlation_id": "corr-audit-test"
+                }
+            }
+        }
+        mock_load.return_value = jobs_db
+
+        handled = handle_job_delete(self.handler, "/jobs/job-audit-1", token="any-admin-token")
+        self.assertTrue(handled)
+        self.assertEqual(self.handler.sent_status, 200)
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args
+        self.assertEqual(call_args[0][0], "job.deleted")
+        self.assertEqual(call_args[1]["correlation_id"], "corr-audit-test")
+
+    @patch("controller.cli.load_jobs_db")
+    @patch("controller.cli.save_jobs_db")
+    def test_cli_delete_running_job_rejected(self, mock_save, mock_load):
+        mock_load.return_value = {
+            "jobs": {
+                "job-cli-running": {
+                    "job_id": "job-cli-running",
+                    "status": JOB_STATE_RUNNING
+                }
+            }
+        }
+        ret = delete_job("job-cli-running", force=False)
+        self.assertEqual(ret, 1)
+        mock_save.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

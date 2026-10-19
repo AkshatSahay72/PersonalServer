@@ -1965,7 +1965,31 @@ window.cancelJobFromDetail = function() {
   }
 };
 
+const inFlightJobDeletions = new Set();
+
 window.confirmDeleteJob = async function(jobId) {
+  if (!jobId) return;
+
+  // Prevent duplicate requests while deletion is in progress
+  if (inFlightJobDeletions.has(jobId)) {
+    console.warn(`[JOBS] Deletion already in progress for job ${jobId}`);
+    return;
+  }
+
+  // Safety check: verify job is not active
+  const targetJob = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
+  if (targetJob) {
+    const st = (targetJob.status || targetJob.state || "").toUpperCase();
+    if (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING") {
+      showCustomAlert({
+        title: "Cannot Delete Active Job",
+        message: `Job "${jobId}" is currently in ${st} state.\n\nActive workloads cannot be deleted directly to maintain cluster reliability. Please cancel the job first.`,
+        isError: true
+      });
+      return;
+    }
+  }
+
   const confirmed = await showCustomConfirm({
     title: "Delete Job",
     message: `Are you sure you want to permanently delete job "${jobId}"?\n\nThis will remove the job and its execution records from the cluster database. This action cannot be undone.`,
@@ -1975,16 +1999,41 @@ window.confirmDeleteJob = async function(jobId) {
 
   if (!confirmed) return;
 
+  inFlightJobDeletions.add(jobId);
   try {
-    await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
-    showCustomAlert({ title: "Job Deleted", message: `Job "${jobId}" deleted successfully.` });
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+    showCustomAlert({
+      title: "Job Deleted",
+      message: (res && res.message) ? res.message : `Job "${jobId}" deleted successfully.`
+    });
     if (activeDetailJobId === jobId) {
       closeJobDetail();
     }
     cachedJobs = cachedJobs.filter(j => (j.job_id !== jobId && j.id !== jobId));
     loadJobs();
   } catch (err) {
-    showCustomAlert({ title: "Delete Failed", message: err.message || "Failed to delete job.", isError: true });
+    const errMsg = err.message || "";
+    const isNotFound = errMsg.includes("404") || errMsg.toLowerCase().includes("not found");
+    if (isNotFound) {
+      showCustomAlert({
+        title: "Job Not Found",
+        message: `Job "${jobId}" was already removed or does not exist. Updating job list.`,
+        isError: true
+      });
+      if (activeDetailJobId === jobId) {
+        closeJobDetail();
+      }
+      cachedJobs = cachedJobs.filter(j => (j.job_id !== jobId && j.id !== jobId));
+      loadJobs();
+    } else {
+      showCustomAlert({
+        title: "Delete Failed",
+        message: errMsg || "Failed to delete job.",
+        isError: true
+      });
+    }
+  } finally {
+    inFlightJobDeletions.delete(jobId);
   }
 };
 

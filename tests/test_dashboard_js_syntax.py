@@ -155,6 +155,18 @@ setTimeout(() => {
             f"JS execution test failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
         )
 
+    def test_05_job_deletion_ui_elements(self):
+        """Verify app.js and index.html contain required job deletion UI routines."""
+        app_js = self.app_js_path.read_text(encoding="utf-8")
+        self.assertIn("confirmDeleteJob", app_js)
+        self.assertIn("deleteJobFromDetail", app_js)
+        self.assertIn("inFlightJobDeletions", app_js)
+        self.assertIn("/api/jobs/", app_js)
+
+        index_html = self.index_html_path.read_text(encoding="utf-8")
+        self.assertIn("job-detail-delete-btn", index_html)
+        self.assertIn("deleteJobFromDetail()", index_html)
+
 
 if __name__ == "__main__":
     unittest.main()
