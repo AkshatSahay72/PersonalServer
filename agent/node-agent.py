@@ -61,7 +61,7 @@ from common.time_utils import get_current_iso_timestamp
 import shlex
 
 
-def run_cmd(cmd):
+def run_cmd(cmd, timeout=3):
     """Run a command safely without shell interpretation when possible."""
     try:
         if isinstance(cmd, str):
@@ -70,7 +70,7 @@ def run_cmd(cmd):
         else:
             cmd_args = cmd
             use_shell = False
-        return subprocess.check_output(cmd_args, shell=use_shell, text=True, stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(cmd_args, shell=use_shell, text=True, stderr=subprocess.DEVNULL, timeout=timeout).strip()
     except Exception:
         return ""
 
@@ -494,10 +494,181 @@ def get_workload_metrics():
     }
 
 
+_KERNEL32 = None
+
+
+def _get_kernel32():
+    """
+    Get configured WinDLL instance for kernel32 with explicit 64-bit argument/return types
+    and use_last_error=True for thread-safe error retrieval.
+    """
+    global _KERNEL32
+    if _KERNEL32 is not None:
+        return _KERNEL32
+
+    if sys.platform != "win32":
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        # 1. OpenProcess -> returns 64-bit HANDLE, accepts DWORD, BOOL, DWORD
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+
+        # 2. WaitForSingleObject -> accepts 64-bit HANDLE, DWORD timeout; returns DWORD
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+
+        # 3. GetExitCodeProcess -> accepts 64-bit HANDLE, LPDWORD; returns BOOL
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+
+        # 4. CloseHandle -> accepts 64-bit HANDLE; returns BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+
+        # 5. QueryFullProcessImageNameW -> accepts 64-bit HANDLE, DWORD flags, LPWSTR buffer, PDWORD size
+        if hasattr(k32, "QueryFullProcessImageNameW"):
+            k32.QueryFullProcessImageNameW.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                wintypes.LPWSTR,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+        _KERNEL32 = k32
+        return _KERNEL32
+    except Exception:
+        return None
+
+
+def _verify_windows_process_pattern(handle, pid, pattern, kernel32=None):
+    """
+    Verify whether the Windows process identified by handle/pid matches the requested pattern.
+    Does not report True unless the pattern is verified against the image path or command line.
+    A Python executable name alone does not prove the process is running a specific Python script.
+    """
+    if not pattern:
+        return True
+
+    pattern_str = str(pattern).strip()
+    if not pattern_str:
+        return True
+
+    pattern_lower = pattern_str.lower().replace("\\", "/")
+    # If the pattern contains path separators or file extensions (.py, .js),
+    # it targets a script/module argument, which must be verified against the command line.
+    is_script_or_path = ("/" in pattern_lower or pattern_lower.endswith(".py") or pattern_lower.endswith(".js"))
+
+    # 1. Query full process image name via QueryFullProcessImageNameW (only for executable binaries)
+    if not is_script_or_path:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = kernel32 if kernel32 is not None else _get_kernel32()
+            if k32 and hasattr(k32, "QueryFullProcessImageNameW"):
+                buf_size = wintypes.DWORD(1024)
+                buf = ctypes.create_unicode_buffer(1024)
+                if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_size)):
+                    image_name = os.path.basename(buf.value).lower()
+                    image_stem = os.path.splitext(image_name)[0]
+                    if pattern_lower == image_name or pattern_lower == image_stem:
+                        return True
+        except Exception:
+            pass
+
+    # 2. Command-line query via PowerShell CIM query with strict timeout for scripts and arguments
+    try:
+        ps_cmd = [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"
+        ]
+        cmd_output = run_cmd(ps_cmd, timeout=3)
+        if cmd_output:
+            cmd_norm = cmd_output.lower().replace("\\", "/")
+            if pattern_lower in cmd_norm:
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _is_pid_alive_windows(pid, pattern=None, kernel32=None):
+    """
+    Check if a process is alive on Windows using non-signaling Win32 process APIs.
+    Guarantees handle closure and never calls os.kill(pid, 0) or sends console signals.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return False
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    SYNCHRONIZE = 0x00100000
+    STILL_ACTIVE = 259
+    WAIT_TIMEOUT = 0x00000102
+    WAIT_OBJECT_0 = 0x00000000
+    ERROR_ACCESS_DENIED = 5
+
+    k32 = kernel32 if kernel32 is not None else _get_kernel32()
+    if k32 is None:
+        return False
+
+    # OpenProcess with query limited info and synchronize access
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+    if not handle:
+        err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else (
+            k32.GetLastError() if hasattr(k32, "GetLastError") else 0
+        )
+        if err == ERROR_ACCESS_DENIED:
+            # Process exists and is running under different credentials.
+            # If a pattern was requested, we cannot verify it without access, so return False.
+            return not bool(pattern)
+        return False
+
+    try:
+        # Check wait state: WAIT_TIMEOUT means the process object is nonsignaled (still running).
+        # WAIT_OBJECT_0 means the process object is signaled (terminated/exited).
+        # WAIT_FAILED or any other return value means API error / not active.
+        wait_res = k32.WaitForSingleObject(handle, 0)
+        if wait_res == WAIT_OBJECT_0:
+            return False
+        elif wait_res != WAIT_TIMEOUT:
+            return False
+
+        # Additional check via exit code
+        exit_code = wintypes.DWORD(0)
+        if k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            if exit_code.value != STILL_ACTIVE:
+                return False
+
+        if not pattern:
+            return True
+
+        # Verify pattern if requested
+        return _verify_windows_process_pattern(handle, pid, pattern, kernel32=k32)
+    finally:
+        k32.CloseHandle(handle)
+
+
 def is_pid_alive(pid_str, pattern=None):
     if not pid_str or not str(pid_str).strip().isdigit():
         return False
     pid = int(pid_str)
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        return _is_pid_alive_windows(pid, pattern=pattern)
+
     try:
         os.kill(pid, 0)
     except OSError:
