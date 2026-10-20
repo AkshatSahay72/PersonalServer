@@ -28,7 +28,7 @@ import unittest
 import urllib.request
 import urllib.error
 from pathlib import Path
-from http.server import HTTPServer
+from http.server import HTTPServer, ThreadingHTTPServer
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
@@ -127,8 +127,12 @@ class TestStorageSharing(unittest.TestCase):
         node_api_mod.AUTH_TOKEN_FILE = self.secrets_dir / "auth.token"
         node_api_mod.SECRETS_DIR = self.secrets_dir
 
-        # Start NodeAPI test server on loopback with non-loopback simulation
-        self.server = HTTPServer(("127.0.0.1", 0), NodeAPIHandler)
+        self._orig_env_data_dir = os.environ.get("PERSONALSERVER_DATA_DIR")
+        os.environ["PERSONALSERVER_DATA_DIR"] = str(self.data_dir)
+
+        # Start NodeAPI test server on loopback with ThreadingHTTPServer
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), NodeAPIHandler)
+        self.server.daemon_threads = True
         self.port = self.server.server_address[1]
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -140,6 +144,11 @@ class TestStorageSharing(unittest.TestCase):
             self.server.server_close()
         except Exception:
             pass
+
+        if self._orig_env_data_dir is not None:
+            os.environ["PERSONALSERVER_DATA_DIR"] = self._orig_env_data_dir
+        else:
+            os.environ.pop("PERSONALSERVER_DATA_DIR", None)
 
         node_api_mod.STORAGE_ROOT = self._orig_storage_root
         node_api_mod.AUTH_TOKEN_FILE = self._orig_auth_token_file
@@ -211,9 +220,10 @@ class TestStorageSharing(unittest.TestCase):
         share_id = body.get("share_id")
         self.assertTrue(share_id)
         self.assertGreaterEqual(len(share_id), 20)
-        # Phase 2B: Stable memorable path URL returned as primary, token_url preserved
-        self.assertIn("/storage/document.txt", body.get("url"))
-        self.assertIn(f"/storage/s/{share_id}", body.get("token_url"))
+        # Canonical Path-Based Public Sharing URL
+        self.assertIn("/share/document.txt", body.get("url"))
+        self.assertIn("/share/document.txt", body.get("share_url"))
+        self.assertIn(f"/share/{share_id}", body.get("token_url"))
 
         # Verify status query
         q_status, q_body, _, _ = http_request(
@@ -224,8 +234,9 @@ class TestStorageSharing(unittest.TestCase):
         self.assertEqual(q_status, 200)
         self.assertTrue(q_body.get("shared"))
         self.assertEqual(q_body.get("share_id"), share_id)
-        self.assertIn("/storage/document.txt", q_body.get("url"))
-        self.assertIn(f"/storage/s/{share_id}", q_body.get("token_url"))
+        self.assertIn("/share/document.txt", q_body.get("url"))
+        self.assertIn("/share/document.txt", q_body.get("share_url"))
+        self.assertIn(f"/share/{share_id}", q_body.get("token_url"))
 
     # --------------------------------------------------------------------------
     # 4. Public Share Link Serves Content Without Authentication
@@ -257,6 +268,43 @@ class TestStorageSharing(unittest.TestCase):
         # Verify internal paths are not exposed
         for hdr_val in pub_headers.values():
             self.assertNotIn(str(self.storage_dir), str(hdr_val))
+
+    def test_04b_public_file_share_under_share_id(self):
+        """Verify Phase 2E: public file access works under /share/<share_id> route."""
+        _, create_body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "document.txt"},
+            headers=self.auth_headers()
+        )
+        share_id = create_body["share_id"]
+
+        # 1. Root /share/<share_id> serves file inline
+        root_status, _, root_bytes, root_headers = http_request(
+            f"{self.base_url}/share/{share_id}",
+            method="GET"
+        )
+        self.assertEqual(root_status, 200)
+        self.assertEqual(root_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+        self.assertIn("inline", root_headers.get("Content-Disposition", ""))
+        self.assertEqual(root_headers.get("X-Content-Type-Options"), "nosniff")
+
+        # 2. /share/<share_id>/file serves file inline
+        file_status, _, file_bytes, _ = http_request(
+            f"{self.base_url}/share/{share_id}/file",
+            method="GET"
+        )
+        self.assertEqual(file_status, 200)
+        self.assertEqual(file_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+
+        # 3. /share/<share_id>/download serves as attachment
+        dl_status, _, dl_bytes, dl_headers = http_request(
+            f"{self.base_url}/share/{share_id}/download",
+            method="GET"
+        )
+        self.assertEqual(dl_status, 200)
+        self.assertEqual(dl_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+        self.assertIn("attachment", dl_headers.get("Content-Disposition", ""))
 
     # --------------------------------------------------------------------------
     # 5. Revoking Share Immediately Disables Access
@@ -328,18 +376,130 @@ class TestStorageSharing(unittest.TestCase):
         self.assertEqual(bytes2.decode("utf-8"), "Hello PersonalServer Storage!")
 
     # --------------------------------------------------------------------------
-    # 7. Directory Sharing Is Strictly Rejected
+    # 7. Secure Folder Sharing (Phase 2D)
     # --------------------------------------------------------------------------
-    def test_07_directory_sharing_rejected(self):
-        """Verify directory shares are rejected with 400 in Phase 2A."""
+    def test_07a_folder_sharing_enable_and_containment(self):
+        """Verify folders can be shared, generating dedicated viewer and read-only endpoints."""
         status, body, _, _ = http_request(
             f"{self.base_url}/storage/share",
             method="POST",
             data={"path": "nested_folder"},
             headers=self.auth_headers()
         )
-        self.assertEqual(status, 400)
-        self.assertIn("directory", body.get("error", "").lower())
+        self.assertEqual(status, 200)
+        self.assertTrue(body["shared"])
+        self.assertTrue(body["is_dir"])
+        share_id = body["share_id"]
+        self.assertTrue(share_id)
+
+        # 1. Root /share/<share_id> serves dedicated HTML folder viewer
+        v_status, _, v_bytes, v_headers = http_request(f"{self.base_url}/share/{share_id}")
+        self.assertEqual(v_status, 200)
+        self.assertIn("text/html", v_headers.get("Content-Type", ""))
+        self.assertIn(b"Shared Folder", v_bytes)
+
+        # 2. /share/<share_id>/list returns folder items
+        l_status, l_body, _, _ = http_request(f"{self.base_url}/share/{share_id}/list")
+        self.assertEqual(l_status, 200)
+        self.assertEqual(l_body["share_id"], share_id)
+        item_names = [it["name"] for it in l_body["items"]]
+        self.assertIn("inner.txt", item_names)
+
+        # 3. /share/<share_id>/file?subpath=inner.txt streams file inline
+        f_status, _, f_bytes, f_headers = http_request(f"{self.base_url}/share/{share_id}/file?subpath=inner.txt")
+        self.assertEqual(f_status, 200)
+        self.assertEqual(f_bytes.decode("utf-8"), "Inner file content")
+        self.assertIn("inline", f_headers.get("Content-Disposition", ""))
+
+        # 4. /share/<share_id>/download?subpath=inner.txt downloads as attachment
+        d_status, _, d_bytes, d_headers = http_request(f"{self.base_url}/share/{share_id}/download?subpath=inner.txt")
+        self.assertEqual(d_status, 200)
+        self.assertEqual(d_bytes.decode("utf-8"), "Inner file content")
+        self.assertIn("attachment", d_headers.get("Content-Disposition", ""))
+
+    def test_07b_folder_boundary_and_traversal_rejection(self):
+        """Enforce strict folder containment: reject traversal and access to parent/sibling files."""
+        _, body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "nested_folder"},
+            headers=self.auth_headers()
+        )
+        share_id = body["share_id"]
+
+        # Traversal in listing
+        status_list_dot, _, _, _ = http_request(f"{self.base_url}/share/{share_id}/list?subpath=../")
+        self.assertIn(status_list_dot, (400, 403, 404))
+
+        status_list_deep, _, _, _ = http_request(f"{self.base_url}/share/{share_id}/list?subpath=../../etc")
+        self.assertIn(status_list_deep, (400, 403, 404))
+
+        # Traversal in file access trying to reach sibling file (document.txt)
+        status_file_sibling, _, _, _ = http_request(f"{self.base_url}/share/{share_id}/file?subpath=../document.txt")
+        self.assertIn(status_file_sibling, (400, 403, 404))
+
+        # Direct escape attempting to access secrets
+        status_file_escape, _, _, _ = http_request(f"{self.base_url}/share/{share_id}/file?subpath=../../config/secrets/auth.token")
+        self.assertIn(status_file_escape, (400, 403, 404))
+
+    def test_07c_folder_revocation_cascades_immediately(self):
+        """Verify turning OFF folder share immediately revokes all descendant access."""
+        _, body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "nested_folder"},
+            headers=self.auth_headers()
+        )
+        share_id = body["share_id"]
+
+        # Verify accessible before revocation
+        s_before, _, _, _ = http_request(f"{self.base_url}/share/{share_id}/file?subpath=inner.txt")
+        self.assertEqual(s_before, 200)
+
+        # Revoke folder share
+        del_status, del_body, _, _ = http_request(
+            f"{self.base_url}/storage/share?path=nested_folder",
+            method="DELETE",
+            headers=self.auth_headers()
+        )
+        self.assertEqual(del_status, 200)
+        self.assertFalse(del_body["shared"])
+
+        # Immediate revocation across all endpoints
+        s_after_root, _, _, _ = http_request(f"{self.base_url}/share/{share_id}")
+        self.assertEqual(s_after_root, 404)
+
+        s_after_list, _, _, _ = http_request(f"{self.base_url}/share/{share_id}/list")
+        self.assertEqual(s_after_list, 404)
+
+        s_after_file, _, _, _ = http_request(f"{self.base_url}/share/{share_id}/file?subpath=inner.txt")
+        self.assertEqual(s_after_file, 404)
+
+    def test_07d_nested_folder_navigation(self):
+        """Verify navigating and accessing deeply nested folders within the shared boundary."""
+        deep_dir = self.sub_folder / "sub1" / "sub2"
+        deep_dir.mkdir(parents=True, exist_ok=True)
+        deep_file = deep_dir / "deep_doc.txt"
+        deep_file.write_text("Deeply nested text content", encoding="utf-8")
+
+        _, body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "nested_folder"},
+            headers=self.auth_headers()
+        )
+        share_id = body["share_id"]
+
+        # List subfolder sub1/sub2
+        l_status, l_body, _, _ = http_request(f"{self.base_url}/share/{share_id}/list?subpath=sub1/sub2")
+        self.assertEqual(l_status, 200)
+        item_names = [it["name"] for it in l_body["items"]]
+        self.assertIn("deep_doc.txt", item_names)
+
+        # Access deep file
+        f_status, _, f_bytes, _ = http_request(f"{self.base_url}/share/{share_id}/file?subpath=sub1/sub2/deep_doc.txt")
+        self.assertEqual(f_status, 200)
+        self.assertEqual(f_bytes.decode("utf-8"), "Deeply nested text content")
 
     # --------------------------------------------------------------------------
     # 8. Untrusted HTML and SVG Content Served Safely
@@ -416,7 +576,8 @@ class TestStorageSharing(unittest.TestCase):
             headers=self.auth_headers()
         )
         self.assertEqual(status, 200)
-        self.assertIn("/storage/document.txt", body["url"])
+        self.assertIn("/share/document.txt", body["url"])
+        self.assertIn(f"/share/{body['share_id']}", body["token_url"])
 
         # Unauthenticated GET /storage/document.txt
         pub_status, _, pub_bytes, pub_headers = http_request(f"{self.base_url}/storage/document.txt")
@@ -488,7 +649,8 @@ class TestStorageSharing(unittest.TestCase):
             headers=self.auth_headers()
         )
         self.assertEqual(create_status, 200)
-        self.assertIn("CV/My%20Resume.pdf", create_body["url"])
+        self.assertIn("share/CV/My%20Resume.pdf", create_body["url"])
+        self.assertIn(f"/share/{create_body['share_id']}", create_body["token_url"])
 
         # Public access via URL with %20
         res_status, _, res_bytes, res_hdrs = http_request(f"{self.base_url}/storage/CV/My%20Resume.pdf")
@@ -641,7 +803,416 @@ class TestStorageSharing(unittest.TestCase):
             status, _, _, _ = http_request(f"{self.base_url}{ep}", headers=fake_auth)
             self.assertEqual(status, 401, f"Route {ep} must enforce authentication")
 
+    # --------------------------------------------------------------------------
+    # 20. Multipart Upload & Network Auth Isolation
+    # --------------------------------------------------------------------------
+    def test_20_multipart_upload_and_tailscale_private_auth(self):
+        """Verify multipart upload saves files, preserves filenames, and enforces network scope."""
+        boundary = "----TestBoundary12345"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="My Uploaded Doc.txt"\r\n'
+            f"Content-Type: text/plain\r\n\r\n"
+            f"Uploaded content with spaces in name\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+
+        # 1. Upload via valid auth token
+        req = urllib.request.Request(
+            f"{self.base_url}/storage/upload?path=",
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+                "Authorization": f"Bearer {self.auth_token}"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            res_data = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(res_data.get("status"), "uploaded")
+            self.assertIn("My Uploaded Doc.txt", res_data.get("files", []))
+
+        uploaded_file = self.storage_dir / "My Uploaded Doc.txt"
+        self.assertTrue(uploaded_file.exists())
+        self.assertEqual(uploaded_file.read_text(encoding="utf-8"), "Uploaded content with spaces in name")
+
+    # --------------------------------------------------------------------------
+    # 21. Preview and Share UI Flow & Node Normalization (Phase 2C.4)
+    # --------------------------------------------------------------------------
+    def test_21_preview_and_share_ui_flow_and_node_normalization(self):
+        """
+        Validates Phase 2C.4 acceptance criteria:
+        1. Preview works with node=auto and on unshared files via local loopback.
+        2. Share query, enable, and revoke work with node=auto.
+        3. Nested files with spaces and unicode are handled cleanly.
+        4. Public proxied access without CF email/token is rejected.
+        """
+        # Create a nested test file with spaces
+        nested_dir = self.storage_dir / "Nested Folder"
+        nested_dir.mkdir(parents=True, exist_ok=True)
+        test_file = nested_dir / "Preview Test File.txt"
+        test_file.write_text("Detailed preview test content for Phase 2C.4", encoding="utf-8")
+
+        encoded_path = urllib.parse.quote("Nested Folder/Preview Test File.txt")
+
+        # 1. Preview of unshared file from loopback (no bearer token header) succeeds
+        status, _, content, hdrs = http_request(
+            f"{self.base_url}/storage/preview?path={encoded_path}&node=auto"
+        )
+        self.assertEqual(status, 200, "Loopback preview with node=auto must return 200")
+        self.assertEqual(content.decode("utf-8"), "Detailed preview test content for Phase 2C.4")
+        self.assertIn("inline", hdrs.get("Content-Disposition", ""))
+
+        # 2. Query initial share status with node=auto -> shared: False
+        status, res, _, _ = http_request(
+            f"{self.base_url}/storage/share?path={encoded_path}&node=auto"
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(res.get("shared"), "Initially unshared file must report shared=False")
+
+        # 3. Enable sharing via POST /storage/share with node="auto"
+        status, res, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={
+                "path": "Nested Folder/Preview Test File.txt",
+                "node": "auto"
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(res.get("shared"))
+        share_url = res.get("url")
+        self.assertTrue(share_url and "/share/" in share_url)
+
+        # 4. Query share status again with node=auto -> shared: True
+        status, res, _, _ = http_request(
+            f"{self.base_url}/storage/share?path={encoded_path}&node=auto"
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(res.get("shared"))
+        self.assertEqual(res.get("url"), share_url)
+
+        # 5. Public access to shared file succeeds without authentication
+        pub_status, _, pub_content, _ = http_request(
+            f"{self.base_url}/storage/Nested%20Folder/Preview%20Test%20File.txt"
+        )
+        self.assertEqual(pub_status, 200)
+        self.assertEqual(pub_content.decode("utf-8"), "Detailed preview test content for Phase 2C.4")
+
+        # 6. Revoke share via DELETE /storage/share with node="auto"
+        status, res, _, _ = http_request(
+            f"{self.base_url}/storage/share?path={encoded_path}&node=auto",
+            method="DELETE"
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(res.get("shared"))
+        self.assertEqual(res.get("status"), "revoked")
+
+        # 7. Share query reflects revoked state -> shared: False
+        status, res, _, _ = http_request(
+            f"{self.base_url}/storage/share?path={encoded_path}&node=auto"
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(res.get("shared"))
+
+        # 8. Unauthenticated public access to now-revoked file returns 404
+        pub_status, _, _, _ = http_request(
+            f"{self.base_url}/storage/Nested%20Folder/Preview%20Test%20File.txt",
+            headers={"Cf-Ray": "simulated-public-cf-tunnel"}
+        )
+        self.assertEqual(pub_status, 404, "Public access to revoked file must return 404")
+
+        # 9. Public proxied preview of unshared file without auth returns 401
+        proxy_preview_status, _, _, _ = http_request(
+            f"{self.base_url}/storage/preview?path={encoded_path}",
+            headers={"Cf-Ray": "simulated-public-cf-tunnel"}
+        )
+        self.assertEqual(proxy_preview_status, 401, "Public preview without auth must return 401")
+
+    def test_22_concurrent_requests_slow_client_non_blocking(self):
+        """
+        Phase 2C.7 Regression: Verify holding one HTTP connection open with an incomplete request
+        does not block subsequent concurrent requests (e.g. /health) from completing promptly.
+        """
+        import socket
+        # 1. Connect first client socket and send incomplete headers (holding connection open)
+        s1 = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            s1.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Slow: true\r\n")
+            # Do NOT send the terminating \r\n\r\n yet; socket remains open and waiting in receive
+
+            # 2. While s1 is holding connection open, send a prompt request to /health from second client
+            t0 = time.time()
+            status, res, _, _ = http_request(f"{self.base_url}/health")
+            elapsed = time.time() - t0
+
+            # 3. Assert second request returned 200 and completed promptly (< 1.5 seconds)
+            self.assertEqual(status, 200, "Concurrent /health request must return 200")
+            self.assertEqual(res.get("status"), "online")
+            self.assertLess(elapsed, 3.0, f"/health took {elapsed:.3f}s; must not be starved by slow connection")
+        finally:
+            try:
+                s1.close()
+            except Exception:
+                pass
+
+    def test_23_client_disconnect_during_file_response(self):
+        """
+        Phase 2C.7 Regression: Verify client abrupt disconnection during streaming of a larger file
+        does not crash the server or impair subsequent request handling.
+        """
+        import socket
+        # 1. Create a larger test file (512 KB)
+        large_file = self.storage_dir / "large_stream_test.bin"
+        chunk_pattern = b"A" * 65536
+        with open(large_file, "wb") as f:
+            for _ in range(8):  # 512 KB
+                f.write(chunk_pattern)
+
+        # 2. Connect raw socket and request the file
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            req = f"GET /storage/preview?path=large_stream_test.bin HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            s.sendall(req.encode("utf-8"))
+
+            # Read only response headers and partial data (e.g. first 1024 bytes)
+            partial = s.recv(1024)
+            self.assertIn(b"200 OK", partial)
+
+            # 3. Abruptly close the socket mid-stream (simulates browser tab close or network loss)
+            s.close()
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+        # 4. Give server a moment to observe disconnect and ensure it continues serving requests
+        time.sleep(0.1)
+        status, res, _, _ = http_request(f"{self.base_url}/health")
+        self.assertEqual(status, 200, "Server must remain healthy and responsive after client disconnect")
+        self.assertEqual(res.get("status"), "online")
+
+        # 5. Clean up
+        try:
+            large_file.unlink()
+        except Exception:
+            pass
+
+    # --------------------------------------------------------------------------
+    # Phase 4 Tests: Path-Based Public Sharing
+    # --------------------------------------------------------------------------
+    def test_24_path_based_file_share_inline_and_download(self):
+        """Phase 4: Active public file share returns content inline and supports ?download=1."""
+        status, body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "document.txt"},
+            headers=self.auth_headers()
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("shared"))
+        canonical_url = body.get("url")
+        self.assertIn("/share/document.txt", canonical_url)
+
+        # 1. Unauthenticated request to canonical path URL serves inline content
+        pub_status, _, pub_bytes, pub_headers = http_request(f"{self.base_url}/share/document.txt")
+        self.assertEqual(pub_status, 200)
+        self.assertEqual(pub_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+        self.assertIn("inline", pub_headers.get("Content-Disposition", ""))
+        self.assertEqual(pub_headers.get("X-Content-Type-Options"), "nosniff")
+
+        # 2. Unauthenticated request with ?download=1 serves as download attachment
+        dl_status, _, dl_bytes, dl_headers = http_request(f"{self.base_url}/share/document.txt?download=1")
+        self.assertEqual(dl_status, 200)
+        self.assertEqual(dl_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+        self.assertIn("attachment", dl_headers.get("Content-Disposition", ""))
+
+    def test_25_path_based_folder_share_renders_folder_page(self):
+        """Phase 4: Active public folder share renders folder page with injected __SHARE_RECORD__."""
+        status, body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "nested_folder", "is_dir": True},
+            headers=self.auth_headers()
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("shared"))
+        self.assertTrue(body.get("is_dir"))
+        canonical_url = body.get("url")
+        self.assertIn("/share/nested_folder", canonical_url)
+
+        # 1. Unauthenticated request to folder URL serves shared_folder.html with injected record
+        pub_status, _, pub_bytes, pub_headers = http_request(f"{self.base_url}/share/nested_folder")
+        self.assertEqual(pub_status, 200)
+        html_text = pub_bytes.decode("utf-8")
+        self.assertIn("text/html", pub_headers.get("Content-Type", ""))
+        self.assertIn("window.__SHARE_RECORD__", html_text)
+        self.assertIn(body["share_id"], html_text)
+        self.assertIn("nested_folder", html_text)
+
+        # 2. Unauthenticated request to contained file within shared folder succeeds
+        inner_status, _, inner_bytes, _ = http_request(f"{self.base_url}/share/nested_folder/inner.txt")
+        self.assertEqual(inner_status, 200)
+        self.assertEqual(inner_bytes.decode("utf-8"), "Inner file content")
+
+    def test_26_path_based_share_revocation_immediate_denial(self):
+        """Phase 4: Turning share OFF immediately revokes access (404); re-enabling restores access."""
+        # Enable share
+        http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "document.txt"},
+            headers=self.auth_headers()
+        )
+        status, _, bytes_val, _ = http_request(f"{self.base_url}/share/document.txt")
+        self.assertEqual(status, 200)
+
+        # Turn share OFF (DELETE)
+        del_status, del_body, _, _ = http_request(
+            f"{self.base_url}/storage/share?path=document.txt",
+            method="DELETE",
+            headers=self.auth_headers()
+        )
+        self.assertEqual(del_status, 200)
+        self.assertEqual(del_body.get("status"), "revoked")
+
+        # Immediately denied with 404
+        revoked_status, revoked_body, revoked_bytes, _ = http_request(f"{self.base_url}/share/document.txt")
+        self.assertEqual(revoked_status, 404)
+        self.assertIn("revoked", revoked_body.get("error", "").lower())
+
+        # HTML accept receives styled error card
+        html_status, _, html_bytes, html_hdrs = http_request(
+            f"{self.base_url}/share/document.txt",
+            headers={"Accept": "text/html,application/xhtml+xml"}
+        )
+        self.assertEqual(html_status, 404)
+        self.assertIn("text/html", html_hdrs.get("Content-Type", ""))
+        self.assertIn("Share Link Unavailable", html_bytes.decode("utf-8"))
+
+        # Re-enable sharing restores access
+        http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "document.txt"},
+            headers=self.auth_headers()
+        )
+        restore_status, _, restore_bytes, _ = http_request(f"{self.base_url}/share/document.txt")
+        self.assertEqual(restore_status, 200)
+        self.assertEqual(restore_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+
+    def test_27_path_based_share_spaces_nested_and_unicode(self):
+        """Phase 4: Proper URL encoding/decoding for spaces, nested paths, and Unicode filenames."""
+        # Create nested file with spaces
+        spaced_file = self.sub_folder / "My Resume.pdf"
+        spaced_file.write_text("%PDF-1.5 Resume with spaces", encoding="utf-8")
+
+        # Create nested file with Unicode
+        unicode_file = self.sub_folder / "résumé.pdf"
+        unicode_file.write_text("%PDF-1.5 Unicode résumé content", encoding="utf-8")
+
+        # Share spaced file
+        status, body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "nested_folder/My Resume.pdf"},
+            headers=self.auth_headers()
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("nested_folder/My%20Resume.pdf", body.get("url"))
+
+        # Access with encoded space
+        sp_status, _, sp_bytes, _ = http_request(f"{self.base_url}/share/nested_folder/My%20Resume.pdf")
+        self.assertEqual(sp_status, 200)
+        self.assertIn(b"Resume with spaces", sp_bytes)
+
+        # Share Unicode file
+        u_status, u_body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "nested_folder/résumé.pdf"},
+            headers=self.auth_headers()
+        )
+        self.assertEqual(u_status, 200)
+
+        # Access with percent-encoded Unicode path
+        encoded_unicode = urllib.parse.quote("résumé.pdf")
+        u_get_status, _, u_get_bytes, _ = http_request(f"{self.base_url}/share/nested_folder/{encoded_unicode}")
+        self.assertEqual(u_get_status, 200)
+        self.assertIn("résumé".encode("utf-8"), u_get_bytes)
+
+    def test_28_path_based_share_security_traversal_and_unshared_denied(self):
+        """Phase 4: Deny unshared files, directory traversal, null bytes, and path escapes."""
+        # Unshared file in storage must return 404 (never exposed just because path is known)
+        secret_file = self.storage_dir / "confidential_secrets.txt"
+        secret_file.write_text("CLASSIFIED", encoding="utf-8")
+        unshared_status, _, _, _ = http_request(f"{self.base_url}/share/confidential_secrets.txt")
+        self.assertEqual(unshared_status, 404, "Unshared file must never be accessible via /share/")
+
+        # Traversal attempts
+        traversal_attempts = [
+            f"{self.base_url}/share/../config/secrets/auth.token",
+            f"{self.base_url}/share/..%2fconfig%2fsecrets%2fauth.token",
+            f"{self.base_url}/share/nested_folder/../../config/secrets/auth.token",
+            f"{self.base_url}/share/document.txt%00.png",
+            f"{self.base_url}/share//etc/passwd",
+            f"{self.base_url}/share/",
+        ]
+        for url in traversal_attempts:
+            t_status, _, _, _ = http_request(url)
+            self.assertEqual(t_status, 404, f"Traversal attempt '{url}' must be denied with 404")
+
+    def test_29_backward_compatibility_token_based_shares(self):
+        """Phase 4: Existing token-based share URLs (/share/<token>) remain operational."""
+        # 1. File share token
+        status, body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "document.txt"},
+            headers=self.auth_headers()
+        )
+        share_id = body["share_id"]
+
+        token_status, _, token_bytes, _ = http_request(f"{self.base_url}/share/{share_id}")
+        self.assertEqual(token_status, 200)
+        self.assertEqual(token_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+
+        token_file_status, _, token_file_bytes, _ = http_request(f"{self.base_url}/share/{share_id}/file")
+        self.assertEqual(token_file_status, 200)
+        self.assertEqual(token_file_bytes.decode("utf-8"), "Hello PersonalServer Storage!")
+
+        # 2. Folder share token
+        f_status, f_body, _, _ = http_request(
+            f"{self.base_url}/storage/share",
+            method="POST",
+            data={"path": "nested_folder", "is_dir": True},
+            headers=self.auth_headers()
+        )
+        f_share_id = f_body["share_id"]
+
+        list_status, list_body, _, _ = http_request(f"{self.base_url}/share/{f_share_id}/list")
+        self.assertEqual(list_status, 200)
+        self.assertEqual(list_body["folder_name"], "nested_folder")
+        self.assertTrue(any(item["name"] == "inner.txt" for item in list_body.get("items", [])))
+
+    def test_30_private_storage_apis_remain_protected(self):
+        """Phase 4: Verify /storage/list, /storage/download, /storage/upload, /storage/mkdir require auth."""
+        private_endpoints = [
+            (f"{self.base_url}/storage/list", "GET", None),
+            (f"{self.base_url}/storage/download?path=document.txt", "GET", None),
+            (f"{self.base_url}/storage/upload?path=", "POST", {}),
+            (f"{self.base_url}/storage/mkdir", "POST", {"name": "TestDir"}),
+        ]
+        unauth_header = {"Authorization": "Bearer invalid-unauthorized-token"}
+        for url, method, data in private_endpoints:
+            status, _, _, _ = http_request(url, method=method, data=data, headers=unauth_header)
+            self.assertEqual(status, 401, f"Private endpoint {method} {url} must return 401")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

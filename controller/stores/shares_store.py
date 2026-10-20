@@ -74,6 +74,8 @@ def find_active_share(node_id: str, rel_path: str, paths: Optional[Any] = None) 
         return None
     clean_path = rel_path.replace("\\", "/").strip("/")
     target_node = (node_id or "").strip()
+    if target_node.lower() in ("auto", "cluster", "local", "self", "default", "none", "null"):
+        target_node = ""
 
     db = load_shares_db(paths)
     for share in db.get("shares", {}).values():
@@ -85,20 +87,23 @@ def find_active_share(node_id: str, rel_path: str, paths: Optional[Any] = None) 
     return None
 
 
-def create_share(node_id: str, rel_path: str, filename: str = "", paths: Optional[Any] = None) -> Dict[str, Any]:
+def create_share(node_id: str, rel_path: str, filename: str = "", is_dir: bool = False, paths: Optional[Any] = None) -> Dict[str, Any]:
     """
     Creates a new public share record with a cryptographically secure random token.
-    Immediately revokes any existing active share for the same file/node.
+    Immediately revokes any existing active share for the same file/folder and node.
     """
     clean_path = rel_path.replace("\\", "/").strip("/")
     target_node = (node_id or "").strip()
-    clean_filename = filename or Path(clean_path).name
+    if target_node.lower() in ("auto", "cluster", "local", "self", "default", "none", "null"):
+        target_node = ""
+    clean_filename = filename or Path(clean_path).name or clean_path
+    item_type = "folder" if is_dir else "file"
 
     with DB_LOCK:
         db = load_shares_db(paths)
         shares = db.setdefault("shares", {})
 
-        # Revoke existing active shares for this specific file/node
+        # Revoke existing active shares for this specific file/folder/node
         for s in shares.values():
             if not s.get("revoked", False):
                 s_node = (s.get("node_id") or "").strip()
@@ -116,6 +121,8 @@ def create_share(node_id: str, rel_path: str, filename: str = "", paths: Optiona
             "node_id": target_node,
             "path": clean_path,
             "filename": clean_filename,
+            "is_dir": bool(is_dir),
+            "item_type": item_type,
             "created_at": get_current_iso_timestamp(),
             "revoked": False,
             "access": "link",
@@ -127,9 +134,35 @@ def create_share(node_id: str, rel_path: str, filename: str = "", paths: Optiona
         return record
 
 
+def find_active_folder_share_for_path(node_id: str, rel_path: str, paths: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    """
+    Finds an active (non-revoked) folder share that contains the given relative path.
+    Checks each parent directory segment of rel_path from immediate parent up to root.
+    """
+    if not rel_path:
+        return None
+    clean_path = rel_path.replace("\\", "/").strip("/")
+    target_node = (node_id or "").strip()
+    if target_node.lower() in ("auto", "cluster", "local", "self", "default", "none", "null"):
+        target_node = ""
+
+    db = load_shares_db(paths)
+    parts = clean_path.split("/")
+    for i in range(len(parts) - 1, 0, -1):
+        prefix = "/".join(parts[:i])
+        for share in db.get("shares", {}).values():
+            if not share.get("revoked", False) and (share.get("is_dir") or share.get("item_type") == "folder"):
+                s_node = (share.get("node_id") or "").strip()
+                s_path = (share.get("path") or "").replace("\\", "/").strip("/")
+                if (s_path == prefix or s_path.lower() == prefix.lower()) and (not target_node or not s_node or s_node == target_node):
+                    return share
+    return None
+
+
 def revoke_share(share_id_or_path: str, node_id: Optional[str] = None, paths: Optional[Any] = None) -> bool:
     """
-    Revokes public access for a share identified by token or file path.
+    Revokes public access for a share identified by token or file/folder path.
+    If revoking a folder share, cascades revocation to any descendant file links.
     """
     if not share_id_or_path:
         return False
@@ -138,16 +171,22 @@ def revoke_share(share_id_or_path: str, node_id: Optional[str] = None, paths: Op
         db = load_shares_db(paths)
         shares = db.setdefault("shares", {})
         revoked_any = False
+        revoked_folder_paths = set()
 
         # Direct token match
         if share_id_or_path in shares:
-            if not shares[share_id_or_path].get("revoked"):
-                shares[share_id_or_path]["revoked"] = True
+            target = shares[share_id_or_path]
+            if not target.get("revoked"):
+                target["revoked"] = True
                 revoked_any = True
+                if target.get("is_dir") or target.get("item_type") == "folder":
+                    revoked_folder_paths.add((target.get("path") or "").replace("\\", "/").strip("/"))
 
         # Path match
         clean_path = share_id_or_path.replace("\\", "/").strip("/")
         target_node = (node_id or "").strip()
+        if target_node.lower() in ("auto", "cluster", "local", "self", "default", "none", "null"):
+            target_node = ""
         for s in shares.values():
             if not s.get("revoked", False):
                 s_node = (s.get("node_id") or "").strip()
@@ -155,6 +194,18 @@ def revoke_share(share_id_or_path: str, node_id: Optional[str] = None, paths: Op
                 if (s_path == clean_path or s_path.lower() == clean_path.lower()) and (not target_node or not s_node or s_node == target_node):
                     s["revoked"] = True
                     revoked_any = True
+                    if s.get("is_dir") or s.get("item_type") == "folder":
+                        revoked_folder_paths.add(s_path)
+
+        # Cascading revocation: ensure any active shares for descendants of revoked folders are revoked
+        if revoked_folder_paths:
+            for s in shares.values():
+                if not s.get("revoked", False):
+                    s_path = (s.get("path") or "").replace("\\", "/").strip("/")
+                    for rfp in revoked_folder_paths:
+                        if s_path == rfp or s_path.startswith(rfp + "/"):
+                            s["revoked"] = True
+                            revoked_any = True
 
         if revoked_any:
             save_shares_db(db, paths)

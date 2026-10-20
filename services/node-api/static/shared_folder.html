@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shared Folder — PersonalServer</title>
+  <style>
+    :root {
+      --bg-primary: #090d16;
+      --bg-card: #111827;
+      --bg-hover: #1e293b;
+      --border-color: #243046;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --danger: #ef4444;
+      --success: #10b981;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .mono { font-family: var(--font-mono); }
+    header {
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border-color);
+      padding: 14px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 600;
+      font-size: 16px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 500;
+      background: rgba(59, 130, 246, 0.12);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.25);
+    }
+    main {
+      flex: 1;
+      max-width: 1200px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+    }
+    .folder-header {
+      padding: 20px 24px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .folder-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .folder-icon-large {
+      font-size: 28px;
+    }
+    .folder-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+    .folder-meta {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    .breadcrumbs {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 24px;
+      background: rgba(0,0,0,0.15);
+      border-bottom: 1px solid var(--border-color);
+      font-size: 13px;
+      overflow-x: auto;
+    }
+    .crumb {
+      color: var(--text-muted);
+      cursor: pointer;
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    .crumb:hover { color: var(--primary); }
+    .crumb.current {
+      color: var(--text-main);
+      font-weight: 600;
+      cursor: default;
+    }
+    .crumb-sep { color: #475569; }
+    .table-container {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+    th {
+      padding: 12px 18px;
+      font-weight: 600;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border-color);
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.05em;
+    }
+    td {
+      padding: 12px 18px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      color: var(--text-main);
+    }
+    tr.file-row:hover {
+      background: var(--bg-hover);
+    }
+    .file-cell {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .item-link {
+      color: var(--text-main);
+      text-decoration: none;
+      font-weight: 500;
+    }
+    .item-link:hover {
+      color: var(--primary);
+    }
+    .cell-muted {
+      color: var(--text-muted);
+    }
+    .actions-cell {
+      text-align: right;
+      white-space: nowrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      border-radius: 6px;
+      border: 1px solid var(--border-color);
+      background: var(--bg-hover);
+      color: var(--text-main);
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.15s ease;
+    }
+    .btn:hover {
+      background: #334155;
+      border-color: #475569;
+    }
+    .btn-primary {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #ffffff;
+    }
+    .btn-primary:hover {
+      background: var(--primary-hover);
+      border-color: var(--primary-hover);
+    }
+    .state-box {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
+    }
+    .state-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+    }
+    .state-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-main);
+      margin-bottom: 8px;
+    }
+    /* Preview Modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 20px;
+    }
+    .modal-frame {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      width: 100%;
+      max-width: 900px;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .modal-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .modal-title {
+      font-weight: 600;
+      font-size: 15px;
+    }
+    .modal-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 18px;
+      cursor: pointer;
+    }
+    .modal-close:hover { color: var(--text-main); }
+    .modal-body {
+      padding: 16px;
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 300px;
+      background: rgba(0,0,0,0.3);
+    }
+    .modal-body iframe {
+      width: 100%;
+      height: 65vh;
+      border: none;
+      border-radius: 4px;
+      background: #ffffff;
+    }
+    .modal-body img {
+      max-width: 100%;
+      max-height: 65vh;
+      object-fit: contain;
+      border-radius: 4px;
+    }
+    .modal-body pre {
+      width: 100%;
+      max-height: 65vh;
+      overflow: auto;
+      background: #050811;
+      padding: 16px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #e2e8f0;
+      white-space: pre-wrap;
+    }
+    .modal-footer {
+      padding: 12px 20px;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>PersonalServer</span>
+      <span class="badge">Read-Only Shared Folder</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <div class="folder-header">
+        <div class="folder-title-wrap">
+          <div class="folder-icon-large">📁</div>
+          <div>
+            <div class="folder-title" id="folder-name">Loading Shared Folder...</div>
+            <div class="folder-meta mono" id="folder-stats">-- items</div>
+          </div>
+        </div>
+      </div>
+
+      <nav class="breadcrumbs" id="breadcrumbs" aria-label="Breadcrumb"></nav>
+
+      <div class="table-container">
+        <table id="file-table" style="display: none;">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Type</th>
+              <th>Size</th>
+              <th>Modified</th>
+              <th style="text-align: right;">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="file-tbody"></tbody>
+        </table>
+
+        <div id="loading-state" class="state-box">
+          <div class="state-icon">⏳</div>
+          <div class="state-title">Loading folder contents...</div>
+        </div>
+
+        <div id="error-state" class="state-box" style="display: none;">
+          <div class="state-icon">⚠️</div>
+          <div class="state-title" id="error-title">Share Not Found or Revoked</div>
+          <div id="error-desc" style="max-width: 480px; margin: 0 auto; line-height: 1.5;">
+            This shared link is no longer available, was turned off by the owner, or does not exist.
+          </div>
+        </div>
+
+        <div id="empty-state" class="state-box" style="display: none;">
+          <div class="state-icon">📂</div>
+          <div class="state-title">This folder is empty</div>
+          <div>No files or subdirectories found.</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Built-in Preview Modal -->
+  <div id="preview-modal" class="modal-backdrop" style="display: none;" onclick="if(event.target === this) closePreview();">
+    <div class="modal-frame">
+      <div class="modal-header">
+        <span class="modal-title mono" id="preview-filename">File Preview</span>
+        <button type="button" class="modal-close" onclick="closePreview()" title="Close">✕</button>
+      </div>
+      <div class="modal-body" id="preview-body"></div>
+      <div class="modal-footer">
+        <a href="#" id="preview-download-btn" class="btn btn-primary" download>Download File</a>
+        <button type="button" class="btn" onclick="closePreview()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Extract share_id from injected __SHARE_RECORD__ or fallback from URL: /share/<share_id>
+    const pathParts = window.location.pathname.split("/").filter(Boolean);
+    const shareIndex = pathParts.indexOf("share");
+    let shareId = (window.__SHARE_RECORD__ && window.__SHARE_RECORD__.share_id) || "";
+    if (!shareId && shareIndex !== -1 && pathParts.length > shareIndex + 1) {
+      shareId = pathParts[shareIndex + 1];
+    }
+
+    let currentSubpath = "";
+    let rootFolderName = (window.__SHARE_RECORD__ && window.__SHARE_RECORD__.folder_name) || "Shared Folder";
+
+    function formatBytes(bytes) {
+      if (bytes === 0 || !bytes) return "0 B";
+      const k = 1024;
+      const sizes = ["B", "KB", "MB", "GB", "TB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+    }
+
+    function formatDate(isoStr) {
+      if (!isoStr) return "--";
+      try {
+        const d = new Date(isoStr);
+        return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      } catch (e) {
+        return isoStr;
+      }
+    }
+
+    function getFileIcon(name, isDir) {
+      if (isDir) return "📁";
+      const ext = name.split(".").pop().toLowerCase();
+      if (["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp"].includes(ext)) return "🖼️";
+      if (ext === "pdf") return "📄";
+      if (["mp4", "webm", "mkv", "mov"].includes(ext)) return "🎬";
+      if (["mp3", "wav", "ogg", "flac"].includes(ext)) return "🎵";
+      if (["zip", "tar", "gz", "rar", "7z"].includes(ext)) return "📦";
+      if (["json", "js", "ts", "py", "sh", "html", "css"].includes(ext)) return "💻";
+      return "📄";
+    }
+
+    function isPreviewable(name) {
+      const ext = name.split(".").pop().toLowerCase();
+      return ["pdf", "jpg", "jpeg", "png", "gif", "webp", "txt", "md", "json", "py", "js", "html", "css", "log", "mp4", "webm", "mp3", "wav"].includes(ext);
+    }
+
+    function renderBreadcrumbs() {
+      const container = document.getElementById("breadcrumbs");
+      const parts = currentSubpath ? currentSubpath.split("/").filter(Boolean) : [];
+
+      let html = `<a href="javascript:void(0)" class="crumb ${parts.length === 0 ? 'current' : ''}" onclick="navigateTo('')">${rootFolderName}</a>`;
+      let accumulated = "";
+      parts.forEach((part, index) => {
+        accumulated += (accumulated ? "/" : "") + part;
+        const target = accumulated;
+        const isLast = index === parts.length - 1;
+        html += `<span class="crumb-sep">/</span>`;
+        if (isLast) {
+          html += `<span class="crumb current">${part}</span>`;
+        } else {
+          html += `<a href="javascript:void(0)" class="crumb" onclick="navigateTo('${encodeURIComponent(target)}')">${part}</a>`;
+        }
+      });
+      container.innerHTML = html;
+    }
+
+    async function loadFolder(subpath = "") {
+      const loading = document.getElementById("loading-state");
+      const error = document.getElementById("error-state");
+      const empty = document.getElementById("empty-state");
+      const table = document.getElementById("file-table");
+      const tbody = document.getElementById("file-tbody");
+
+      loading.style.display = "block";
+      error.style.display = "none";
+      empty.style.display = "none";
+      table.style.display = "none";
+
+      try {
+        const query = subpath ? `?subpath=${encodeURIComponent(subpath)}` : "";
+        const res = await fetch(`/share/${encodeURIComponent(shareId)}/list${query}`);
+        if (!res.ok) {
+          throw new Error(`Failed to load shared folder (HTTP ${res.status})`);
+        }
+        const data = await res.json();
+        currentSubpath = data.current_subpath || "";
+        rootFolderName = data.folder_name || "Shared Folder";
+        document.getElementById("folder-name").textContent = rootFolderName;
+
+        renderBreadcrumbs();
+
+        const items = data.items || [];
+        document.getElementById("folder-stats").textContent = `${items.length} item${items.length === 1 ? '' : 's'}`;
+
+        if (items.length === 0) {
+          loading.style.display = "none";
+          empty.style.display = "block";
+          return;
+        }
+
+        tbody.innerHTML = "";
+        items.forEach(item => {
+          const tr = document.createElement("tr");
+          tr.className = "file-row";
+
+          const icon = getFileIcon(item.name, item.is_dir);
+          const fullSub = currentSubpath ? `${currentSubpath}/${item.name}` : item.name;
+          const encodedSub = encodeURIComponent(fullSub);
+
+          const downloadUrl = `/share/${encodeURIComponent(shareId)}/download?subpath=${encodedSub}`;
+          const previewUrl = `/share/${encodeURIComponent(shareId)}/file?subpath=${encodedSub}`;
+
+          let nameHtml = "";
+          let actionsHtml = "";
+
+          if (item.is_dir) {
+            nameHtml = `<a href="javascript:void(0)" class="item-link" onclick="navigateTo('${encodedSub}')">${item.name}</a>`;
+            actionsHtml = `<button class="btn btn-sm" onclick="navigateTo('${encodedSub}')">Open</button>`;
+          } else {
+            nameHtml = `<span class="item-link">${item.name}</span>`;
+            if (isPreviewable(item.name)) {
+              actionsHtml += `<button class="btn btn-sm btn-primary" onclick="openPreview('${encodedSub}', '${encodeURIComponent(item.name)}')">Preview</button> `;
+            }
+            actionsHtml += `<a href="${downloadUrl}" class="btn btn-sm" download>Download</a>`;
+          }
+
+          tr.innerHTML = `
+            <td>
+              <div class="file-cell">
+                <span>${icon}</span>
+                ${nameHtml}
+              </div>
+            </td>
+            <td class="cell-muted">${item.is_dir ? 'Folder' : (item.mime || 'File')}</td>
+            <td class="mono cell-muted">${item.is_dir ? '--' : formatBytes(item.size)}</td>
+            <td class="mono cell-muted">${formatDate(item.modified)}</td>
+            <td class="actions-cell">${actionsHtml}</td>
+          `;
+          tbody.appendChild(tr);
+        });
+
+        loading.style.display = "none";
+        table.style.display = "table";
+      } catch (err) {
+        loading.style.display = "none";
+        error.style.display = "block";
+        document.getElementById("error-title").textContent = "Share Link Unavailable";
+        document.getElementById("error-desc").textContent = err.message || "The share link may be revoked or inactive.";
+      }
+    }
+
+    function navigateTo(encodedSub) {
+      const sub = decodeURIComponent(encodedSub || "");
+      loadFolder(sub);
+    }
+
+    async function openPreview(encodedSub, encodedName) {
+      const sub = decodeURIComponent(encodedSub);
+      const name = decodeURIComponent(encodedName);
+      const modal = document.getElementById("preview-modal");
+      const title = document.getElementById("preview-filename");
+      const body = document.getElementById("preview-body");
+      const dlBtn = document.getElementById("preview-download-btn");
+
+      title.textContent = name;
+      const fileUrl = `/share/${encodeURIComponent(shareId)}/file?subpath=${encodeURIComponent(sub)}`;
+      dlBtn.href = `/share/${encodeURIComponent(shareId)}/download?subpath=${encodeURIComponent(sub)}`;
+
+      const ext = name.split(".").pop().toLowerCase();
+      body.innerHTML = "<div class='mono cell-muted'>Loading preview...</div>";
+      modal.style.display = "flex";
+
+      if (["jpg", "jpeg", "png", "gif", "webp", "svg"].includes(ext)) {
+        body.innerHTML = `<img src="${fileUrl}" alt="${name}">`;
+      } else if (ext === "pdf") {
+        body.innerHTML = `<iframe src="${fileUrl}" title="${name}"></iframe>`;
+      } else if (["mp4", "webm"].includes(ext)) {
+        body.innerHTML = `<video controls autoplay style="max-width:100%; max-height:65vh;"><source src="${fileUrl}"></video>`;
+      } else if (["mp3", "wav", "ogg"].includes(ext)) {
+        body.innerHTML = `<audio controls autoplay style="width:100%;"><source src="${fileUrl}"></audio>`;
+      } else {
+        try {
+          const resp = await fetch(fileUrl);
+          const text = await resp.text();
+          body.innerHTML = `<pre><code>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</code></pre>`;
+        } catch (e) {
+          body.innerHTML = `<div class='mono cell-muted'>Failed to load text preview: ${e.message}</div>`;
+        }
+      }
+    }
+
+    function closePreview() {
+      const modal = document.getElementById("preview-modal");
+      modal.style.display = "none";
+      document.getElementById("preview-body").innerHTML = "";
+    }
+
+    // Keyboard navigation (Esc to close preview)
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closePreview();
+    });
+
+    // Initial load
+    if (shareId) {
+      loadFolder("");
+    } else {
+      document.getElementById("loading-state").style.display = "none";
+      document.getElementById("error-state").style.display = "block";
+    }
+  </script>
+</body>
+</html>

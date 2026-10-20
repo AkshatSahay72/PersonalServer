@@ -199,7 +199,248 @@ setTimeout(() => {
         self.assertIn("preview-modal-content", index_html)
         self.assertIn("storage-props-preview-btn", index_html)
 
+    def test_08_storage_preview_and_share_modals_interaction(self):
+        """Simulate Preview and Share modal interactions in Node.js VM."""
+        if not self.node_bin:
+            raise unittest.SkipTest("Node.js binary not available in PATH")
+
+        runner_script = """
+const fs = require('fs');
+const vm = require('vm');
+
+const code = fs.readFileSync(process.argv[1], 'utf8');
+const fetchCalls = [];
+
+const elements = {};
+function getOrCreate(id) {
+  if (!elements[id]) {
+    elements[id] = {
+      id: id,
+      style: { display: 'none' },
+      classList: { add: () => {}, remove: () => {}, contains: () => false, toggle: () => {} },
+      addEventListener: () => {},
+      setAttribute: (k, v) => { elements[id][k] = v; },
+      getAttribute: (k) => elements[id][k],
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      checked: false,
+      href: ''
+    };
+  }
+  return elements[id];
+}
+
+const mockDoc = {
+  getElementById: (id) => getOrCreate(id),
+  querySelectorAll: () => [],
+  querySelector: () => null,
+  addEventListener: () => {},
+  createElement: () => ({ style: {}, classList: { add: () => {}, remove: () => {} }, setAttribute: () => {}, appendChild: () => {} }),
+  body: { appendChild: () => {} }
+};
+
+let shareResponse = { shared: true, url: 'https://server.akshatsahay.space/storage/test%20file.pdf', share_id: 'abc123xyz' };
+
+const sandbox = {
+  location: { hash: '#storage', hostname: 'server.akshatsahay.space', protocol: 'https:' },
+  document: mockDoc,
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  innerWidth: 1024,
+  sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+  localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+  addEventListener: () => {},
+  fetch: (url, opts) => {
+    fetchCalls.push({ url, opts });
+    if (url.includes('/storage/share') && (!opts || !opts.method || opts.method === 'GET')) {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(shareResponse) });
+    }
+    if (url.includes('/storage/share') && opts?.method === 'POST') {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ status: 'enabled', shared: true, url: 'https://server.akshatsahay.space/storage/test%20file.pdf' }) });
+    }
+    if (url.includes('/storage/share') && opts?.method === 'DELETE') {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ status: 'revoked', shared: false }) });
+    }
+    if (url.includes('/storage/preview')) {
+      return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('Sample preview text content') });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+  }
+};
+sandbox.window = sandbox;
+
+vm.createContext(sandbox);
+vm.runInContext(code, sandbox);
+
+async function runTests() {
+  // Test 1: Open Preview Modal for PDF
+  await sandbox.openPreviewModal('nested/my test.pdf');
+  const previewBackdrop = getOrCreate('storage-preview-modal-backdrop');
+  const previewTitle = getOrCreate('preview-modal-title');
+  const previewOpenBtn = getOrCreate('preview-modal-open-btn');
+  const previewContent = getOrCreate('preview-modal-content');
+
+  if (previewBackdrop.style.display !== 'flex') {
+    throw new Error('Preview modal backdrop was not displayed');
+  }
+  if (previewTitle.textContent !== 'my test.pdf') {
+    throw new Error('Preview title did not match filename');
+  }
+  if (!previewOpenBtn.href.includes('/storage/preview?path=nested%2Fmy%20test.pdf')) {
+    throw new Error('Preview open URL malformed: ' + previewOpenBtn.href);
+  }
+  if (!previewContent.innerHTML.includes('iframe') || !previewContent.innerHTML.includes('preview-iframe')) {
+    throw new Error('PDF preview did not render iframe viewer');
+  }
+
+  // Test 2: Close and Reopen Preview Modal
+  sandbox.closePreviewModal();
+  if (previewBackdrop.style.display !== 'none') {
+    throw new Error('Preview backdrop did not hide on close');
+  }
+  if (previewContent.innerHTML !== '') {
+    throw new Error('Preview content was not cleaned on close');
+  }
+
+  // Test 3: Reopen for text file
+  await sandbox.openPreviewModal('notes.txt');
+  if (previewBackdrop.style.display !== 'flex') {
+    throw new Error('Preview backdrop did not reopen');
+  }
+  if (!previewContent.innerHTML.includes('Sample preview text content')) {
+    throw new Error('Text preview did not render text content');
+  }
+  sandbox.closePreviewModal();
+
+  // Test 4: Open Share Modal for an active shared file
+  await sandbox.openShareModal('folder/document.txt');
+  const shareBackdrop = getOrCreate('storage-share-modal-backdrop');
+  const shareToggle = getOrCreate('share-toggle-input');
+  const shareStatusText = getOrCreate('share-toggle-status-text');
+  const shareUrlInput = getOrCreate('share-url-input');
+
+  if (shareBackdrop.style.display !== 'flex') {
+    throw new Error('Share modal backdrop was not displayed');
+  }
+  if (!shareToggle.checked || shareStatusText.textContent !== 'ON') {
+    throw new Error('Share toggle did not reflect ON state');
+  }
+  if (shareUrlInput.value !== 'https://server.akshatsahay.space/storage/test%20file.pdf') {
+    throw new Error('Share URL was not set in input');
+  }
+
+  // Test 5: Toggle Share OFF
+  await sandbox.toggleFileSharing({ target: { checked: false } });
+  const deleteCalls = fetchCalls.filter(c => c.opts?.method === 'DELETE');
+  if (deleteCalls.length === 0) {
+    throw new Error('Disabling share did not send DELETE request');
+  }
+  if (!deleteCalls[0].url.includes('/storage/share?path=folder%2Fdocument.txt')) {
+    throw new Error('DELETE share URL mismatch: ' + deleteCalls[0].url);
+  }
+  if (shareUrlInput.value !== '') {
+    throw new Error('URL input was not cleared when toggled OFF');
+  }
+
+  // Test 6: Toggle Share ON
+  await sandbox.toggleFileSharing({ target: { checked: true } });
+  const postCalls = fetchCalls.filter(c => c.opts?.method === 'POST');
+  if (postCalls.length === 0) {
+    throw new Error('Enabling share did not send POST request');
+  }
+  const postBody = JSON.parse(postCalls[0].opts.body);
+  if (postBody.path !== 'folder/document.txt') {
+    throw new Error('POST share body path mismatch: ' + postBody.path);
+  }
+
+  // Test 7: Close Share Modal
+  sandbox.closeShareModal();
+  if (shareBackdrop.style.display !== 'none') {
+    throw new Error('Share backdrop did not hide on close');
+  }
+
+  console.log('All Preview and Share modal interactions passed successfully!');
+  process.exit(0);
+}
+
+runTests().catch(err => {
+  console.error('Test execution failed:', err);
+  process.exit(1);
+});
+"""
+        result = subprocess.run(
+            [self.node_bin, "-e", runner_script, str(self.app_js_path)],
+            capture_output=True,
+            text=True
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"Preview & Share interaction test failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+        )
+
+    def test_09_modal_html_hierarchy_and_unclosed_tags(self):
+        """
+        Verify index.html has well-formed modal structure with zero unclosed tags,
+        ensuring preview and share modals are not trapped inside a hidden backdrop.
+        """
+        import re
+        content = self.index_html_path.read_text(encoding="utf-8")
+        tag_pattern = re.compile(r'<\/?([a-zA-Z0-9]+)(?:\s+[^>]*?)?(\/?)>')
+        stack = []
+        void_elements = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
+
+        for match in tag_pattern.finditer(content):
+            tag_name = match.group(1).lower()
+            is_closing = match.group(0).startswith('</')
+            is_self_closing = match.group(2) == '/' or tag_name in void_elements
+            line = content[:match.start()].count('\n') + 1
+
+            if is_self_closing and not is_closing:
+                continue
+            elif is_closing:
+                self.assertTrue(len(stack) > 0, f"Line {line}: Unexpected closing </{tag_name}>")
+                popped_tag, popped_line, popped_str = stack.pop()
+                self.assertEqual(
+                    popped_tag, tag_name,
+                    f"Line {line}: Mismatched </{tag_name}>, expected </{popped_tag}> (opened at line {popped_line})"
+                )
+            else:
+                m_str = match.group(0)
+                stack.append((tag_name, line, m_str))
+
+        self.assertEqual(len(stack), 0, f"Unclosed tags remaining on stack: {stack}")
+
+        # Verify each modal backdrop exists as a distinct sibling, none nested inside another
+        modal_ids = [
+            "node-diag-modal-backdrop",
+            "storage-share-modal-backdrop",
+            "storage-preview-modal-backdrop",
+            "ha-details-modal-backdrop"
+        ]
+        for m_id in modal_ids:
+            self.assertIn(f'id="{m_id}"', content)
+
+    def test_10_shared_folder_viewer_html_integrity_and_wiring(self):
+        """Verify shared_folder.html exists, has clean HTML, and app.js has folder share wiring."""
+        shared_folder_html = STATIC_DIR / "shared_folder.html"
+        self.assertTrue(shared_folder_html.exists(), "shared_folder.html must exist in static dir")
+        sf_content = shared_folder_html.read_text(encoding="utf-8")
+        self.assertIn("Shared Folder", sf_content)
+        self.assertIn("preview-modal", sf_content)
+        self.assertIn("file-table", sf_content)
+
+        # Check app.js for folder share wiring
+        app_js = self.app_js_path.read_text(encoding="utf-8")
+        self.assertIn("currentSharingIsDir", app_js)
+        self.assertIn("openShareModal(decodeURIComponent('${safeJsPath}'), ${isDir})", app_js)
+        self.assertIn("is_dir: currentSharingIsDir", app_js)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

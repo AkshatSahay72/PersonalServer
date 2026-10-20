@@ -123,8 +123,18 @@ document.querySelectorAll(".sidebar .nav-link").forEach(link => {
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && sidebar?.classList.contains("open")) {
-    toggleMobileNav(false);
+  if (e.key === "Escape") {
+    if (sidebar?.classList.contains("open")) {
+      toggleMobileNav(false);
+    }
+    const previewBackdrop = document.getElementById("storage-preview-modal-backdrop");
+    if (previewBackdrop && previewBackdrop.style.display !== "none") {
+      closePreviewModal();
+    }
+    const shareBackdrop = document.getElementById("storage-share-modal-backdrop");
+    if (shareBackdrop && shareBackdrop.style.display !== "none") {
+      closeShareModal();
+    }
   }
 });
 
@@ -2486,15 +2496,17 @@ function renderStorageTable() {
 
     const escapedPath = itemRelPath.replace(/'/g, "\\'");
     const escapedName = item.name.replace(/'/g, "\\'");
+    const safeJsPath = encodeURIComponent(itemRelPath).replace(/'/g, "%27");
+    const safeJsName = encodeURIComponent(item.name).replace(/'/g, "%27");
     const isSelected = selectedItemName === item.name ? "selected" : "";
 
     return `
-      <tr class="explorer-row ${isSelected}" onclick="selectStorageRow(event, '${escapedName}')" ondblclick="${isDir ? `loadStorage('${escapedPath}', '${node}', true)` : `openPreviewModal('${escapedPath}')`}">
+      <tr class="explorer-row ${isSelected}" onclick="selectStorageRow(event, decodeURIComponent('${safeJsName}'))" ondblclick="${isDir ? `loadStorage(decodeURIComponent('${safeJsPath}'), '${node}', true)` : `openPreviewModal(decodeURIComponent('${safeJsPath}'))`}">
         <td>
           <div class="file-name-cell">
             <span class="file-icon">${icon}</span>
             ${isDir 
-              ? `<a href="javascript:void(0)" class="mono" style="font-weight: 500;" onclick="event.stopPropagation(); loadStorage('${escapedPath}', '${node}', true)">${escapeHtml(item.name)}</a>`
+              ? `<a href="javascript:void(0)" class="mono" style="font-weight: 500;" onclick="event.stopPropagation(); loadStorage(decodeURIComponent('${safeJsPath}'), '${node}', true)">${escapeHtml(item.name)}</a>`
               : `<span class="mono">${escapeHtml(item.name)}</span>`
             }
           </div>
@@ -2504,12 +2516,12 @@ function renderStorageTable() {
         <td class="mono cell-muted">${modStr}</td>
         <td style="text-align: right;">
           <div class="explorer-row-actions">
-            ${!isDir ? `<button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); openPreviewModal('${escapedPath}')" title="Preview file">Preview</button>` : ''}
-            ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download title="Download file" onclick="event.stopPropagation()">Download</a>` : ''}
-            ${!isDir ? `<button class="btn btn-sm" onclick="event.stopPropagation(); openShareModal('${escapedPath}')" title="Share link">Share</button>` : ''}
-            ${isOnline ? `<button class="btn btn-sm" onclick="event.stopPropagation(); renameItem('${escapedPath}')" title="Rename">Rename</button>` : ''}
-            ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteItem('${escapedPath}', ${isDir})" title="Delete">Delete</button>` : ''}
-            <button class="btn btn-sm" onclick="event.stopPropagation(); viewStorageProperties('${escapedPath}', ${isDir})" title="Item Properties">Props</button>
+            ${!isDir ? `<button class="btn btn-sm btn-primary storage-btn-preview" data-action="preview" data-path="${encodeURIComponent(itemRelPath)}" onclick="event.stopPropagation(); openPreviewModal(decodeURIComponent('${safeJsPath}'))" title="Preview file">Preview</button>` : ''}
+            ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm storage-btn-download" download title="Download file" onclick="event.stopPropagation()">Download</a>` : ''}
+            <button class="btn btn-sm storage-btn-share" data-action="share" data-is-dir="${isDir}" data-path="${encodeURIComponent(itemRelPath)}" onclick="event.stopPropagation(); openShareModal(decodeURIComponent('${safeJsPath}'), ${isDir})" title="${isDir ? 'Share folder' : 'Share link'}">Share</button>
+            ${isOnline ? `<button class="btn btn-sm" onclick="event.stopPropagation(); renameItem(decodeURIComponent('${safeJsPath}'))" title="Rename">Rename</button>` : ''}
+            ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteItem(decodeURIComponent('${safeJsPath}'), ${isDir})" title="Delete">Delete</button>` : ''}
+            <button class="btn btn-sm" onclick="event.stopPropagation(); viewStorageProperties(decodeURIComponent('${safeJsPath}'), ${isDir})" title="Item Properties">Props</button>
           </div>
         </td>
       </tr>
@@ -2771,12 +2783,15 @@ window.shareCurrentPropsItem = function() {
 // ==========================================
 
 let currentSharingPath = null;
+let currentSharingIsDir = false;
 
-window.openShareModal = async function(itemRelPath) {
+window.openShareModal = async function(itemRelPath, isDir = false) {
   currentSharingPath = itemRelPath;
-  const fileName = itemRelPath.split("/").pop();
+  currentSharingIsDir = Boolean(isDir);
+  const itemName = itemRelPath.split("/").pop();
 
   const backdrop = document.getElementById("storage-share-modal-backdrop");
+  const modalTitle = document.getElementById("share-modal-title");
   const nameEl = document.getElementById("share-file-name");
   const pathEl = document.getElementById("share-file-path");
   const loadingEl = document.getElementById("share-modal-loading");
@@ -2791,7 +2806,8 @@ window.openShareModal = async function(itemRelPath) {
 
   if (!backdrop) return;
 
-  if (nameEl) nameEl.textContent = fileName;
+  if (modalTitle) modalTitle.textContent = isDir ? "Share Folder" : "Share File";
+  if (nameEl) nameEl.textContent = (isDir ? "📁 " : "📄 ") + itemName;
   if (pathEl) pathEl.textContent = `Logical Path: Home/${itemRelPath}`;
   if (errorEl) {
     errorEl.style.display = "none";
@@ -2804,13 +2820,15 @@ window.openShareModal = async function(itemRelPath) {
   if (contentEl) contentEl.style.display = "none";
 
   try {
-    const nodeParam = selectedStorageNode ? `&node=${encodeURIComponent(selectedStorageNode)}` : "";
+    const cleanNode = (selectedStorageNode && selectedStorageNode !== "auto") ? selectedStorageNode : "";
+    const nodeParam = cleanNode ? `&node=${encodeURIComponent(cleanNode)}` : "";
     const res = await apiFetch(`/storage/share?path=${encodeURIComponent(itemRelPath)}${nodeParam}`);
 
-    if (res.shared && res.url) {
+    if (res.shared && (res.share_url || res.url)) {
       if (toggleInput) toggleInput.checked = true;
       if (statusText) statusText.textContent = "ON";
-      if (urlInput) urlInput.value = res.url;
+      const canonicalUrl = res.share_url || res.url;
+      if (urlInput) urlInput.value = canonicalUrl;
       if (linkSection) linkSection.style.display = "block";
       if (privateSection) privateSection.style.display = "none";
     } else {
@@ -2837,6 +2855,7 @@ window.closeShareModal = function() {
   const backdrop = document.getElementById("storage-share-modal-backdrop");
   if (backdrop) backdrop.style.display = "none";
   currentSharingPath = null;
+  currentSharingIsDir = false;
 };
 
 window.toggleFileSharing = async function(event) {
@@ -2860,21 +2879,27 @@ window.toggleFileSharing = async function(event) {
   if (statusText) statusText.textContent = isEnabling ? "ON" : "OFF";
 
   try {
+    const cleanNode = (selectedStorageNode && selectedStorageNode !== "auto") ? selectedStorageNode : "";
     if (isEnabling) {
       const res = await apiFetch("/storage/share", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           path: currentSharingPath,
-          node: selectedStorageNode || ""
+          node: cleanNode,
+          is_dir: currentSharingIsDir
         })
       });
 
-      if (urlInput) urlInput.value = res.url || "";
+      const canonicalUrl = res.share_url || res.url;
+      if (!canonicalUrl) {
+        throw new Error("Server did not return a canonical share URL");
+      }
+      if (urlInput) urlInput.value = canonicalUrl;
       if (linkSection) linkSection.style.display = "block";
       if (privateSection) privateSection.style.display = "none";
     } else {
-      const nodeParam = selectedStorageNode ? `&node=${encodeURIComponent(selectedStorageNode)}` : "";
+      const nodeParam = cleanNode ? `&node=${encodeURIComponent(cleanNode)}` : "";
       await apiFetch(`/storage/share?path=${encodeURIComponent(currentSharingPath)}${nodeParam}`, {
         method: "DELETE"
       });
@@ -2896,11 +2921,20 @@ window.toggleFileSharing = async function(event) {
 window.copyShareUrl = async function() {
   const urlInput = document.getElementById("share-url-input");
   const copyBtn = document.getElementById("share-copy-btn");
-  if (!urlInput || !urlInput.value) return;
+  const errorEl = document.getElementById("share-modal-error");
 
+  if (!urlInput || !urlInput.value) {
+    if (errorEl) {
+      errorEl.textContent = "No share link available to copy";
+      errorEl.style.display = "block";
+    }
+    return;
+  }
+
+  const textToCopy = urlInput.value;
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(urlInput.value);
+      await navigator.clipboard.writeText(textToCopy);
     } else {
       urlInput.select();
       document.execCommand("copy");
@@ -2945,7 +2979,8 @@ window.openPreviewModal = async function(itemRelPath) {
   if (badgeEl) badgeEl.textContent = ext ? `.${ext}` : "file";
   if (metaEl) metaEl.textContent = `Logical Path: Home/${itemRelPath}`;
 
-  const nodeParam = selectedStorageNode ? `&node=${encodeURIComponent(selectedStorageNode)}` : "";
+  const cleanNode = (selectedStorageNode && selectedStorageNode !== "auto") ? selectedStorageNode : "";
+  const nodeParam = cleanNode ? `&node=${encodeURIComponent(cleanNode)}` : "";
   const previewUrl = `/storage/preview?path=${encodeURIComponent(itemRelPath)}${nodeParam}`;
   const downloadUrl = `/storage/download?path=${encodeURIComponent(itemRelPath)}${nodeParam}`;
 

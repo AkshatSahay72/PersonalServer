@@ -19,7 +19,9 @@ import urllib.error
 import subprocess
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import socket
+import secrets
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -39,6 +41,7 @@ from controller.stores.shares_store import (
     save_shares_db,
     get_share_by_id,
     find_active_share,
+    find_active_folder_share_for_path,
     create_share,
     revoke_share,
 )
@@ -59,6 +62,7 @@ STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 DEFAULT_CONTROLLER_URL = os.environ.get("PERSONALSERVER_CONTROLLER_URL", "http://127.0.0.1:8000")
 DEFAULT_ROUTER_URL = os.environ.get("PERSONALSERVER_ROUTER_URL", "http://127.0.0.1:8088")
 _CACHED_ACTIVE_CONTROLLER_URL = None
+_CONTROLLER_URL_LOCK = threading.Lock()
 
 
 class ProxyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -88,8 +92,8 @@ def resolve_target_node_endpoint(node_param):
     local_id = config.get("NODE_ID", config.get("node_id", ""))
     local_name = config.get("NODE_NAME", config.get("name", ""))
 
-    # If explicitly referring to local node
-    if param_str.lower() in ("local", "self", "local_node") or (local_id and param_str == local_id) or (local_name and param_str == local_name):
+    # If explicitly referring to local node or cluster/auto defaults
+    if param_str.lower() in ("local", "self", "local_node", "auto", "cluster", "all", "default", "none", "null") or (local_id and param_str == local_id) or (local_name and param_str == local_name):
         return True, None
 
     if param_str in DEFAULT_KNOWN_NODES:
@@ -386,6 +390,8 @@ RESERVED_STORAGE_ROUTES = {
 
 
 class NodeAPIHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = 15  # Bounded socket timeout prevents hanging on idle or aborted connections
 
     def send_json(self, status_code, data):
         corr_id = getattr(self, "current_correlation_id", None) or extract_correlation_id(self.headers)
@@ -401,7 +407,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Correlation-ID, X-Request-ID")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+            self.close_connection = True
 
     def serve_storage_file_inline(self, target_file: Path, filename: str = None, is_preview: bool = False):
         """
@@ -440,12 +449,47 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Security-Policy", csp)
         self.end_headers()
 
-        with open(target_file, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+        try:
+            with open(target_file, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+            self.close_connection = True
+
+    def serve_storage_file_download(self, target_file: Path, filename: str = None):
+        """
+        Streams a storage file with attachment Content-Disposition to trigger browser download.
+        """
+        if not target_file.exists() or not target_file.is_file():
+            self.send_json(404, {"error": "File not found", "status": 404})
+            return
+
+        file_size = target_file.stat().st_size
+        fname = filename or target_file.name
+        guessed_type = mimetypes.guess_type(fname)[0]
+        content_type = guessed_type or "application/octet-stream"
+        safe_fname = fname.replace('"', '\\"')
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_fname}"')
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+
+        try:
+            with open(target_file, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+            self.close_connection = True
 
 
     def get_public_base_url(self):
@@ -462,7 +506,15 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         return "https://server.akshatsahay.space"
 
     def do_OPTIONS(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/demo-app/") or path.startswith("/recallflow/") or path.startswith("/apps/"):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+            self.proxy_to_router("OPTIONS", self.path, body_bytes=body_bytes)
+            return
         self.send_response(204)
+        self.send_header("Content-Length", "0")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token, X-Correlation-ID, X-Request-ID")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
@@ -501,9 +553,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         if require_explicit:
             return False
 
-        # Allow local loopback access
+        # Allow direct local loopback or Tailscale private mesh access (when not public proxied)
         client_ip = self.client_address[0]
-        if client_ip in ("127.0.0.1", "::1", "localhost"):
+        if not is_proxied_public and (client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("100.")):
             return True
 
         # Deny unauthenticated external requests
@@ -523,7 +575,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         global _CACHED_ACTIVE_CONTROLLER_URL
         config = load_config()
         configured_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
-        controller_url = _CACHED_ACTIVE_CONTROLLER_URL or configured_url
+        with _CONTROLLER_URL_LOCK:
+            cached_url = _CACHED_ACTIVE_CONTROLLER_URL
+        controller_url = cached_url or configured_url
         target_url = f"{controller_url}{subpath}"
         if query_str:
             target_url += f"?{query_str}"
@@ -557,7 +611,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(resp_data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(resp_data)
+                try:
+                    self.wfile.write(resp_data)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                    self.close_connection = True
                 return
         except urllib.error.HTTPError as e:
             err_body = e.read()
@@ -567,8 +624,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     err_json = json.loads(err_body.decode("utf-8"))
                     new_leader_url = err_json.get("leader_url")
                     if new_leader_url and new_leader_url.rstrip("/") != controller_url:
-                        _CACHED_ACTIVE_CONTROLLER_URL = new_leader_url.rstrip("/")
-                        retry_target = f"{_CACHED_ACTIVE_CONTROLLER_URL}{subpath}"
+                        with _CONTROLLER_URL_LOCK:
+                            _CACHED_ACTIVE_CONTROLLER_URL = new_leader_url.rstrip("/")
+                            active_target = _CACHED_ACTIVE_CONTROLLER_URL
+                        retry_target = f"{active_target}{subpath}"
                         if query_str:
                             retry_target += f"?{query_str}"
                         retry_req = urllib.request.Request(retry_target, data=body_bytes, headers=headers, method=method)
@@ -579,7 +638,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                             self.send_header("Content-Length", str(len(retry_data)))
                             self.send_header("Access-Control-Allow-Origin", "*")
                             self.end_headers()
-                            self.wfile.write(retry_data)
+                            try:
+                                self.wfile.write(retry_data)
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                                self.close_connection = True
                             return
                 except Exception:
                     pass
@@ -589,7 +651,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(err_body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(err_body)
+            try:
+                self.wfile.write(err_body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                self.close_connection = True
             return
         except Exception as initial_err:
             # Trigger HA master auto-discovery across candidate controller URLs
@@ -606,8 +671,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
                 active_url, leader_info = find_active_leader(candidates, exclude_url=controller_url)
                 if active_url:
-                    _CACHED_ACTIVE_CONTROLLER_URL = active_url
-                    retry_target = f"{active_url}{subpath}"
+                    with _CONTROLLER_URL_LOCK:
+                        _CACHED_ACTIVE_CONTROLLER_URL = active_url
+                        active_target = _CACHED_ACTIVE_CONTROLLER_URL
+                    retry_target = f"{active_target}{subpath}"
                     if query_str:
                         retry_target += f"?{query_str}"
                     retry_req = urllib.request.Request(retry_target, data=body_bytes, headers=headers, method=method)
@@ -618,7 +685,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                         self.send_header("Content-Length", str(len(resp_data)))
                         self.send_header("Access-Control-Allow-Origin", "*")
                         self.end_headers()
-                        self.wfile.write(resp_data)
+                        try:
+                            self.wfile.write(resp_data)
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                            self.close_connection = True
                         return
             except Exception:
                 pass
@@ -651,23 +721,39 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             with PROXY_OPENER.open(req, timeout=15) as response:
                 resp_data = response.read()
                 self.send_response(response.status)
+                has_content_length = False
                 for k, v in response.headers.items():
                     if k.lower() in ("transfer-encoding", "connection"):
                         continue
+                    if k.lower() == "content-length":
+                        has_content_length = True
                     self.send_header(k, v)
+                if not has_content_length:
+                    self.send_header("Content-Length", str(len(resp_data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(resp_data)
+                try:
+                    self.wfile.write(resp_data)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                    self.close_connection = True
         except urllib.error.HTTPError as e:
             err_body = e.read()
             self.send_response(e.code)
+            has_content_length = False
             for k, v in e.headers.items():
                 if k.lower() in ("transfer-encoding", "connection"):
                     continue
+                if k.lower() == "content-length":
+                    has_content_length = True
                 self.send_header(k, v)
+            if not has_content_length:
+                self.send_header("Content-Length", str(len(err_body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(err_body)
+            try:
+                self.wfile.write(err_body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                self.close_connection = True
         except urllib.error.URLError as e:
             self.send_json(504, {"error": "Application host node is temporarily unreachable", "status": 504})
         except Exception as e:
@@ -710,7 +796,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(resp_data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(resp_data)
+                try:
+                    self.wfile.write(resp_data)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                    self.close_connection = True
         except urllib.error.HTTPError as e:
             err_body = e.read()
             self.send_response(e.code)
@@ -718,7 +807,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(err_body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(err_body)
+            try:
+                self.wfile.write(err_body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                self.close_connection = True
         except urllib.error.URLError as e:
             err_msg = str(e.reason) if hasattr(e, "reason") else str(e)
             if "timed out" in err_msg.lower():
@@ -746,7 +838,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_header("Pragma", "no-cache")
                 self.send_header("Expires", "0")
                 self.end_headers()
-                self.wfile.write(content)
+                try:
+                    self.wfile.write(content)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                    self.close_connection = True
                 return
             else:
                 self.send_json(200, get_health())
@@ -775,7 +870,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_header("Pragma", "no-cache")
                 self.send_header("Expires", "0")
                 self.end_headers()
-                self.wfile.write(content)
+                try:
+                    self.wfile.write(content)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                    self.close_connection = True
                 return
             else:
                 self.send_json(404, {"error": "Static file not found"})
@@ -784,6 +882,331 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         # 3. Node Health / Status
         if path in ("/health", "/status"):
             self.send_json(200, get_health(self.current_correlation_id))
+            return
+
+        # 3a. Dedicated Public Share Namespace: GET /share/<path_or_share_id>...
+        if path.startswith("/share/"):
+            raw_share_sub = path[len("/share/"):].strip("/")
+            if not raw_share_sub:
+                self.send_json(404, {"error": "Share link not found", "status": 404})
+                return
+
+            parts = raw_share_sub.split("/")
+            possible_token = parts[0]
+            token_action = parts[1] if len(parts) > 1 else ""
+
+            # Check if the first segment is an existing share token (backward compatibility)
+            token_share = None
+            if re.match(r'^[a-zA-Z0-9_-]{16,32}$', possible_token):
+                token_share = get_share_by_id(possible_token)
+
+            if token_share is not None:
+                share = token_share
+                action = token_action
+                share_id = possible_token
+                if share.get("revoked", False):
+                    accept = self.headers.get("Accept", "")
+                    if "text/html" in accept and not action:
+                        self.send_response(404)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        html_err = (
+                            "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Share Inactive</title>"
+                            "<style>body{font-family:sans-serif;background:#090d16;color:#f1f5f9;display:flex;"
+                            "align-items:center;justify-content:center;height:100vh;margin:0;}"
+                            ".card{background:#111827;border:1px solid #243046;padding:32px 40px;border-radius:8px;"
+                            "text-align:center;max-width:440px;box-shadow:0 4px 20px rgba(0,0,0,0.4);}"
+                            "h2{margin-top:0;color:#ef4444;}p{color:#94a3b8;font-size:14px;line-height:1.5;}</style></head>"
+                            "<body><div class='card'><h2>⚠️ Share Link Unavailable</h2>"
+                            "<p>This share link has been revoked, expired, or does not exist.</p></div></body></html>"
+                        )
+                        body = html_err.encode("utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(body)
+                        except Exception:
+                            pass
+                        return
+                    self.send_json(404, {"error": "This share link has been revoked or does not exist", "status": 404})
+                    return
+
+                target_node = share.get("node_id", "")
+                share_rel_path = share.get("path", "").replace("\\", "/").strip("/")
+                is_dir_share = bool(share.get("is_dir") or share.get("item_type") == "folder")
+
+                is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+                if remote_endpoint == "INVALID":
+                    self.send_json(404, {"error": "Storage node for this share is not available", "status": 404})
+                    return
+
+                # Action 1: Directory listing: GET /share/<share_id>/list
+                if action == "list":
+                    if not is_dir_share:
+                        self.send_json(400, {"error": "Target share is a file, not a directory", "status": 400})
+                        return
+
+                    if not is_local and remote_endpoint:
+                        self.proxy_to_remote_storage(remote_endpoint, "GET", f"/share/{share_id}/list", query)
+                        return
+
+                    subpath = query.get("subpath", [""])[0].replace("\\", "/").strip("/")
+                    if subpath:
+                        sub_segs = [s for s in subpath.split("/") if s]
+                        if any(s == ".." for s in sub_segs) or "\0" in subpath or subpath.startswith("/"):
+                            self.send_json(403, {"error": "Access denied: Path traversal detected", "status": 403})
+                            return
+                        full_rel = f"{share_rel_path}/{'/'.join(sub_segs)}"
+                    else:
+                        full_rel = share_rel_path
+
+                    try:
+                        folder_base = resolve_safe_storage_path(share_rel_path)
+                        target_dir = resolve_safe_storage_path(full_rel)
+                        target_dir.resolve().relative_to(folder_base.resolve())
+                    except ValueError:
+                        self.send_json(403, {"error": "Access denied: Folder boundary violation", "status": 403})
+                        return
+
+                    if not target_dir.exists() or not target_dir.is_dir():
+                        self.send_json(404, {"error": "Directory not found", "status": 404})
+                        return
+
+                    items = []
+                    try:
+                        for entry in sorted(target_dir.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                            try:
+                                entry.resolve().relative_to(folder_base.resolve())
+                            except ValueError:
+                                continue
+
+                            try:
+                                st = entry.stat()
+                                is_dir_entry = entry.is_dir()
+                                size = 0 if is_dir_entry else st.st_size
+                                mtime_iso = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
+                                mime = None
+                                if not is_dir_entry:
+                                    mime, _ = mimetypes.guess_type(entry.name)
+                                items.append({
+                                    "name": entry.name,
+                                    "is_dir": is_dir_entry,
+                                    "size": size,
+                                    "modified": mtime_iso,
+                                    "mime": mime or "application/octet-stream"
+                                })
+                            except Exception:
+                                continue
+                    except Exception as e:
+                        self.send_json(500, {"error": f"Failed to list directory: {e}", "status": 500})
+                        return
+
+                    self.send_json(200, {
+                        "share_id": share_id,
+                        "folder_name": share.get("filename") or folder_base.name,
+                        "current_subpath": subpath,
+                        "items": items
+                    })
+                    return
+
+                # Action 2: File access / download / preview: /share/<share_id>/file, /download, /preview
+                if action in ("file", "download", "preview"):
+                    if not is_local and remote_endpoint:
+                        self.proxy_to_remote_storage(remote_endpoint, "GET", f"/share/{share_id}/{action}", query)
+                        return
+
+                    if is_dir_share:
+                        subpath = query.get("subpath", [""])[0].replace("\\", "/").strip("/")
+                        if not subpath:
+                            self.send_json(400, {"error": "Missing 'subpath' parameter", "status": 400})
+                            return
+                        sub_segs = [s for s in subpath.split("/") if s]
+                        if any(s == ".." for s in sub_segs) or "\0" in subpath or subpath.startswith("/"):
+                            self.send_json(403, {"error": "Access denied: Path traversal detected", "status": 403})
+                            return
+                        full_rel = f"{share_rel_path}/{'/'.join(sub_segs)}"
+                        try:
+                            folder_base = resolve_safe_storage_path(share_rel_path)
+                            target_file = resolve_safe_storage_path(full_rel)
+                            target_file.resolve().relative_to(folder_base.resolve())
+                        except ValueError:
+                            self.send_json(403, {"error": "Access denied: Folder boundary violation", "status": 403})
+                            return
+                    else:
+                        try:
+                            target_file = resolve_safe_storage_path(share_rel_path)
+                        except ValueError:
+                            self.send_json(403, {"error": "Access denied", "status": 403})
+                            return
+
+                    if not target_file.exists() or not target_file.is_file():
+                        self.send_json(404, {"error": "File not found", "status": 404})
+                        return
+
+                    as_download = (action == "download") or (query.get("download", ["0"])[0] == "1")
+                    if as_download:
+                        self.serve_storage_file_download(target_file)
+                    else:
+                        self.serve_storage_file_inline(target_file)
+                    return
+
+                # Action 3: Root share URL: GET /share/<share_id>
+                if not action:
+                    if is_dir_share:
+                        viewer_path = STATIC_DIR / "shared_folder.html"
+                        if viewer_path.exists():
+                            try:
+                                html_text = viewer_path.read_text(encoding="utf-8")
+                                injection = (
+                                    f"<script>"
+                                    f"window.__SHARE_RECORD__ = {json.dumps({'share_id': share['share_id'], 'path': share_rel_path, 'folder_name': share.get('filename') or Path(share_rel_path).name})};"
+                                    f"</script>"
+                                )
+                                if "<head>" in html_text:
+                                    html_text = html_text.replace("<head>", f"<head>\n  {injection}", 1)
+                                else:
+                                    html_text = injection + "\n" + html_text
+                                body = html_text.encode("utf-8")
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/html; charset=utf-8")
+                                self.send_header("Content-Length", str(len(body)))
+                                self.send_header("Cache-Control", "no-cache")
+                                self.end_headers()
+                                self.wfile.write(body)
+                                return
+                            except Exception as e:
+                                self.send_json(500, {"error": f"Failed to serve shared folder viewer: {e}"})
+                                return
+                        else:
+                            self.send_json(500, {"error": "Shared folder viewer not installed"})
+                            return
+                    else:
+                        # Shared file: serve inline
+                        if not is_local and remote_endpoint:
+                            self.proxy_to_remote_storage(remote_endpoint, "GET", f"/share/{share_id}", query)
+                            return
+                        try:
+                            target_file = resolve_safe_storage_path(share_rel_path)
+                        except ValueError:
+                            self.send_json(403, {"error": "Access denied"})
+                            return
+                        if not target_file.exists() or not target_file.is_file():
+                            self.send_json(404, {"error": "Shared file not found", "status": 404})
+                            return
+                        self.serve_storage_file_inline(target_file)
+                        return
+
+                self.send_json(404, {"error": "Invalid share action", "status": 404})
+                return
+
+            # PATH-BASED PUBLIC SHARING: /share/<logical-path>
+            try:
+                decoded_rel_path = urllib.parse.unquote(raw_share_sub)
+            except Exception:
+                self.send_json(400, {"error": "Malformed URL path encoding", "status": 400})
+                return
+
+            if not decoded_rel_path or "\0" in decoded_rel_path:
+                self.send_json(404, {"error": "File not found", "status": 404})
+                return
+
+            clean_norm = decoded_rel_path.replace("\\", "/")
+            segs = [s for s in clean_norm.split("/") if s]
+            if not segs or any(s == ".." for s in segs) or clean_norm.startswith("/"):
+                self.send_json(404, {"error": "File not found", "status": 404})
+                return
+
+            clean_rel_path = "/".join(segs)
+            target_node = query.get("node", [""])[0]
+
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": "Storage node not found", "status": 404})
+                return
+
+            if not is_local and remote_endpoint:
+                encoded_sub = "/".join(urllib.parse.quote(s) for s in clean_rel_path.split("/"))
+                self.proxy_to_remote_storage(remote_endpoint, "GET", f"/share/{encoded_sub}", query)
+                return
+
+            try:
+                target_item = resolve_safe_storage_path(clean_rel_path)
+            except ValueError:
+                self.send_json(404, {"error": "File not found", "status": 404})
+                return
+
+            canonical_rel = str(target_item.relative_to(STORAGE_ROOT)).replace("\\", "/")
+
+            # Resolve against active share records
+            active_share = find_active_share(target_node, canonical_rel)
+            if not active_share:
+                active_share = find_active_folder_share_for_path(target_node, canonical_rel)
+
+            if not active_share or active_share.get("revoked", False):
+                accept = self.headers.get("Accept", "")
+                if "text/html" in accept and not query.get("download"):
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    html_err = (
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Share Inactive</title>"
+                        "<style>body{font-family:sans-serif;background:#090d16;color:#f1f5f9;display:flex;"
+                        "align-items:center;justify-content:center;height:100vh;margin:0;}"
+                        ".card{background:#111827;border:1px solid #243046;padding:32px 40px;border-radius:8px;"
+                        "text-align:center;max-width:440px;box-shadow:0 4px 20px rgba(0,0,0,0.4);}"
+                        "h2{margin-top:0;color:#ef4444;}p{color:#94a3b8;font-size:14px;line-height:1.5;}</style></head>"
+                        "<body><div class='card'><h2>⚠️ Share Link Unavailable</h2>"
+                        "<p>This share link has been revoked, expired, or does not exist.</p></div></body></html>"
+                    )
+                    body = html_err.encode("utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except Exception:
+                        pass
+                    return
+                self.send_json(404, {"error": "This share link has been revoked or does not exist", "status": 404})
+                return
+
+            if not target_item.exists():
+                self.send_json(404, {"error": "File not found", "status": 404})
+                return
+
+            # If folder share: serve shared folder viewer
+            if target_item.is_dir():
+                viewer_path = STATIC_DIR / "shared_folder.html"
+                if viewer_path.exists():
+                    try:
+                        html_text = viewer_path.read_text(encoding="utf-8")
+                        injection = (
+                            f"<script>"
+                            f"window.__SHARE_RECORD__ = {json.dumps({'share_id': active_share['share_id'], 'path': canonical_rel, 'folder_name': active_share.get('filename') or target_item.name})};"
+                            f"</script>"
+                        )
+                        if "<head>" in html_text:
+                            html_text = html_text.replace("<head>", f"<head>\n  {injection}", 1)
+                        else:
+                            html_text = injection + "\n" + html_text
+                        body = html_text.encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Cache-Control", "no-cache")
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    except Exception as e:
+                        self.send_json(500, {"error": f"Failed to serve shared folder viewer: {e}"})
+                        return
+                else:
+                    self.send_json(500, {"error": "Shared folder viewer not installed"})
+                    return
+
+            # If file: serve inline or as download
+            as_download = (query.get("download", ["0"])[0] == "1")
+            if as_download:
+                self.serve_storage_file_download(target_item)
+            else:
+                self.serve_storage_file_inline(target_item)
             return
 
         # 3b. Public Storage Share: GET /storage/s/<share_id>
@@ -842,11 +1265,17 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 pub_base = self.get_public_base_url()
                 s_path = (active_share.get("path") or req_path).replace("\\", "/").strip("/")
                 encoded_path = "/".join(urllib.parse.quote(seg) for seg in s_path.split("/"))
+                is_dir = bool(active_share.get("is_dir") or active_share.get("item_type") == "folder")
+                share_url = f"{pub_base}/share/{encoded_path}"
                 self.send_json(200, {
                     "shared": True,
                     "share_id": active_share["share_id"],
-                    "url": f"{pub_base}/storage/{encoded_path}",
-                    "token_url": f"{pub_base}/storage/s/{active_share['share_id']}",
+                    "is_dir": is_dir,
+                    "url": share_url,
+                    "share_url": share_url,
+                    "path_url": share_url,
+                    "token_url": f"{pub_base}/share/{active_share['share_id']}",
+                    "stable_url": share_url,
                     "path": s_path,
                     "created_at": active_share.get("created_at")
                 })
@@ -962,12 +1391,16 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             # Stream file in 64KB chunks
-            with open(target_file, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+            try:
+                with open(target_file, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                self.close_connection = True
+                return
             return
 
         # 7. Storage Usage: GET /storage/usage
@@ -1039,8 +1472,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             active_share = find_active_share(target_node, canonical_rel)
             is_shared = active_share is not None and not active_share.get("revoked", False)
 
-            # If not publicly shared, preview requires explicit authentication
-            if not is_shared and not self.check_auth(require_explicit=True):
+            # If not publicly shared, preview requires administrative or authenticated access
+            if not is_shared and not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized", "status": 401})
                 return
 
@@ -1089,6 +1522,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 # Canonicalize relative path against STORAGE_ROOT
                 canonical_rel_path = str(target_file.relative_to(STORAGE_ROOT)).replace("\\", "/")
                 active_share = find_active_share(target_node, canonical_rel_path)
+                if not active_share:
+                    active_share = find_active_folder_share_for_path(target_node, canonical_rel_path)
                 is_shared = active_share is not None and not active_share.get("revoked", False)
 
                 if is_shared:
@@ -1230,6 +1665,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 return
 
             filename = Path(req_path).name
+            is_dir = False
             if is_local:
                 try:
                     target_file = resolve_safe_storage_path(req_path)
@@ -1241,22 +1677,28 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     self.send_json(404, {"error": "File not found"})
                     return
 
-                if target_file.is_dir():
-                    self.send_json(400, {"error": "Directory sharing is not supported in this phase"})
-                    return
+                is_dir = target_file.is_dir()
                 filename = target_file.name
+            else:
+                is_dir = bool(body.get("is_dir", False))
+                filename = Path(req_path).name
 
-            share_record = create_share(target_node, req_path, filename)
+            share_record = create_share(target_node, req_path, filename, is_dir=is_dir)
             pub_base = self.get_public_base_url()
             clean_rel = str(target_file.relative_to(STORAGE_ROOT)).replace("\\", "/") if is_local else req_path.replace("\\", "/").strip("/")
             encoded_path = "/".join(urllib.parse.quote(seg) for seg in clean_rel.split("/"))
+            share_url = f"{pub_base}/share/{encoded_path}"
 
             self.send_json(200, {
                 "status": "enabled",
                 "shared": True,
                 "share_id": share_record["share_id"],
-                "url": f"{pub_base}/storage/{encoded_path}",
-                "token_url": f"{pub_base}/storage/s/{share_record['share_id']}",
+                "is_dir": is_dir,
+                "url": share_url,
+                "share_url": share_url,
+                "path_url": share_url,
+                "token_url": f"{pub_base}/share/{share_record['share_id']}",
+                "stable_url": share_url,
                 "path": clean_rel,
                 "created_at": share_record["created_at"]
             })
@@ -1349,9 +1791,15 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             
             # Case A: Multipart form upload
             if "multipart/form-data" in content_type:
-                boundary = content_type.split("boundary=")[-1].strip()
-                if boundary.startswith('"') and boundary.endswith('"'):
-                    boundary = boundary[1:-1]
+                boundary = ""
+                for part in content_type.split(";"):
+                    part = part.strip()
+                    if part.startswith("boundary="):
+                        boundary = part[9:].strip('"')
+                        break
+                if not boundary:
+                    self.send_json(400, {"error": "Missing boundary in multipart form data"})
+                    return
                 
                 raw_data = self.rfile.read(content_len)
                 boundary_bytes = boundary.encode("utf-8")
@@ -1360,23 +1808,41 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 saved_files = []
 
                 for part in parts:
-                    if b"Content-Disposition" in part and b'filename="' in part:
+                    if b"Content-Disposition" in part and b"filename=" in part:
                         header_part, file_data = part.split(b"\r\n\r\n", 1)
-                        file_data = file_data.rstrip(b"\r\n--")
+                        if file_data.endswith(b"\r\n"):
+                            file_data = file_data[:-2]
+                        elif file_data.endswith(b"\n"):
+                            file_data = file_data[:-1]
                         
-                        match = re.search(rb'filename="([^"]+)"', header_part)
+                        match = re.search(rb'filename="?([^";\r\n]+)"?', header_part)
                         if match:
-                            raw_filename = match.group(1).decode("utf-8", errors="ignore")
+                            raw_filename = match.group(1).decode("utf-8", errors="ignore").strip()
                             safe_name = os.path.basename(raw_filename)
-                            safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
+                            # Neutralize directory traversal and invalid path characters
+                            safe_name = re.sub(r'[\\/:\*\?"<>\|\x00]', '_', safe_name).strip()
                             if not safe_name or safe_name in (".", ".."):
                                 safe_name = "uploaded_file"
 
                             dest_path = target_dir / safe_name
-                            with open(dest_path, "wb") as f:
-                                f.write(file_data)
+                            tmp_path = target_dir / f".tmp_{safe_name}_{secrets.token_hex(4)}"
+                            try:
+                                with open(tmp_path, "wb") as f:
+                                    f.write(file_data)
+                                os.replace(tmp_path, dest_path)
+                            except Exception:
+                                if tmp_path.exists():
+                                    try:
+                                        tmp_path.unlink()
+                                    except Exception:
+                                        pass
+                                raise
 
                             saved_files.append(safe_name)
+
+                if not saved_files:
+                    self.send_json(400, {"error": "No valid file data found in upload request"})
+                    return
 
                 self.send_json(200, {
                     "status": "uploaded",
@@ -1391,16 +1857,43 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 safe_name = os.path.basename(filename)
                 safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
                 dest_path = target_dir / safe_name
+                tmp_path = target_dir / f".tmp_{safe_name}_{secrets.token_hex(4)}"
 
-                with open(dest_path, "wb") as f:
-                    remaining = content_len
-                    while remaining > 0:
-                        chunk_size = min(remaining, 65536)
-                        chunk = self.rfile.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        remaining -= len(chunk)
+                try:
+                    with open(tmp_path, "wb") as f:
+                        remaining = content_len
+                        while remaining > 0:
+                            chunk_size = min(remaining, 65536)
+                            chunk = self.rfile.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            remaining -= len(chunk)
+                    if remaining == 0:
+                        os.replace(tmp_path, dest_path)
+                    else:
+                        if tmp_path.exists():
+                            try:
+                                tmp_path.unlink()
+                            except Exception:
+                                pass
+                        self.send_json(400, {"error": "Upload incomplete, connection ended early"})
+                        return
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except Exception:
+                            pass
+                    self.close_connection = True
+                    return
+                except Exception:
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except Exception:
+                            pass
+                    raise
 
                 self.send_json(200, {
                     "status": "uploaded",
@@ -1590,15 +2083,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         body_bytes = self.rfile.read(content_len) if content_len > 0 else None
         self.proxy_to_router("PATCH", self.path, body_bytes=body_bytes)
 
-    def do_OPTIONS(self):
-        content_len = int(self.headers.get("Content-Length", 0))
-        body_bytes = self.rfile.read(content_len) if content_len > 0 else None
-        self.proxy_to_router("OPTIONS", self.path, body_bytes=body_bytes)
-
     def do_HEAD(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        if path in ("/", "/health", "/status") or path.startswith("/static/") or path.startswith("/storage/s/"):
+        if path in ("/", "/health", "/status") or path.startswith("/static/") or path.startswith("/storage/s/") or path.startswith("/share/"):
             self.do_GET()
             return
         self.proxy_to_router("HEAD", self.path)
@@ -1685,10 +2173,16 @@ def start_heartbeat_reporter(interval_seconds=15):
     t.start()
 
 
+def create_node_api_server(host=HOST, port=PORT):
+    server = ThreadingHTTPServer((host, port), NodeAPIHandler)
+    server.daemon_threads = True
+    return server
+
+
 if __name__ == "__main__":
     ensure_storage_root()
     start_heartbeat_reporter(interval_seconds=15)
-    server = HTTPServer((HOST, PORT), NodeAPIHandler)
+    server = create_node_api_server(HOST, PORT)
     print(f"PersonalServer Node API & Web Operations running on {HOST}:{PORT}")
     print(f"Storage Root initialized at: {STORAGE_ROOT}")
     server.serve_forever()
