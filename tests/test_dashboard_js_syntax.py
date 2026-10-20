@@ -167,6 +167,39 @@ setTimeout(() => {
         self.assertIn("job-detail-delete-btn", index_html)
         self.assertIn("deleteJobFromDetail()", index_html)
 
+    def test_06_storage_share_ui_elements(self):
+        """Verify app.js and index.html contain required storage sharing UI elements."""
+        app_js = self.app_js_path.read_text(encoding="utf-8")
+        self.assertIn("openShareModal", app_js)
+        self.assertIn("closeShareModal", app_js)
+        self.assertIn("toggleFileSharing", app_js)
+        self.assertIn("copyShareUrl", app_js)
+        self.assertIn("/storage/share", app_js)
+
+        index_html = self.index_html_path.read_text(encoding="utf-8")
+        self.assertIn("storage-share-modal-backdrop", index_html)
+        self.assertIn("share-toggle-input", index_html)
+        self.assertIn("share-url-input", index_html)
+        self.assertIn("share-copy-btn", index_html)
+        self.assertIn("storage-props-share-btn", index_html)
+
+    def test_07_storage_preview_ui_elements(self):
+        """Verify app.js and index.html contain required storage preview modal UI elements."""
+        app_js = self.app_js_path.read_text(encoding="utf-8")
+        self.assertIn("openPreviewModal", app_js)
+        self.assertIn("closePreviewModal", app_js)
+        self.assertIn("previewCurrentPropsItem", app_js)
+        self.assertIn("/storage/preview", app_js)
+
+        index_html = self.index_html_path.read_text(encoding="utf-8")
+        self.assertIn("storage-preview-modal-backdrop", index_html)
+        self.assertIn("preview-modal-title", index_html)
+        self.assertIn("preview-modal-open-btn", index_html)
+        self.assertIn("preview-modal-download-btn", index_html)
+        self.assertIn("preview-modal-content", index_html)
+        self.assertIn("storage-props-preview-btn", index_html)
+
 
 if __name__ == "__main__":
     unittest.main()
+

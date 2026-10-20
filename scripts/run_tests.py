@@ -59,6 +59,7 @@ INTEGRATION_TEST_FILES = [
     "tests/test_phase12_application_routing.py",
     "tests/test_phase13_source_deployment.py",
     "tests/test_storage_explorer_ui.py",
+    "tests/test_storage_sharing.py",
 ]
 
 

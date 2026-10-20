@@ -292,6 +292,8 @@ class ControllerPaths:
         self.onboarding_codes_file = self.data_dir / "onboarding_codes.json"
         self.backup_onboarding_codes_file = self.data_dir / "onboarding_codes.json.bak"
         self.enrollment_token_file = self.secrets_dir / "enrollment.token"
+        self.shares_file = self.data_dir / "shares.json"
+        self.backup_shares_file = self.data_dir / "shares.json.bak"
         self.leader_lease_file = self.data_dir / "leader_lease.json"
         self.ha_state_file = self.data_dir / "ha_state.json"
 

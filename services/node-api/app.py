@@ -29,10 +29,19 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE_DIR))
+import mimetypes
 from common.time_utils import get_current_iso_timestamp
 from common.crypto_utils import constant_time_compare
 from common.storage_utils import resolve_safe_path
 from config.platform_config import get_platform_config
+from controller.stores.shares_store import (
+    load_shares_db,
+    save_shares_db,
+    get_share_by_id,
+    find_active_share,
+    create_share,
+    revoke_share,
+)
 from config.structured_logger import (
     extract_correlation_id,
     generate_correlation_id,
@@ -370,6 +379,12 @@ def resolve_safe_storage_path(relative_path_str: str) -> Path:
     return resolve_safe_path(STORAGE_ROOT, relative_path_str)
 
 
+RESERVED_STORAGE_ROUTES = {
+    "nodes", "list", "download", "usage", "share", "shares",
+    "s", "mkdir", "upload", "rename", "preview"
+}
+
+
 class NodeAPIHandler(BaseHTTPRequestHandler):
 
     def send_json(self, status_code, data):
@@ -388,6 +403,64 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def serve_storage_file_inline(self, target_file: Path, filename: str = None, is_preview: bool = False):
+        """
+        Safely streams a storage file with inline Content-Disposition, strict MIME typing,
+        and sandbox Content-Security-Policy for untrusted markup (HTML, SVG, XML).
+        """
+        if not target_file.exists() or not target_file.is_file():
+            self.send_json(404, {"error": "File not found", "status": 404})
+            return
+
+        file_size = target_file.stat().st_size
+        fname = filename or target_file.name
+        ext = target_file.suffix.lower()
+
+        # Security: Untrusted HTML/SVG must NEVER run as active same-origin scripts
+        if ext in (".html", ".htm", ".svg", ".xhtml", ".xml"):
+            content_type = "text/plain; charset=utf-8"
+            disposition = f'inline; filename="{fname}"'
+            csp = "default-src 'none'; sandbox"
+        else:
+            guessed_type = mimetypes.guess_type(fname)[0]
+            content_type = guessed_type or "application/octet-stream"
+            disposition = f'inline; filename="{fname}"'
+            csp = None
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Content-Disposition", disposition)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        if csp:
+            self.send_header("Content-Security-Policy", csp)
+        self.end_headers()
+
+        with open(target_file, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+
+    def get_public_base_url(self):
+        try:
+            pcfg = get_platform_config()
+            if pcfg and pcfg.admin_url:
+                return pcfg.admin_url.rstrip("/")
+        except Exception:
+            pass
+        host_hdr = self.headers.get("Host", "")
+        if host_hdr:
+            proto = "https" if (self.headers.get("X-Forwarded-Proto") == "https" or "server." in host_hdr) else "http"
+            return f"{proto}://{host_hdr}"
+        return "https://server.akshatsahay.space"
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -395,7 +468,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
 
-    def check_auth(self):
+    def check_auth(self, require_explicit: bool = False):
         """Token and origin check for administrative storage endpoints."""
         expected_token = get_auth_token()
         controller_token = get_controller_auth_token()
@@ -408,12 +481,25 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # Cloudflare Access authentication verification
         cf_email = self.headers.get("Cf-Access-Authenticated-User-Email")
-        if cf_email and (self.headers.get("Cf-Ray") or self.headers.get("Cf-Connecting-Ip")):
+        is_proxied_public = bool(self.headers.get("Cf-Ray") or self.headers.get("Cf-Connecting-Ip"))
+        if cf_email and is_proxied_public:
             return True
 
         # If token matches configured auth token or controller enrollment token
         if token and (constant_time_compare(token, expected_token) or constant_time_compare(token, controller_token)):
             return True
+
+        # If proxied through public tunnel, deny without valid CF auth or token
+        if is_proxied_public:
+            return False
+
+        # If an explicit auth token was supplied but failed validation, deny
+        if auth_header or self.headers.get("X-Auth-Token"):
+            return False
+
+        # If explicit authentication is required (e.g. unshared files on public file routes)
+        if require_explicit:
+            return False
 
         # Allow local loopback access
         client_ip = self.client_address[0]
@@ -700,6 +786,74 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.send_json(200, get_health(self.current_correlation_id))
             return
 
+        # 3b. Public Storage Share: GET /storage/s/<share_id>
+        if path.startswith("/storage/s/"):
+            share_id = path[len("/storage/s/"):].strip("/")
+            if not share_id or re.search(r'[^a-zA-Z0-9_-]', share_id):
+                self.send_json(404, {"error": "Share link not found", "status": 404})
+                return
+
+            share = get_share_by_id(share_id)
+            if not share or share.get("revoked", False):
+                self.send_json(404, {"error": "This share link has been revoked or does not exist", "status": 404})
+                return
+
+            target_node = share.get("node_id", "")
+            rel_path = share.get("path", "")
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": "Storage node for this share is not available", "status": 404})
+                return
+
+            if not is_local and remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "GET", "/storage/download", {"path": rel_path})
+                return
+
+            try:
+                target_file = resolve_safe_storage_path(rel_path)
+            except ValueError as e:
+                self.send_json(403, {"error": str(e), "status": 403})
+                return
+
+            if not target_file.exists() or not target_file.is_file():
+                self.send_json(404, {"error": "Shared file not found", "status": 404})
+                return
+
+            self.serve_storage_file_inline(target_file)
+            return
+
+        # 3c. Storage Subsystem: GET /storage/share (or /storage/shares)
+        if path in ("/storage/share", "/storage/shares"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            target_node = query.get("node", [""])[0]
+            req_path = query.get("path", [""])[0]
+
+            if not req_path:
+                db = load_shares_db()
+                active = [s for s in db.get("shares", {}).values() if not s.get("revoked")]
+                self.send_json(200, {"shares": active})
+                return
+
+            active_share = find_active_share(target_node, req_path)
+            if active_share:
+                pub_base = self.get_public_base_url()
+                s_path = (active_share.get("path") or req_path).replace("\\", "/").strip("/")
+                encoded_path = "/".join(urllib.parse.quote(seg) for seg in s_path.split("/"))
+                self.send_json(200, {
+                    "shared": True,
+                    "share_id": active_share["share_id"],
+                    "url": f"{pub_base}/storage/{encoded_path}",
+                    "token_url": f"{pub_base}/storage/s/{active_share['share_id']}",
+                    "path": s_path,
+                    "created_at": active_share.get("created_at")
+                })
+            else:
+                self.send_json(200, {"shared": False})
+            return
+
         # 4. Storage Subsystem: GET /storage/nodes
         if path == "/storage/nodes":
             if not self.check_auth():
@@ -709,7 +863,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             return
 
         # 5. Storage Subsystem: GET /storage/list or GET /storage
-        if path in ("/storage", "/storage/list"):
+        if path in ("/storage", "/storage/", "/storage/list"):
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
                 return
@@ -854,6 +1008,104 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # 6b. Storage Subsystem: GET /storage/preview (Inline Document & Media Preview)
+        if path == "/storage/preview":
+            target_node = query.get("node", [""])[0]
+            req_path = query.get("path", [""])[0]
+            if not req_path:
+                self.send_json(400, {"error": "Missing 'path' parameter", "status": 400})
+                return
+
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+
+            if not is_local and remote_endpoint:
+                self.proxy_to_remote_storage(remote_endpoint, "GET", "/storage/preview", query)
+                return
+
+            try:
+                target_file = resolve_safe_storage_path(req_path)
+            except ValueError as e:
+                self.send_json(403, {"error": str(e), "status": 403})
+                return
+
+            if not target_file.exists() or not target_file.is_file():
+                self.send_json(404, {"error": "File not found", "status": 404})
+                return
+
+            canonical_rel = str(target_file.relative_to(STORAGE_ROOT)).replace("\\", "/")
+            active_share = find_active_share(target_node, canonical_rel)
+            is_shared = active_share is not None and not active_share.get("revoked", False)
+
+            # If not publicly shared, preview requires explicit authentication
+            if not is_shared and not self.check_auth(require_explicit=True):
+                self.send_json(401, {"error": "Unauthorized", "status": 401})
+                return
+
+            self.serve_storage_file_inline(target_file, is_preview=True)
+            return
+
+        # 6c. Stable Path-Based Storage File Route: GET /storage/<path>
+        if path.startswith("/storage/") and not path.startswith("/storage/s/"):
+            raw_subpath = path[len("/storage/"):].strip("/")
+            first_seg = raw_subpath.split("/")[0] if raw_subpath else ""
+
+            if first_seg not in RESERVED_STORAGE_ROUTES:
+                try:
+                    decoded_rel_path = urllib.parse.unquote(raw_subpath)
+                except Exception:
+                    self.send_json(400, {"error": "Malformed URL path encoding", "status": 400})
+                    return
+
+                if not decoded_rel_path or "\0" in decoded_rel_path:
+                    self.send_json(404, {"error": "File not found", "status": 404})
+                    return
+
+                target_node = query.get("node", [""])[0]
+                is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+                if remote_endpoint == "INVALID":
+                    self.send_json(404, {"error": "Storage node not found", "status": 404})
+                    return
+
+                if not is_local and remote_endpoint:
+                    encoded_sub = "/".join(urllib.parse.quote(s) for s in decoded_rel_path.split("/"))
+                    self.proxy_to_remote_storage(remote_endpoint, "GET", f"/storage/{encoded_sub}", query)
+                    return
+
+                try:
+                    target_file = resolve_safe_storage_path(decoded_rel_path)
+                except ValueError:
+                    # Path traversal or escape attempts receive 404 to avoid leaking filesystem layout
+                    self.send_json(404, {"error": "File not found", "status": 404})
+                    return
+
+                # Directories cannot be accessed through public file URLs
+                if not target_file.exists() or not target_file.is_file():
+                    self.send_json(404, {"error": "File not found", "status": 404})
+                    return
+
+                # Canonicalize relative path against STORAGE_ROOT
+                canonical_rel_path = str(target_file.relative_to(STORAGE_ROOT)).replace("\\", "/")
+                active_share = find_active_share(target_node, canonical_rel_path)
+                is_shared = active_share is not None and not active_share.get("revoked", False)
+
+                if is_shared:
+                    # Public access permitted for explicitly shared file
+                    self.serve_storage_file_inline(target_file)
+                    return
+
+                # If sharing is OFF, allow explicitly authenticated user/admin to access directly
+                if self.check_auth(require_explicit=True):
+                    self.serve_storage_file_inline(target_file)
+                    return
+
+                # Unauthenticated access to unshared/revoked private file: ALWAYS return 404
+                # (Prevents enumeration of private file names)
+                self.send_json(404, {"error": "File not found", "status": 404})
+                return
+
         # 7. Session Info: GET /api/session
         if path == "/api/session":
             cf_email = self.headers.get("Cf-Access-Authenticated-User-Email") or self.headers.get("cf-access-authenticated-user-email")
@@ -957,6 +1209,58 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+
+        # 0b. Storage Subsystem: POST /storage/share (Create/Toggle Share)
+        if path == "/storage/share":
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            body = self.read_json_body()
+            if not body or not body.get("path"):
+                self.send_json(400, {"error": "Missing 'path' parameter"})
+                return
+
+            req_path = body.get("path", "").strip()
+            target_node = body.get("node", "").strip()
+
+            is_local, remote_endpoint = resolve_target_node_endpoint(target_node)
+            if remote_endpoint == "INVALID":
+                self.send_json(404, {"error": f"Target storage node '{target_node}' not found in cluster"})
+                return
+
+            filename = Path(req_path).name
+            if is_local:
+                try:
+                    target_file = resolve_safe_storage_path(req_path)
+                except ValueError as e:
+                    self.send_json(403, {"error": str(e)})
+                    return
+
+                if not target_file.exists():
+                    self.send_json(404, {"error": "File not found"})
+                    return
+
+                if target_file.is_dir():
+                    self.send_json(400, {"error": "Directory sharing is not supported in this phase"})
+                    return
+                filename = target_file.name
+
+            share_record = create_share(target_node, req_path, filename)
+            pub_base = self.get_public_base_url()
+            clean_rel = str(target_file.relative_to(STORAGE_ROOT)).replace("\\", "/") if is_local else req_path.replace("\\", "/").strip("/")
+            encoded_path = "/".join(urllib.parse.quote(seg) for seg in clean_rel.split("/"))
+
+            self.send_json(200, {
+                "status": "enabled",
+                "shared": True,
+                "share_id": share_record["share_id"],
+                "url": f"{pub_base}/storage/{encoded_path}",
+                "token_url": f"{pub_base}/storage/s/{share_record['share_id']}",
+                "path": clean_rel,
+                "created_at": share_record["created_at"]
+            })
+            return
 
         # 1. Storage Subsystem: POST /storage/mkdir
         if path == "/storage/mkdir":
@@ -1189,6 +1493,35 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
+        # Storage Subsystem: DELETE /storage/share (Revoke Share)
+        if path == "/storage/share":
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            share_id = query.get("share_id", [""])[0]
+            req_path = query.get("path", [""])[0]
+            target_node = query.get("node", [""])[0]
+
+            if not share_id and not req_path:
+                body = self.read_json_body()
+                if body:
+                    share_id = body.get("share_id", "")
+                    req_path = body.get("path", "")
+                    target_node = body.get("node", target_node)
+
+            identifier = share_id or req_path
+            if not identifier:
+                self.send_json(400, {"error": "Missing 'share_id' or 'path' parameter"})
+                return
+
+            revoke_share(identifier, target_node)
+            self.send_json(200, {
+                "status": "revoked",
+                "shared": False
+            })
+            return
+
         # Storage Subsystem: DELETE /storage
         if path == "/storage":
             if not self.check_auth():
@@ -1265,7 +1598,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        if path in ("/", "/health", "/status") or path.startswith("/static/"):
+        if path in ("/", "/health", "/status") or path.startswith("/static/") or path.startswith("/storage/s/"):
             self.do_GET()
             return
         self.proxy_to_router("HEAD", self.path)

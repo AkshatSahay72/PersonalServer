@@ -590,7 +590,11 @@
         <div id="storage-properties-panel" class="section-card explorer-properties-panel" style="display:none">
           <div class="section-header">
             <span class="section-title" id="storage-props-title">Item Properties</span>
-            <button class="btn btn-sm" onclick="closeStorageProperties()">Close</button>
+            <div style="display: flex; gap: 8px;">
+              <button id="storage-props-preview-btn" class="btn btn-sm btn-primary" onclick="previewCurrentPropsItem()" style="display:none;">Preview</button>
+              <button id="storage-props-share-btn" class="btn btn-sm" onclick="shareCurrentPropsItem()" style="display:none;">Share</button>
+              <button class="btn btn-sm" onclick="closeStorageProperties()">Close</button>
+            </div>
           </div>
           <div class="detail-content">
             <div class="detail-grid mono" id="storage-props-grid">
@@ -1052,6 +1056,94 @@
       <div class="modal-footer">
         <button type="button" class="btn btn-sm" onclick="closeNodeDiagModal()">Close</button>
         <button type="button" class="btn btn-sm btn-primary" id="diag-modal-rerun-btn" onclick="rerunCurrentNodeDiag()">Run Test</button>
+      </div>
+    </div>
+  <!-- Storage Share Modal (Phase 2A Link Sharing) -->
+  <div id="storage-share-modal-backdrop" class="modal-backdrop" style="display:none">
+    <div class="modal-frame" style="max-width: 500px; width: 92%;" role="dialog" aria-modal="true" aria-labelledby="share-modal-title">
+      <div class="modal-header">
+        <span class="modal-title mono" id="share-modal-title">Share File</span>
+        <button type="button" class="modal-close-btn" onclick="closeShareModal()" title="Close (Esc)">✕</button>
+      </div>
+      <div class="modal-body" style="padding: 18px 20px;">
+        <div id="share-modal-loading" class="mono cell-muted" style="display:none; text-align: center; padding: 24px 0;">
+          <span class="pulse-spinner"></span> Checking share status...
+        </div>
+        <div id="share-modal-content">
+          <div style="margin-bottom: 14px;">
+            <div class="mono" id="share-file-name" style="font-weight: 600; font-size: 14px; word-break: break-all; margin-bottom: 3px;"></div>
+            <div class="mono cell-muted" id="share-file-path" style="font-size: 11px;"></div>
+          </div>
+
+          <!-- Single Toggle Card: Anyone with the link — ON/OFF -->
+          <div style="padding: 14px 16px; margin-bottom: 14px; border: 1px solid var(--border-color); border-radius: var(--radius); background: rgba(255,255,255,0.02);">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <label for="share-toggle-input" style="font-size: 13px; font-weight: 600; display: block; cursor: pointer;">Anyone with the link</label>
+                <span class="cell-muted" style="font-size: 11px;">Public read-only link. No sign-in required.</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span id="share-toggle-status-text" class="mono" style="font-size: 11px; font-weight: 600;">OFF</span>
+                <label class="switch-toggle" style="margin: 0;">
+                  <input type="checkbox" id="share-toggle-input" onchange="toggleFileSharing(event)">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Share Link Details (Visible when ON) -->
+          <div id="share-link-section" style="display: none;">
+            <label style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); display: block; margin-bottom: 6px;">Public Share Link</label>
+            <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+              <input type="text" id="share-url-input" class="form-input mono" readonly style="font-size: 12px; flex: 1;" onclick="this.select()">
+              <button type="button" class="btn btn-sm btn-primary" id="share-copy-btn" onclick="copyShareUrl()">Copy Link</button>
+            </div>
+            <div class="cell-muted mono" style="font-size: 11px; line-height: 1.4;">
+              Turning sharing OFF immediately revokes public access. Re-enabling sharing will generate a fresh URL.
+            </div>
+          </div>
+
+          <!-- Private Notice (Visible when OFF) -->
+          <div id="share-private-section">
+            <div class="mono cell-muted" style="font-size: 12px; padding: 10px 12px; background: rgba(0,0,0,0.2); border-radius: var(--radius); border-left: 3px solid var(--text-muted);">
+              🔒 This file is currently <strong>private</strong>. Only authenticated cluster users can access it.
+            </div>
+          </div>
+
+          <div id="share-modal-error" class="modal-error mono" style="display:none; margin-top: 12px;"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm" onclick="closeShareModal()">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Storage File Preview Modal -->
+  <div id="storage-preview-modal-backdrop" class="modal-backdrop" style="display:none">
+    <div class="modal-frame storage-preview-modal-frame" role="dialog" aria-modal="true" aria-labelledby="preview-modal-title">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 8px; overflow: hidden; flex: 1;">
+          <span class="file-icon" id="preview-modal-icon">📄</span>
+          <span class="modal-title mono" id="preview-modal-title" style="text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">Preview</span>
+          <span class="badge badge-secondary mono" id="preview-modal-badge" style="font-size: 11px;">-</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <a id="preview-modal-open-btn" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-sm" title="Open file in a new browser tab">Open in New Tab ↗</a>
+          <a id="preview-modal-download-btn" href="#" download class="btn btn-sm btn-secondary" title="Download file">Download</a>
+          <button type="button" class="modal-close-btn" onclick="closePreviewModal()" title="Close (Esc)">✕</button>
+        </div>
+      </div>
+      <div class="modal-body storage-preview-modal-body" id="preview-modal-body">
+        <div class="preview-loading-spinner" id="preview-modal-loading" style="display:none;">
+          <span class="pulse-spinner"></span> Loading preview...
+        </div>
+        <div id="preview-modal-content" class="preview-content-container"></div>
+      </div>
+      <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+        <span class="mono cell-muted" id="preview-modal-meta" style="font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 75%;">Path: -</span>
+        <button type="button" class="btn btn-sm" onclick="closePreviewModal()">Close</button>
       </div>
     </div>
   </div>

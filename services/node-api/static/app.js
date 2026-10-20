@@ -2489,7 +2489,7 @@ function renderStorageTable() {
     const isSelected = selectedItemName === item.name ? "selected" : "";
 
     return `
-      <tr class="explorer-row ${isSelected}" onclick="selectStorageRow(event, '${escapedName}')" ondblclick="${isDir ? `loadStorage('${escapedPath}', '${node}', true)` : `viewStorageProperties('${escapedPath}', false)`}">
+      <tr class="explorer-row ${isSelected}" onclick="selectStorageRow(event, '${escapedName}')" ondblclick="${isDir ? `loadStorage('${escapedPath}', '${node}', true)` : `openPreviewModal('${escapedPath}')`}">
         <td>
           <div class="file-name-cell">
             <span class="file-icon">${icon}</span>
@@ -2504,7 +2504,9 @@ function renderStorageTable() {
         <td class="mono cell-muted">${modStr}</td>
         <td style="text-align: right;">
           <div class="explorer-row-actions">
+            ${!isDir ? `<button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); openPreviewModal('${escapedPath}')" title="Preview file">Preview</button>` : ''}
             ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm" download title="Download file" onclick="event.stopPropagation()">Download</a>` : ''}
+            ${!isDir ? `<button class="btn btn-sm" onclick="event.stopPropagation(); openShareModal('${escapedPath}')" title="Share link">Share</button>` : ''}
             ${isOnline ? `<button class="btn btn-sm" onclick="event.stopPropagation(); renameItem('${escapedPath}')" title="Rename">Rename</button>` : ''}
             ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteItem('${escapedPath}', ${isDir})" title="Delete">Delete</button>` : ''}
             <button class="btn btn-sm" onclick="event.stopPropagation(); viewStorageProperties('${escapedPath}', ${isDir})" title="Item Properties">Props</button>
@@ -2731,6 +2733,18 @@ window.viewStorageProperties = function(itemRelPath, isDir) {
     <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value text-online">${status === 'ONLINE' ? 'Healthy' : status}</span></div>
   `;
 
+  const propsPreviewBtn = document.getElementById("storage-props-preview-btn");
+  if (propsPreviewBtn) {
+    propsPreviewBtn.style.display = isDir ? "none" : "inline-flex";
+    propsPreviewBtn.setAttribute("data-item-path", itemRelPath);
+  }
+
+  const propsShareBtn = document.getElementById("storage-props-share-btn");
+  if (propsShareBtn) {
+    propsShareBtn.style.display = isDir ? "none" : "inline-flex";
+    propsShareBtn.setAttribute("data-item-path", itemRelPath);
+  }
+
   panel.style.display = "block";
   panel.scrollIntoView({ behavior: "smooth" });
 };
@@ -2738,6 +2752,312 @@ window.viewStorageProperties = function(itemRelPath, isDir) {
 window.closeStorageProperties = function() {
   const panel = document.getElementById("storage-properties-panel");
   if (panel) panel.style.display = "none";
+};
+
+window.previewCurrentPropsItem = function() {
+  const propsPreviewBtn = document.getElementById("storage-props-preview-btn");
+  const path = propsPreviewBtn?.getAttribute("data-item-path");
+  if (path) openPreviewModal(path);
+};
+
+window.shareCurrentPropsItem = function() {
+  const propsShareBtn = document.getElementById("storage-props-share-btn");
+  const path = propsShareBtn?.getAttribute("data-item-path");
+  if (path) openShareModal(path);
+};
+
+// ==========================================
+// 4b. Storage Link Sharing (Phase 2A)
+// ==========================================
+
+let currentSharingPath = null;
+
+window.openShareModal = async function(itemRelPath) {
+  currentSharingPath = itemRelPath;
+  const fileName = itemRelPath.split("/").pop();
+
+  const backdrop = document.getElementById("storage-share-modal-backdrop");
+  const nameEl = document.getElementById("share-file-name");
+  const pathEl = document.getElementById("share-file-path");
+  const loadingEl = document.getElementById("share-modal-loading");
+  const contentEl = document.getElementById("share-modal-content");
+  const toggleInput = document.getElementById("share-toggle-input");
+  const statusText = document.getElementById("share-toggle-status-text");
+  const urlInput = document.getElementById("share-url-input");
+  const linkSection = document.getElementById("share-link-section");
+  const privateSection = document.getElementById("share-private-section");
+  const errorEl = document.getElementById("share-modal-error");
+  const copyBtn = document.getElementById("share-copy-btn");
+
+  if (!backdrop) return;
+
+  if (nameEl) nameEl.textContent = fileName;
+  if (pathEl) pathEl.textContent = `Logical Path: Home/${itemRelPath}`;
+  if (errorEl) {
+    errorEl.style.display = "none";
+    errorEl.textContent = "";
+  }
+  if (copyBtn) copyBtn.textContent = "Copy Link";
+
+  backdrop.style.display = "flex";
+  if (loadingEl) loadingEl.style.display = "block";
+  if (contentEl) contentEl.style.display = "none";
+
+  try {
+    const nodeParam = selectedStorageNode ? `&node=${encodeURIComponent(selectedStorageNode)}` : "";
+    const res = await apiFetch(`/storage/share?path=${encodeURIComponent(itemRelPath)}${nodeParam}`);
+
+    if (res.shared && res.url) {
+      if (toggleInput) toggleInput.checked = true;
+      if (statusText) statusText.textContent = "ON";
+      if (urlInput) urlInput.value = res.url;
+      if (linkSection) linkSection.style.display = "block";
+      if (privateSection) privateSection.style.display = "none";
+    } else {
+      if (toggleInput) toggleInput.checked = false;
+      if (statusText) statusText.textContent = "OFF";
+      if (urlInput) urlInput.value = "";
+      if (linkSection) linkSection.style.display = "none";
+      if (privateSection) privateSection.style.display = "block";
+    }
+  } catch (err) {
+    if (toggleInput) toggleInput.checked = false;
+    if (statusText) statusText.textContent = "OFF";
+    if (errorEl) {
+      errorEl.textContent = `Failed to query share state: ${err.message}`;
+      errorEl.style.display = "block";
+    }
+  } finally {
+    if (loadingEl) loadingEl.style.display = "none";
+    if (contentEl) contentEl.style.display = "block";
+  }
+};
+
+window.closeShareModal = function() {
+  const backdrop = document.getElementById("storage-share-modal-backdrop");
+  if (backdrop) backdrop.style.display = "none";
+  currentSharingPath = null;
+};
+
+window.toggleFileSharing = async function(event) {
+  if (!currentSharingPath) return;
+
+  const toggleInput = document.getElementById("share-toggle-input");
+  const statusText = document.getElementById("share-toggle-status-text");
+  const urlInput = document.getElementById("share-url-input");
+  const linkSection = document.getElementById("share-link-section");
+  const privateSection = document.getElementById("share-private-section");
+  const errorEl = document.getElementById("share-modal-error");
+  const copyBtn = document.getElementById("share-copy-btn");
+
+  if (errorEl) {
+    errorEl.style.display = "none";
+    errorEl.textContent = "";
+  }
+  if (copyBtn) copyBtn.textContent = "Copy Link";
+
+  const isEnabling = event.target.checked;
+  if (statusText) statusText.textContent = isEnabling ? "ON" : "OFF";
+
+  try {
+    if (isEnabling) {
+      const res = await apiFetch("/storage/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: currentSharingPath,
+          node: selectedStorageNode || ""
+        })
+      });
+
+      if (urlInput) urlInput.value = res.url || "";
+      if (linkSection) linkSection.style.display = "block";
+      if (privateSection) privateSection.style.display = "none";
+    } else {
+      const nodeParam = selectedStorageNode ? `&node=${encodeURIComponent(selectedStorageNode)}` : "";
+      await apiFetch(`/storage/share?path=${encodeURIComponent(currentSharingPath)}${nodeParam}`, {
+        method: "DELETE"
+      });
+
+      if (urlInput) urlInput.value = "";
+      if (linkSection) linkSection.style.display = "none";
+      if (privateSection) privateSection.style.display = "block";
+    }
+  } catch (err) {
+    if (toggleInput) toggleInput.checked = !isEnabling;
+    if (statusText) statusText.textContent = !isEnabling ? "ON" : "OFF";
+    if (errorEl) {
+      errorEl.textContent = err.message || "Action failed";
+      errorEl.style.display = "block";
+    }
+  }
+};
+
+window.copyShareUrl = async function() {
+  const urlInput = document.getElementById("share-url-input");
+  const copyBtn = document.getElementById("share-copy-btn");
+  if (!urlInput || !urlInput.value) return;
+
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(urlInput.value);
+    } else {
+      urlInput.select();
+      document.execCommand("copy");
+    }
+    if (copyBtn) {
+      const origText = copyBtn.textContent;
+      copyBtn.textContent = "Copied!";
+      setTimeout(() => {
+        copyBtn.textContent = origText;
+      }, 2000);
+    }
+  } catch (err) {
+    urlInput.select();
+  }
+};
+
+// ==========================================
+// 4c. Storage Document & Media Preview (Phase 2B)
+// ==========================================
+
+let currentPreviewPath = null;
+
+window.openPreviewModal = async function(itemRelPath) {
+  currentPreviewPath = itemRelPath;
+  const fileName = itemRelPath.split("/").pop();
+  const ext = (fileName.split(".").pop() || "").toLowerCase();
+
+  const backdrop = document.getElementById("storage-preview-modal-backdrop");
+  const titleEl = document.getElementById("preview-modal-title");
+  const iconEl = document.getElementById("preview-modal-icon");
+  const badgeEl = document.getElementById("preview-modal-badge");
+  const metaEl = document.getElementById("preview-modal-meta");
+  const loadingEl = document.getElementById("preview-modal-loading");
+  const contentEl = document.getElementById("preview-modal-content");
+  const openBtn = document.getElementById("preview-modal-open-btn");
+  const downloadBtn = document.getElementById("preview-modal-download-btn");
+
+  if (!backdrop) return;
+
+  if (titleEl) titleEl.textContent = fileName;
+  if (iconEl) iconEl.textContent = getFileIcon(fileName, false);
+  if (badgeEl) badgeEl.textContent = ext ? `.${ext}` : "file";
+  if (metaEl) metaEl.textContent = `Logical Path: Home/${itemRelPath}`;
+
+  const nodeParam = selectedStorageNode ? `&node=${encodeURIComponent(selectedStorageNode)}` : "";
+  const previewUrl = `/storage/preview?path=${encodeURIComponent(itemRelPath)}${nodeParam}`;
+  const downloadUrl = `/storage/download?path=${encodeURIComponent(itemRelPath)}${nodeParam}`;
+
+  if (openBtn) openBtn.href = previewUrl;
+  if (downloadBtn) {
+    downloadBtn.href = downloadUrl;
+    downloadBtn.setAttribute("download", fileName);
+  }
+
+  backdrop.style.display = "flex";
+  if (loadingEl) loadingEl.style.display = "flex";
+  if (contentEl) contentEl.innerHTML = "";
+
+  const imageExts = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"];
+  const textExts = ["txt", "md", "markdown", "json", "yaml", "yml", "py", "js", "css", "sh", "log", "conf", "ini", "env", "csv", "sql", "toml"];
+  const safeSourceExts = ["html", "htm", "svg", "xhtml", "xml"];
+  const audioExts = ["mp3", "wav", "ogg", "m4a", "flac"];
+  const videoExts = ["mp4", "webm", "ogv"];
+
+  try {
+    if (ext === "pdf") {
+      // PDF Viewer via native browser PDF viewer inside iframe
+      if (loadingEl) loadingEl.style.display = "none";
+      contentEl.innerHTML = `
+        <iframe src="${previewUrl}#toolbar=0" class="preview-iframe" title="${escapeHtml(fileName)}"></iframe>
+      `;
+    } else if (imageExts.includes(ext)) {
+      // Image Viewer
+      if (loadingEl) loadingEl.style.display = "none";
+      contentEl.innerHTML = `
+        <div class="preview-img-wrap">
+          <img src="${previewUrl}" class="preview-img" alt="${escapeHtml(fileName)}" onload="document.getElementById('preview-modal-loading')?.style.setProperty('display', 'none');" onerror="this.parentElement.innerHTML='<div class=\\'cell-muted mono\\'>Failed to load image.</div>';" />
+        </div>
+      `;
+    } else if (safeSourceExts.includes(ext)) {
+      // Untrusted HTML & SVG: Display sanitized code source view to prevent XSS execution
+      const resp = await fetch(previewUrl);
+      if (!resp.ok) {
+        throw new Error(`Server returned HTTP ${resp.status}`);
+      }
+      const rawText = await resp.text();
+      if (loadingEl) loadingEl.style.display = "none";
+      contentEl.innerHTML = `
+        <div class="preview-text-wrap">
+          <div class="cell-muted mono" style="font-size:11px; margin-bottom:12px; padding:6px 10px; background:rgba(255,255,255,0.04); border-left: 3px solid var(--status-blue, #58a6ff); border-radius: 4px;">
+            🛡️ Safe Source Preview — Active script execution is disabled for untrusted markup (${ext.toUpperCase()}).
+          </div>
+          <pre class="preview-code mono">${escapeHtml(rawText)}</pre>
+        </div>
+      `;
+    } else if (textExts.includes(ext) || ext === "") {
+      // Plain-text, Markdown, Code, Config files
+      const resp = await fetch(previewUrl);
+      if (!resp.ok) {
+        throw new Error(`Server returned HTTP ${resp.status}`);
+      }
+      const textContent = await resp.text();
+      if (loadingEl) loadingEl.style.display = "none";
+      contentEl.innerHTML = `
+        <div class="preview-text-wrap">
+          <pre class="preview-code mono">${escapeHtml(textContent)}</pre>
+        </div>
+      `;
+    } else if (audioExts.includes(ext)) {
+      if (loadingEl) loadingEl.style.display = "none";
+      contentEl.innerHTML = `
+        <div class="preview-media-wrap">
+          <audio controls autoplay src="${previewUrl}" class="preview-audio"></audio>
+        </div>
+      `;
+    } else if (videoExts.includes(ext)) {
+      if (loadingEl) loadingEl.style.display = "none";
+      contentEl.innerHTML = `
+        <div class="preview-media-wrap">
+          <video controls autoplay src="${previewUrl}" class="preview-video"></video>
+        </div>
+      `;
+    } else {
+      // Unsupported file format
+      if (loadingEl) loadingEl.style.display = "none";
+      contentEl.innerHTML = `
+        <div class="preview-unsupported">
+          <div class="preview-unsupported-icon">${getFileIcon(fileName, false)}</div>
+          <div class="preview-unsupported-title">No preview available for .${escapeHtml(ext)} files</div>
+          <p class="mono cell-muted" style="font-size: 12px; max-width: 360px;">
+            This file type cannot be previewed directly in the browser. You can download the file to inspect it on your local device.
+          </p>
+          <a href="${downloadUrl}" download="${escapeHtml(fileName)}" class="btn btn-primary" style="margin-top: 8px;">Download File</a>
+        </div>
+      `;
+    }
+  } catch (err) {
+    if (loadingEl) loadingEl.style.display = "none";
+    contentEl.innerHTML = `
+      <div class="preview-unsupported">
+        <div class="preview-unsupported-icon" style="color: #f85149;">⚠️</div>
+        <div class="preview-unsupported-title">Preview Unavailable</div>
+        <p class="mono cell-muted" style="font-size: 12px; max-width: 400px;">
+          ${escapeHtml(err.message || "Failed to load document preview.")}
+        </p>
+        <a href="${downloadUrl}" download="${escapeHtml(fileName)}" class="btn btn-sm btn-secondary" style="margin-top: 8px;">Download File Instead</a>
+      </div>
+    `;
+  }
+};
+
+window.closePreviewModal = function() {
+  const backdrop = document.getElementById("storage-preview-modal-backdrop");
+  const contentEl = document.getElementById("preview-modal-content");
+  if (backdrop) backdrop.style.display = "none";
+  if (contentEl) contentEl.innerHTML = "";
+  currentPreviewPath = null;
 };
 
 // ==========================================
@@ -4121,6 +4441,15 @@ document.getElementById("ps-modal-confirm-btn")?.addEventListener("click", () =>
 });
 
 document.addEventListener("keydown", (e) => {
+  const shareBackdrop = document.getElementById("storage-share-modal-backdrop");
+  if (shareBackdrop && shareBackdrop.style.display !== "none") {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeShareModal();
+      return;
+    }
+  }
+
   const haBackdrop = document.getElementById("ha-details-modal-backdrop");
   if (haBackdrop && haBackdrop.style.display !== "none") {
     if (e.key === "Escape") {
@@ -4139,6 +4468,12 @@ document.addEventListener("keydown", (e) => {
   } else if (e.key === "Enter") {
     e.preventDefault();
     document.getElementById("ps-modal-confirm-btn")?.click();
+  }
+});
+
+document.getElementById("storage-share-modal-backdrop")?.addEventListener("click", (e) => {
+  if (e.target.id === "storage-share-modal-backdrop") {
+    closeShareModal();
   }
 });
 
