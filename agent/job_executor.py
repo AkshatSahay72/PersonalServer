@@ -37,6 +37,12 @@ from controller.image_inspector import (
     get_local_image_metadata,
 )
 
+from common.artifact_manager import (
+    validate_job_output_path,
+    compute_file_sha256,
+    MAX_ARTIFACT_SIZE_BYTES
+)
+
 SCRIPTS_DIR = BASE_DIR / "scripts"
 RUNTIME_DIR = BASE_DIR / "runtime"
 JOBS_RUNTIME_DIR = RUNTIME_DIR / "jobs"
@@ -229,7 +235,7 @@ class JobExecutor:
         return is_image_cached(image, runtime)
 
     @staticmethod
-    def execute(job):
+    def execute(job, sandbox_dir=None):
         """
         Execute a job dictionary:
         {
@@ -245,6 +251,8 @@ class JobExecutor:
         job_type = job.get("type", "")
         params = job.get("parameters", {}) or {}
         timeout_sec = int(job.get("timeout", 60))
+        sandbox_path = Path(sandbox_dir).resolve() if sandbox_dir else (JOBS_RUNTIME_DIR / job_id).resolve()
+        sandbox_path.mkdir(parents=True, exist_ok=True)
 
         if not JobExecutor.is_allowed(job_type):
             return {
@@ -1174,12 +1182,17 @@ except Exception as e:
 
         proc = None
         try:
+            proc_env = os.environ.copy()
+            proc_env["PERSONALSERVER_JOB_DIR"] = str(sandbox_path)
+            proc_env["PERSONALSERVER_JOB_ID"] = str(job_id)
+            exec_cwd = str(sandbox_path) if job_type in ("python-script", "shell-script", "echo") else str(BASE_DIR)
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd=str(BASE_DIR)
+                cwd=exec_cwd,
+                env=proc_env
             )
             with JobExecutor._ACTIVE_JOBS_LOCK:
                 if job_id in JobExecutor._ACTIVE_JOBS:
@@ -1278,6 +1291,47 @@ except Exception as e:
             stderr_str = f"Execution Exception: {str(e)}"
             exit_code = 1
 
+        declared_outputs_list = []
+        if status == JOB_STATE_SUCCEEDED:
+            declared_outputs = job.get("outputs") or params.get("outputs") or params.get("artifacts") or []
+            for out in declared_outputs:
+                if isinstance(out, str):
+                    out_name = out
+                    target_name = out
+                elif isinstance(out, dict):
+                    out_name = out.get("path") or out.get("name")
+                    target_name = out.get("name") or out_name
+                else:
+                    continue
+                try:
+                    out_file = validate_job_output_path(sandbox_path, out_name)
+                    if not out_file.exists() or not out_file.is_file():
+                        status = JOB_STATE_FAILED
+                        exit_code = 1
+                        stderr_str = f"Declared output artifact '{out_name}' was not produced by job."
+                        declared_outputs_list = []
+                        break
+                    sha256, size_bytes = compute_file_sha256(out_file)
+                    if size_bytes > MAX_ARTIFACT_SIZE_BYTES:
+                        status = JOB_STATE_FAILED
+                        exit_code = 1
+                        stderr_str = f"Output artifact '{out_name}' exceeds size limit of {MAX_ARTIFACT_SIZE_BYTES // (1024*1024)}MB."
+                        declared_outputs_list = []
+                        break
+                    declared_outputs_list.append({
+                        "name": target_name,
+                        "filename": out_file.name,
+                        "path": str(out_file),
+                        "sha256": sha256,
+                        "size_bytes": size_bytes
+                    })
+                except Exception as e:
+                    status = JOB_STATE_FAILED
+                    exit_code = 1
+                    stderr_str = f"Output artifact validation error for '{out_name}': {e}"
+                    declared_outputs_list = []
+                    break
+
         end_time = time.time()
         finished_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_time))
         duration_ms = int((end_time - start_time) * 1000)
@@ -1294,6 +1348,7 @@ except Exception as e:
             "exit_code": exit_code,
             "stdout": stdout_clean,
             "stderr": stderr_clean,
+            "declared_outputs": declared_outputs_list,
             "duration_ms": duration_ms,
             "started_at": started_iso,
             "finished_at": finished_iso,

@@ -201,6 +201,22 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         if not art:
             handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
             return True
+
+        if not constant_time_compare(token, enrollment_token):
+            caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
+            if not caller_node_id:
+                handler.send_json(401, {"error": "Unauthorized: Node credentials invalid"})
+                return True
+            art_wf_id = art.get("workflow_id")
+            authorized_nodes = art.get("authorized_nodes", [])
+            if art_wf_id:
+                jobs_db = load_jobs_db()
+                wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == art_wf_id]
+                node_in_wf = any(j.get("assigned_node") == caller_node_id or j.get("target_node") == caller_node_id for j in wf_jobs)
+                if not node_in_wf and caller_node_id not in authorized_nodes and art.get("producing_node") != caller_node_id:
+                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifacts for workflow '{art_wf_id}'"})
+                    return True
+
         is_valid = verify_artifact_integrity(art)
         handler.send_json(200, {"artifact": art, "integrity_verified": is_valid})
         return True
@@ -220,19 +236,37 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         if not art:
             handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
             return True
+
+        if not constant_time_compare(token, enrollment_token):
+            caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
+            if not caller_node_id:
+                handler.send_json(401, {"error": "Unauthorized: Node credentials invalid"})
+                return True
+            art_wf_id = art.get("workflow_id")
+            authorized_nodes = art.get("authorized_nodes", [])
+            if art_wf_id:
+                jobs_db = load_jobs_db()
+                wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == art_wf_id]
+                node_in_wf = any(j.get("assigned_node") == caller_node_id or j.get("target_node") == caller_node_id for j in wf_jobs)
+                if not node_in_wf and caller_node_id not in authorized_nodes and art.get("producing_node") != caller_node_id:
+                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifacts for workflow '{art_wf_id}'"})
+                    return True
+
         file_path = art.get("path")
         if not file_path or not os.path.exists(file_path):
             handler.send_json(404, {"error": f"Artifact file on disk missing for '{art_id}'"})
             return True
-        with open(file_path, "rb") as f:
-            content = f.read()
+        file_size = os.path.getsize(file_path)
         handler.send_response(200)
         handler.send_header("Content-Type", art.get("content_type", "application/octet-stream"))
-        handler.send_header("Content-Length", str(len(content)))
+        handler.send_header("Content-Length", str(file_size))
+        handler.send_header("X-Artifact-Sha256", art.get("sha256", ""))
         handler.send_header("Content-Disposition", f'attachment; filename="{art.get("filename", art_id)}"')
         handler.send_header("Access-Control-Allow-Origin", "*")
         handler.end_headers()
-        handler.wfile.write(content)
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                handler.wfile.write(chunk)
         return True
 
     # GET /nodes/<node_id>/jobs/next (Node Agent fetching its assigned job with Lease)
@@ -982,18 +1016,9 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     app["updated_at"] = now_iso
                 save_apps_db(apps_db)
 
-        # Progress any parent workflow if job belongs to a workflow
-        wf_id = job.get("workflow_id")
-        if wf_id:
-            try:
-                workflows_db = load_workflows_db()
-                if progress_workflows(workflows_db, jobs_db):
-                    save_workflows_db(workflows_db)
-            except Exception as e:
-                print(f"[CONTROLLER-WORKFLOW] Error progressing workflow '{wf_id}': {e}", file=sys.stderr)
-
         reported_artifacts = body.get("artifacts")
         if reported_artifacts and isinstance(reported_artifacts, list):
+            job["artifacts"] = reported_artifacts
             try:
                 artifacts_db = load_artifacts_db()
                 for art in reported_artifacts:
@@ -1003,6 +1028,16 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 save_artifacts_db(artifacts_db)
             except Exception as e:
                 print(f"[CONTROLLER-ARTIFACTS] Error storing reported artifacts: {e}", file=sys.stderr)
+
+        # Progress any parent workflow if job belongs to a workflow
+        wf_id = job.get("workflow_id")
+        if wf_id:
+            try:
+                workflows_db = load_workflows_db()
+                if progress_workflows(workflows_db, jobs_db):
+                    save_workflows_db(workflows_db)
+            except Exception as e:
+                print(f"[CONTROLLER-WORKFLOW] Error progressing workflow '{wf_id}': {e}", file=sys.stderr)
 
         save_jobs_db(jobs_db)
 
@@ -1314,7 +1349,21 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
     # POST /artifacts/upload/raw - Streaming raw binary artifact upload
     if path == "/artifacts/upload/raw":
         enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+        is_admin = False
+        if hasattr(handler, "is_authenticated_admin"):
+            admin_val = handler.is_authenticated_admin()
+            if isinstance(admin_val, bool):
+                is_admin = admin_val
+        if not is_admin:
+            is_admin = constant_time_compare(token, enrollment_token)
+
+        caller_node_id = None
+        if hasattr(handler, "get_authenticated_node_id"):
+            raw_node_id = handler.get_authenticated_node_id()
+            if isinstance(raw_node_id, str):
+                caller_node_id = raw_node_id
+
+        if not is_admin and not caller_node_id and not handler.is_authenticated_admin_or_node():
             handler.send_json(401, {"error": "Unauthorized: Authentication required to upload artifacts"})
             return True
 
@@ -1328,10 +1377,53 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         except (ValueError, TypeError):
             content_length = 0
 
+        # Maximum artifact limit: 64 MB
+        MAX_ARTIFACT_LIMIT = 64 * 1024 * 1024
+        if content_length > MAX_ARTIFACT_LIMIT:
+            handler.send_json(413, {"error": f"Payload Too Large: Artifact exceeds {MAX_ARTIFACT_LIMIT // (1024*1024)}MB limit."})
+            return True
+
         expected_sha256 = query.get("sha256", [None])[0] or handler.headers.get("X-Artifact-Sha256")
         job_id = query.get("job_id", [None])[0] or handler.headers.get("X-Job-Id")
         workflow_id = query.get("workflow_id", [None])[0] or handler.headers.get("X-Workflow-Id")
+        name = query.get("name", [None])[0] or handler.headers.get("X-Artifact-Name") or filename
+        step_id = query.get("step_id", [None])[0] or handler.headers.get("X-Workflow-Step-Id")
         content_type = handler.headers.get("Content-Type", "application/octet-stream")
+
+        # Worker assignment authorization
+        if job_id:
+            jobs_db = load_jobs_db()
+            job = jobs_db.get("jobs", {}).get(job_id)
+            if job:
+                if not is_admin and caller_node_id and job.get("assigned_node") and job.get("assigned_node") != caller_node_id:
+                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not assigned to job '{job_id}'"})
+                    return True
+                if not workflow_id and job.get("workflow_id"):
+                    workflow_id = job.get("workflow_id")
+                if not step_id and job.get("workflow_step_id"):
+                    step_id = job.get("workflow_step_id")
+
+        # Check for existing artifact on retry (idempotent duplicate avoidance)
+        artifacts_db = load_artifacts_db()
+        existing_art = next(
+            (a for a in artifacts_db.get("artifacts", {}).values()
+             if a.get("job_id") == job_id and (a.get("filename") == filename or a.get("name") == name)),
+            None
+        )
+        if existing_art and expected_sha256 and existing_art.get("sha256", "").lower() == expected_sha256.lower():
+            if content_length > 0:
+                # Drain stream cleanly
+                try:
+                    _ = handler.rfile.read(content_length)
+                except Exception:
+                    pass
+            if verify_artifact_integrity(existing_art):
+                handler.send_json(200, {
+                    "status": "EXISTS",
+                    "artifact": existing_art,
+                    "message": "Artifact already exists with identical checksum."
+                })
+                return True
 
         storage_root = get_controller_paths().artifacts_dir
         art_id = generate_artifact_id()
@@ -1346,8 +1438,19 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 expected_sha256=expected_sha256,
                 job_id=job_id,
                 workflow_id=workflow_id,
-                content_type=content_type
+                content_type=content_type,
+                max_bytes=MAX_ARTIFACT_LIMIT
             )
+            art_record["name"] = name
+            art_record["workflow_step_id"] = step_id
+            art_record["producing_node"] = caller_node_id if isinstance(caller_node_id, str) else None
+            if workflow_id:
+                jobs_db = load_jobs_db()
+                wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == workflow_id]
+                auth_nodes = [j.get("assigned_node") for j in wf_jobs if isinstance(j.get("assigned_node"), str)]
+                if isinstance(caller_node_id, str):
+                    auth_nodes.append(caller_node_id)
+                art_record["authorized_nodes"] = list(set(auth_nodes))
         except ValueError as e:
             handler.send_json(400, {"error": str(e)})
             return True

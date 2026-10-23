@@ -145,9 +145,8 @@ def instantiate_workflow(
             "created_at": now,
             "started_at": None,
             "finished_at": None,
-            "result": None,
-            "inputs": spec.get("inputs", []),
-            "outputs": spec.get("outputs", [])
+            "inputs": spec.get("inputs") or spec.get("parameters", {}).get("inputs") or [],
+            "outputs": spec.get("outputs") or spec.get("parameters", {}).get("outputs") or spec.get("parameters", {}).get("artifacts") or []
         }
 
         created_jobs.append(job_record)
@@ -239,6 +238,65 @@ def evaluate_workflow_progress(
                     for p in parent_jobs
                 )
                 if all_parents_succeeded:
+                    # Resolve input artifacts from successful parent steps
+                    declared_inputs = job.get("inputs") or job.get("parameters", {}).get("inputs") or []
+                    resolved_artifacts = []
+                    missing_artifact_err = None
+
+                    for inp in declared_inputs:
+                        if isinstance(inp, str):
+                            if "/" in inp:
+                                p_name, a_name = inp.split("/", 1)
+                            else:
+                                p_name, a_name = None, inp
+                            loc_name = a_name
+                        elif isinstance(inp, dict):
+                            p_name = inp.get("step")
+                            a_name = inp.get("artifact") or inp.get("name")
+                            loc_name = inp.get("name") or a_name
+                        else:
+                            continue
+
+                        cand_parent_steps = [p_name] if p_name else parent_step_ids
+                        found = None
+                        for cand in cand_parent_steps:
+                            if cand in steps:
+                                p_jid = steps[cand]["job_id"]
+                                pj = all_jobs.get(p_jid)
+                                if pj and pj.get("artifacts"):
+                                    for art in pj["artifacts"]:
+                                        if art.get("name") == a_name or art.get("filename") == a_name:
+                                            found = art
+                                            break
+                            if found:
+                                break
+
+                        if not found:
+                            missing_artifact_err = f"Required input artifact '{a_name}' from parent step '{p_name or cand_parent_steps}' was not produced."
+                            break
+
+                        resolved_artifacts.append({
+                            "artifact_id": found["artifact_id"],
+                            "name": loc_name,
+                            "filename": found.get("filename") or loc_name,
+                            "sha256": found.get("sha256"),
+                            "size_bytes": found.get("size_bytes"),
+                            "source_step": p_name or (cand_parent_steps[0] if cand_parent_steps else None),
+                            "source_job_id": found.get("job_id")
+                        })
+
+                    if missing_artifact_err:
+                        job["status"] = JOB_STATE_FAILED
+                        job["state"] = JOB_STATE_FAILED
+                        job["finished_at"] = get_current_iso_timestamp()
+                        job["retry_reason"] = missing_artifact_err
+                        job["waiting_reason"] = None
+                        step["status"] = JOB_STATE_FAILED
+                        changed = True
+                        iteration_changed = True
+                        continue
+
+                    job["input_artifacts"] = resolved_artifacts
                     job["status"] = JOB_STATE_QUEUED
                     job["state"] = JOB_STATE_QUEUED
                     job["waiting_reason"] = None

@@ -62,6 +62,25 @@ class BaseHandler(BaseHTTPRequestHandler):
             return auth_header[7:].strip()
         return self.headers.get("X-Auth-Token", "").strip()
 
+    def is_authenticated_admin(self) -> bool:
+        """Verifies if caller has the cluster enrollment token."""
+        token = self.parse_auth_token()
+        if not token:
+            return False
+        enrollment_token = get_or_create_enrollment_token()
+        return constant_time_compare(token, enrollment_token)
+
+    def get_authenticated_node_id(self) -> Optional[str]:
+        """Returns node_id if caller is an authenticated node, or None if admin or unauthenticated."""
+        token = self.parse_auth_token()
+        if not token:
+            return None
+        nodes_db = load_nodes_db()
+        for node_id, node in nodes_db.get("nodes", {}).items():
+            if node.get("auth_token") and constant_time_compare(node.get("auth_token"), token):
+                return node.get("node_id") or node_id
+        return None
+
     def is_authenticated_admin_or_node(self) -> bool:
         """Verifies if caller has valid cluster enrollment token or registered node auth token."""
         token = self.parse_auth_token()

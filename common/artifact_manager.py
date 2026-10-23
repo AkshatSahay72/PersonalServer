@@ -47,6 +47,9 @@ def compute_file_sha256(filepath: Path, chunk_size: int = 65536) -> Tuple[str, i
         return compute_stream_sha256(f, chunk_size)
 
 
+MAX_ARTIFACT_SIZE_BYTES = 64 * 1024 * 1024  # 64 MB maximum artifact size
+
+
 def validate_artifact_path(base_dir: Path, filename: str) -> Path:
     """
     Guards against directory traversal attacks.
@@ -67,6 +70,46 @@ def validate_artifact_path(base_dir: Path, filename: str) -> Path:
     return target_path
 
 
+def validate_job_output_path(sandbox_dir: Path, declared_path: str) -> Path:
+    """
+    Validates a job's declared output path inside its dedicated sandbox.
+    Rejects directory traversal, paths escaping the sandbox, symlinks escaping the sandbox,
+    and unsupported file types (directories, sockets, pipes).
+    """
+    if not declared_path or not isinstance(declared_path, str):
+        raise ValueError("Invalid or missing declared artifact path.")
+    
+    cleaned = declared_path.strip()
+    if not cleaned or ".." in cleaned.split("/") or ".." in cleaned.split("\\"):
+        raise ValueError(f"Path traversal detected: '{declared_path}' contains '..'.")
+    
+    resolved_base = sandbox_dir.resolve()
+    target_path = (sandbox_dir / cleaned).resolve()
+
+    try:
+        target_path.relative_to(resolved_base)
+    except ValueError:
+        raise ValueError(f"Path traversal detected: '{declared_path}' escapes job sandbox.")
+
+    # Symlink escape verification
+    raw_path = sandbox_dir / cleaned
+    if raw_path.is_symlink() or os.path.islink(str(raw_path)):
+        real_target = Path(os.path.realpath(str(raw_path)))
+        try:
+            real_target.relative_to(resolved_base)
+        except ValueError:
+            raise ValueError(f"Symlink escape detected: artifact '{declared_path}' links to outside of sandbox.")
+
+    # Unsupported file type verification (if file exists)
+    if target_path.exists():
+        if target_path.is_dir():
+            raise ValueError(f"Invalid artifact type: '{declared_path}' is a directory, not a file.")
+        if target_path.is_socket() or target_path.is_fifo() or target_path.is_block_device() or target_path.is_char_device():
+            raise ValueError(f"Invalid artifact type: '{declared_path}' is a special device or socket.")
+
+    return target_path
+
+
 def store_artifact_bytes(
     storage_root: Path,
     artifact_id: str,
@@ -76,12 +119,17 @@ def store_artifact_bytes(
     job_id: Optional[str] = None,
     workflow_id: Optional[str] = None,
     content_type: str = "application/octet-stream",
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    max_bytes: int = MAX_ARTIFACT_SIZE_BYTES
 ) -> Dict[str, Any]:
     """
     Atomically writes artifact bytes to storage_root/<artifact_id>/<filename>
-    with SHA-256 verification and metadata persistence.
+    with SHA-256 verification, size bounding, and metadata persistence.
     """
+    size_bytes = len(content_bytes)
+    if size_bytes > max_bytes:
+        raise ValueError(f"Artifact size ({size_bytes} bytes) exceeds limit of {max_bytes} bytes.")
+
     art_dir = (storage_root / artifact_id).resolve()
     art_dir.mkdir(parents=True, exist_ok=True)
     target_file = validate_artifact_path(art_dir, filename)
@@ -91,7 +139,6 @@ def store_artifact_bytes(
     hasher = hashlib.sha256()
     hasher.update(content_bytes)
     actual_sha256 = hasher.hexdigest()
-    size_bytes = len(content_bytes)
 
     if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
         raise ValueError(f"Checksum mismatch: expected {expected_sha256}, got {actual_sha256}")
@@ -141,12 +188,16 @@ def store_artifact_stream(
     workflow_id: Optional[str] = None,
     content_type: str = "application/octet-stream",
     metadata: Optional[Dict[str, Any]] = None,
-    chunk_size: int = 65536
+    chunk_size: int = 65536,
+    max_bytes: int = MAX_ARTIFACT_SIZE_BYTES
 ) -> Dict[str, Any]:
     """
     Streams artifact bytes from an open file or socket directly into a temporary file
-    with streaming SHA-256 computation, verifying checksum before atomic promotion.
+    with streaming SHA-256 computation, verifying checksum and max size before atomic promotion.
     """
+    if total_bytes_expected > max_bytes:
+        raise ValueError(f"Artifact size ({total_bytes_expected} bytes) exceeds limit of {max_bytes} bytes.")
+
     art_dir = (storage_root / artifact_id).resolve()
     art_dir.mkdir(parents=True, exist_ok=True)
     target_file = validate_artifact_path(art_dir, filename)
@@ -169,9 +220,11 @@ def store_artifact_stream(
                     break
                 if isinstance(chunk, str):
                     chunk = chunk.encode("utf-8")
+                bytes_read += len(chunk)
+                if bytes_read > max_bytes:
+                    raise ValueError(f"Artifact size exceeded maximum allowed limit of {max_bytes} bytes.")
                 f.write(chunk)
                 hasher.update(chunk)
-                bytes_read += len(chunk)
 
         actual_sha256 = hasher.hexdigest()
         if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
@@ -220,10 +273,12 @@ def verify_artifact_integrity(record: Dict[str, Any]) -> bool:
 
 class ArtifactManager:
     """Convenience class interface for artifact management."""
+    MAX_SIZE = MAX_ARTIFACT_SIZE_BYTES
     generate_id = staticmethod(generate_artifact_id)
     compute_stream_sha256 = staticmethod(compute_stream_sha256)
     compute_file_sha256 = staticmethod(compute_file_sha256)
     validate_path = staticmethod(validate_artifact_path)
+    validate_job_output_path = staticmethod(validate_job_output_path)
     store_bytes = staticmethod(store_artifact_bytes)
     store_stream = staticmethod(store_artifact_stream)
     verify_integrity = staticmethod(verify_artifact_integrity)

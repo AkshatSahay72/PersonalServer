@@ -19,14 +19,26 @@ import shutil
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Tuple, Optional, List, Dict, Any
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
-# Import local JobExecutor
-from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+# Import local JobExecutor & Artifact helpers
+try:
+    from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+except ImportError:
+    from agent.job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+
+from common.artifact_manager import (
+    validate_artifact_path,
+    compute_file_sha256,
+    MAX_ARTIFACT_SIZE_BYTES
+)
 from config.structured_logger import (
     agent_logger,
     extract_correlation_id,
@@ -1300,9 +1312,148 @@ def cmd_registration_status(args):
     return 0
 
 
+def _post_job_result(controller_url: str, auth_token: str, job_id: str, corr_id: str, result: dict) -> dict:
+    """Posts job execution result back to the controller with correlation headers."""
+    result_url = f"{controller_url.rstrip('/')}/jobs/{job_id}/result"
+    res_req = urllib.request.Request(
+        result_url,
+        data=json.dumps(result).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {auth_token}",
+            "X-Correlation-ID": corr_id,
+            "User-Agent": "PersonalServer-NodeAgent/1.0"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(res_req, timeout=10) as res_resp:
+        return json.loads(res_resp.read().decode("utf-8"))
+
+
+def _download_input_artifacts(controller_url: str, auth_token: str, input_artifacts: list, sandbox_dir: Path) -> Tuple[bool, Optional[str]]:
+    """
+    Downloads required input artifacts into the sandbox directory with streaming SHA-256 validation.
+    Returns (True, None) on success or (False, error_reason) on failure.
+    """
+    for art in input_artifacts:
+        art_id = art.get("artifact_id")
+        raw_dest_name = art.get("name") or art.get("filename")
+        if not raw_dest_name:
+            return False, "Input artifact missing name/filename."
+        try:
+            dest_path = validate_artifact_path(sandbox_dir, raw_dest_name)
+        except ValueError as ve:
+            return False, f"Invalid destination path for artifact '{raw_dest_name}': {ve}"
+
+        expected_sha = art.get("sha256")
+        download_url = f"{controller_url.rstrip('/')}/artifacts/{art_id}/download"
+        req = urllib.request.Request(
+            download_url,
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+                "User-Agent": "PersonalServer-NodeAgent/1.0"
+            }
+        )
+        tmp_dest = dest_path.with_suffix(f".tmp.{secrets.token_hex(4)}")
+        hasher = hashlib.sha256()
+        bytes_read = 0
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                with open(tmp_dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        bytes_read += len(chunk)
+                        if bytes_read > MAX_ARTIFACT_SIZE_BYTES:
+                            raise ValueError(f"Artifact '{raw_dest_name}' exceeded maximum size limit of {MAX_ARTIFACT_SIZE_BYTES} bytes.")
+                        f.write(chunk)
+                        hasher.update(chunk)
+
+            actual_sha = hasher.hexdigest()
+            if expected_sha and actual_sha.lower() != expected_sha.lower():
+                if tmp_dest.exists():
+                    tmp_dest.unlink(missing_ok=True)
+                return False, f"Checksum mismatch for artifact '{raw_dest_name}': expected {expected_sha}, got {actual_sha}."
+
+            shutil.move(str(tmp_dest), str(dest_path))
+        except Exception as e:
+            if tmp_dest.exists():
+                try:
+                    tmp_dest.unlink()
+                except Exception:
+                    pass
+            return False, f"Failed to download input artifact '{raw_dest_name}': {e}"
+
+    return True, None
+
+
+def _upload_output_artifacts(controller_url: str, auth_token: str, declared_outputs: list, job: dict) -> Tuple[bool, list, Optional[str]]:
+    """
+    Streams output artifacts produced by the job to the controller with SHA-256 verification.
+    Returns (True, uploaded_list, None) or (False, uploaded_list, error_reason).
+    """
+    uploaded_records = []
+    job_id = job.get("job_id", "")
+    workflow_id = job.get("workflow_id", "")
+    step_id = job.get("workflow_step_id", "")
+
+    for out in declared_outputs:
+        filename = out.get("filename")
+        name = out.get("name") or filename
+        filepath = Path(out.get("path"))
+        sha256 = out.get("sha256")
+        size_bytes = out.get("size_bytes", 0)
+
+        if not filepath.exists() or not filepath.is_file():
+            return False, uploaded_records, f"Output artifact file '{filepath}' missing on disk."
+
+        query_str = urllib.parse.urlencode({
+            "filename": filename,
+            "name": name,
+            "sha256": sha256,
+            "job_id": job_id,
+            "workflow_id": workflow_id,
+            "step_id": step_id
+        })
+        upload_url = f"{controller_url.rstrip('/')}/artifacts/upload/raw?{query_str}"
+
+        try:
+            with open(filepath, "rb") as f:
+                file_bytes = f.read()
+
+            req = urllib.request.Request(
+                upload_url,
+                data=file_bytes,
+                headers={
+                    "Authorization": f"Bearer {auth_token}",
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(size_bytes),
+                    "X-Artifact-Filename": filename,
+                    "X-Artifact-Name": name,
+                    "X-Artifact-Sha256": sha256,
+                    "X-Job-Id": job_id,
+                    "X-Workflow-Id": workflow_id,
+                    "X-Workflow-Step-Id": step_id,
+                    "User-Agent": "PersonalServer-NodeAgent/1.0"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                art_rec = resp_data.get("artifact")
+                if art_rec:
+                    uploaded_records.append(art_rec)
+        except Exception as e:
+            return False, uploaded_records, f"Failed to upload artifact '{filename}': {e}"
+
+    return True, uploaded_records, None
+
+
 def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon=False):
     """Polls controller for the next job assigned to node_id, executes it, and submits results."""
-    fetch_url = f"{controller_url}/nodes/{node_id}/jobs/next"
+    fetch_url = f"{controller_url.rstrip('/')}/nodes/{node_id}/jobs/next"
     req = urllib.request.Request(
         fetch_url,
         headers={
@@ -1326,6 +1477,9 @@ def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon
             job_id = job.get("job_id")
             corr_id = job.get("correlation_id") or extract_correlation_id(body=job)
             attempt = job.get("attempt", 1)
+            sandbox_dir = (JOBS_DIR / job_id).resolve()
+            sandbox_dir.mkdir(parents=True, exist_ok=True)
+
             agent_logger.info(
                 "job.received",
                 f"Assigned Job: {job_id} ({job.get('type')}, attempt: {attempt})",
@@ -1335,11 +1489,40 @@ def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon
                 attempt=attempt
             )
 
+            # Download required input artifacts (if declared by workflow)
+            input_artifacts = job.get("input_artifacts") or []
+            if input_artifacts:
+                print(f"-> Downloading {len(input_artifacts)} input artifact(s)...")
+                dl_ok, dl_err = _download_input_artifacts(controller_url, auth_token, input_artifacts, sandbox_dir)
+                if not dl_ok:
+                    print(f"-> Failed to download input artifacts: {dl_err}", file=sys.stderr)
+                    fail_result = {
+                        "job_id": job_id,
+                        "correlation_id": corr_id,
+                        "attempt": attempt,
+                        "lease_generation": int(job.get("lease_generation", 1)),
+                        "status": "FAILED",
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": f"Input artifact resolution error: {dl_err}",
+                        "duration_ms": 0,
+                        "started_at": get_current_iso_timestamp(),
+                        "finished_at": get_current_iso_timestamp(),
+                        "diagnostics": {
+                            "failure_reason": f"Input artifact resolution error: {dl_err}"
+                        }
+                    }
+                    try:
+                        _post_job_result(controller_url, auth_token, job_id, corr_id, fail_result)
+                    except Exception as pe:
+                        print(f"Failed to post failure result: {pe}", file=sys.stderr)
+                    return True, False
+
             print(f"-> Assigned Job: {job_id} ({job.get('type')})")
             print(f"-> Executing workload under user permissions...")
 
-            # Execute via JobExecutor
-            result = JobExecutor.execute(job)
+            # Execute via JobExecutor inside dedicated sandbox
+            result = JobExecutor.execute(job, sandbox_dir=sandbox_dir)
 
             agent_logger.info(
                 "job.completed",
@@ -1352,24 +1535,22 @@ def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon
             )
             print(f"-> Execution completed with status: {result.get('status')} (Exit: {result.get('exit_code')})")
 
-            # Post result back to controller
-            result_url = f"{controller_url}/jobs/{job.get('job_id')}/result"
-            res_req = urllib.request.Request(
-                result_url,
-                data=json.dumps(result).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {auth_token}",
-                    "X-Correlation-ID": corr_id,
-                    "User-Agent": "PersonalServer-NodeAgent/1.0"
-                },
-                method="POST"
-            )
+            # Upload declared outputs (if execution succeeded and outputs declared)
+            if result.get("status") == "SUCCEEDED" and result.get("declared_outputs"):
+                print(f"-> Uploading {len(result['declared_outputs'])} output artifact(s)...")
+                up_ok, uploaded_arts, up_err = _upload_output_artifacts(controller_url, auth_token, result["declared_outputs"], job)
+                if not up_ok:
+                    print(f"-> Failed to upload output artifacts: {up_err}", file=sys.stderr)
+                    result["status"] = "FAILED"
+                    result["exit_code"] = 1
+                    result["stderr"] = f"Output artifact upload error: {up_err}"
+                else:
+                    result["artifacts"] = uploaded_arts
 
-            with urllib.request.urlopen(res_req, timeout=5) as res_resp:
-                ack_data = json.loads(res_resp.read().decode("utf-8"))
-                ack_status = ack_data.get("job_status") or ack_data.get("status") or "ACK"
-                print(f"-> Result reported to controller: {ack_status}")
+            # Post result back to controller
+            ack_data = _post_job_result(controller_url, auth_token, job_id, corr_id, result)
+            ack_status = ack_data.get("job_status") or ack_data.get("status") or "ACK"
+            print(f"-> Result reported to controller: {ack_status}")
 
             return True, True
 
