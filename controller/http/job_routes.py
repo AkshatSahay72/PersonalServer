@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 from common.artifact_manager import (
     generate_artifact_id,
     store_artifact_bytes,
+    store_artifact_stream,
     verify_artifact_integrity,
 )
 from common.crypto_utils import constant_time_compare
@@ -174,6 +175,11 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
 
     # GET /artifacts - List cluster artifacts
     if path == "/artifacts":
+        token = handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to list artifacts"})
+            return True
         artifacts_db = load_artifacts_db()
         arts = list(artifacts_db.get("artifacts", {}).values())
         handler.send_json(200, {
@@ -184,6 +190,11 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
 
     # GET /artifacts/<artifact_id>/metadata - Artifact metadata & checksum status
     if path.startswith("/artifacts/") and path.endswith("/metadata"):
+        token = handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to access artifact metadata"})
+            return True
         art_id = path[11:-9].strip()
         artifacts_db = load_artifacts_db()
         art = artifacts_db.get("artifacts", {}).get(art_id)
@@ -196,6 +207,11 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
 
     # GET /artifacts/<artifact_id>/download or GET /artifacts/<artifact_id>
     if path.startswith("/artifacts/"):
+        token = handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to download artifacts"})
+            return True
         art_id = path[11:].rstrip("/")
         if art_id.endswith("/download"):
             art_id = art_id[:-9]
@@ -278,6 +294,8 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         next_job["claimed_at"] = now_iso
         next_job["started_at"] = now_iso
         next_job["lease_expires_at"] = now_epoch + lease_duration
+        # Increment lease generation as a fencing token to prevent duplicate / stale execution
+        next_job["lease_generation"] = int(next_job.get("lease_generation", 0)) + 1
 
         if next_job.get("target") == "auto":
             next_job["scheduler"] = {
@@ -304,6 +322,11 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
 
     # GET /jobs/<job_id>/artifacts
     if path.startswith("/jobs/") and path.endswith("/artifacts"):
+        token = handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to access job artifacts"})
+            return True
         job_id = path[6:-10].strip()
         artifacts_db = load_artifacts_db()
         matching = [
@@ -428,6 +451,11 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
     if path == "/jobs":
         if not body:
             handler.send_json(400, {"error": "Missing JSON request body"})
+            return True
+
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to submit jobs"})
             return True
 
         target = body.get("target") or body.get("target_node") or "auto"
@@ -566,6 +594,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "timeout": timeout_sec,
             "max_attempts": max_attempts,
             "attempt": 1,
+            "lease_generation": 0,
             "claimed_at": None,
             "lease_expires_at": None,
             "created_at": now,
@@ -647,6 +676,27 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 "job_id": job_id,
                 "current_attempt": current_attempt,
                 "stale_attempt": True
+            })
+            return True
+
+        # Fencing token: reject superseded lease generations
+        reported_gen = body.get("lease_generation")
+        current_gen = int(job.get("lease_generation", 1))
+        if reported_gen is not None and int(reported_gen) < current_gen:
+            controller_logger.warning(
+                "worker.stale_generation",
+                f"Superseded lease generation result for job '{job_id}': reported generation {reported_gen} < current generation {current_gen}",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                reported_generation=reported_gen,
+                current_generation=current_gen
+            )
+            handler.send_json(409, {
+                "error": f"Superseded lease generation: reported generation {reported_gen} is older than current generation {current_gen}.",
+                "job_id": job_id,
+                "current_generation": current_gen,
+                "superseded": True
             })
             return True
 
@@ -1022,6 +1072,51 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         })
         return True
 
+    # POST /jobs/<job_id>/lease/renew - Worker lease renewal (heartbeat extension)
+    if path.startswith("/jobs/") and path.endswith("/lease/renew"):
+        job_id = path[6:-12].strip()
+        jobs_db = load_jobs_db()
+        job = jobs_db.get("jobs", {}).get(job_id)
+        if not job:
+            handler.send_json(404, {"error": f"Job '{job_id}' not found"})
+            return True
+
+        target_node = job.get("target_node")
+        nodes_db = load_nodes_db()
+        node_entry = nodes_db.get("nodes", {}).get(target_node, {})
+        expected_auth = node_entry.get("auth_token")
+        enrollment_token = get_or_create_enrollment_token()
+        if not token or (not constant_time_compare(token, expected_auth) and not constant_time_compare(token, enrollment_token)):
+            handler.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
+            return True
+
+        req_gen = body.get("lease_generation") if body else None
+        curr_gen = int(job.get("lease_generation", 1))
+        if req_gen is not None and int(req_gen) < curr_gen:
+            handler.send_json(409, {
+                "error": f"Cannot renew superseded lease generation {req_gen} (current is {curr_gen})",
+                "lease_generation": curr_gen
+            })
+            return True
+
+        curr_st = canonicalize_job_state(job.get("status"))
+        if curr_st not in (JOB_STATE_ASSIGNED, JOB_STATE_RUNNING):
+            handler.send_json(400, {"error": f"Cannot renew lease for job in '{curr_st}' state"})
+            return True
+
+        extension_sec = min(300, max(10, int((body or {}).get("extension_sec", job.get("timeout", 60) + DEFAULT_LEASE_GRACE_SEC))))
+        now_epoch = time.time()
+        job["lease_expires_at"] = now_epoch + extension_sec
+        save_jobs_db(jobs_db)
+
+        handler.send_json(200, {
+            "status": "ok",
+            "job_id": job_id,
+            "lease_expires_at": job["lease_expires_at"],
+            "lease_generation": curr_gen
+        })
+        return True
+
     # POST /jobs/<job_id>/status - Update Job Status (e.g. CLAIMED -> RUNNING)
     if path.startswith("/jobs/") and path.endswith("/status"):
         if not body:
@@ -1151,6 +1246,11 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             handler.send_json(400, {"error": "Missing required 'filename' or 'content_base64'"})
             return True
 
+        # Bound request payload memory size: 64 MB base64 limit
+        if len(content_b64) > 64 * 1024 * 1024:
+            handler.send_json(413, {"error": "Payload Too Large: Base64 artifact exceeds 64MB limit. Use streaming upload."})
+            return True
+
         try:
             content_bytes = base64.b64decode(content_b64)
         except Exception as e:
@@ -1183,6 +1283,60 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             return True
         except Exception as e:
             handler.send_json(500, {"error": f"Failed to store artifact: {e}"})
+            return True
+
+        artifacts_db = load_artifacts_db()
+        artifacts_db.setdefault("artifacts", {})[art_id] = art_record
+        save_artifacts_db(artifacts_db)
+
+        handler.send_json(201, {
+            "status": "UPLOADED",
+            "artifact": art_record
+        })
+        return True
+
+    # POST /artifacts/upload/raw - Streaming raw binary artifact upload
+    if path == "/artifacts/upload/raw":
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to upload artifacts"})
+            return True
+
+        filename = query.get("filename", [None])[0] or handler.headers.get("X-Artifact-Filename")
+        if not filename:
+            handler.send_json(400, {"error": "Missing 'filename' query parameter or X-Artifact-Filename header"})
+            return True
+
+        try:
+            content_length = int(handler.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            content_length = 0
+
+        expected_sha256 = query.get("sha256", [None])[0] or handler.headers.get("X-Artifact-Sha256")
+        job_id = query.get("job_id", [None])[0] or handler.headers.get("X-Job-Id")
+        workflow_id = query.get("workflow_id", [None])[0] or handler.headers.get("X-Workflow-Id")
+        content_type = handler.headers.get("Content-Type", "application/octet-stream")
+
+        storage_root = get_controller_paths().artifacts_dir
+        art_id = generate_artifact_id()
+
+        try:
+            art_record = store_artifact_stream(
+                storage_root=storage_root,
+                artifact_id=art_id,
+                filename=filename,
+                stream=handler.rfile,
+                total_bytes_expected=content_length,
+                expected_sha256=expected_sha256,
+                job_id=job_id,
+                workflow_id=workflow_id,
+                content_type=content_type
+            )
+        except ValueError as e:
+            handler.send_json(400, {"error": str(e)})
+            return True
+        except Exception as e:
+            handler.send_json(500, {"error": f"Failed to store streaming artifact: {e}"})
             return True
 
         artifacts_db = load_artifacts_db()
@@ -1238,15 +1392,29 @@ def handle_job_delete(handler: Any, path: str, token: str) -> bool:
         handler.send_json(404, {"error": f"Job '{job_id}' not found"})
         return True
 
-    # Guard: Active running / claimed jobs cannot be deleted without cancelling first
+    # Guard: Active jobs and jobs belonging to active workflows cannot be deleted
     status = (job.get("status") or job.get("state") or "").upper()
-    if status in (JOB_STATE_RUNNING, JOB_STATE_CLAIMED):
+    canon_st = canonicalize_job_state(status)
+    if canon_st in (JOB_STATE_RUNNING, JOB_STATE_ASSIGNED, JOB_STATE_QUEUED, JOB_STATE_RETRY_WAIT, JOB_STATE_WAITING_FOR_DEPENDENCY, JOB_STATE_NEEDS_ATTENTION):
         handler.send_json(409, {
-            "error": f"Cannot delete job '{job_id}' while in {status} state. Cancel the job first.",
-            "status": status,
+            "error": f"Cannot delete job '{job_id}' while in active state '{canon_st}'. Cancel the job first.",
+            "status": canon_st,
             "job_id": job_id
         })
         return True
+
+    # Check if job belongs to an active DAG workflow
+    wf_id = job.get("workflow_id")
+    if wf_id:
+        workflows_db = load_workflows_db()
+        wf = workflows_db.get("workflows", {}).get(wf_id)
+        if wf and wf.get("status") not in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
+            handler.send_json(409, {
+                "error": f"Cannot delete job '{job_id}': step of active workflow '{wf_id}'. Cancel or delete workflow first.",
+                "workflow_id": wf_id,
+                "job_id": job_id
+            })
+            return True
 
     # Delete job from database
     del jobs_db["jobs"][job_id]

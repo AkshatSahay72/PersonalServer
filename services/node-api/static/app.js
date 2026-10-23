@@ -2001,10 +2001,19 @@ window.confirmDeleteJob = async function(jobId) {
   const targetJob = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
   if (targetJob) {
     const st = (targetJob.status || targetJob.state || "").toUpperCase();
-    if (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING") {
+    const activeStates = ["QUEUED", "CLAIMED", "ASSIGNED", "RUNNING", "RECOVERING", "RETRY_WAIT", "WAITING_FOR_DEPENDENCY", "NEEDS_ATTENTION"];
+    if (activeStates.includes(st)) {
       showCustomAlert({
         title: "Cannot Delete Active Job",
         message: `Job "${jobId}" is currently in ${st} state.\n\nActive workloads cannot be deleted directly to maintain cluster reliability. Please cancel the job first.`,
+        isError: true
+      });
+      return;
+    }
+    if (targetJob.workflow_id) {
+      showCustomAlert({
+        title: "Cannot Delete Workflow Job",
+        message: `Job "${jobId}" belongs to DAG workflow "${targetJob.workflow_id}".\n\nDeleting individual steps compromises workflow integrity. Please cancel or delete the parent workflow instead.`,
         isError: true
       });
       return;

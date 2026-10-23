@@ -74,7 +74,7 @@ def sweep_expired_leases(
         # A: Active Lease Evaluation (ASSIGNED / CLAIMED / RUNNING)
         if canon_status in (JOB_STATE_ASSIGNED, JOB_STATE_RUNNING):
             lease_exp = job.get("lease_expires_at")
-            lease_expired = lease_exp and now_epoch > lease_exp
+            lease_expired = (lease_exp is None) or (now_epoch > float(lease_exp))
             worker_lost = node_live in (STATE_OFFLINE, STATE_REMOVED)
 
             if lease_expired or worker_lost:

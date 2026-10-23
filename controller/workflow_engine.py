@@ -106,6 +106,7 @@ def instantiate_workflow(
 
     created_jobs = []
     instantiated_steps = {}
+    failure_policy = workflow_spec.get("failure_policy", "fail_fast")
 
     for step_id, spec in raw_steps.items():
         job_id = step_to_job_id[step_id]
@@ -134,6 +135,7 @@ def instantiate_workflow(
             "timeout": int(spec.get("timeout", 60)),
             "max_attempts": int(spec.get("max_attempts", 3)),
             "attempt": 1,
+            "lease_generation": 0,
             "priority": spec.get("priority", "normal"),
             "depends_on_steps": depends_on_steps,
             "depends_on_jobs": depends_on_job_ids,
@@ -166,6 +168,7 @@ def instantiate_workflow(
         "name": name,
         "description": description,
         "status": JOB_STATE_QUEUED,
+        "failure_policy": failure_policy,
         "created_at": now,
         "started_at": None,
         "finished_at": None,
@@ -187,6 +190,8 @@ def evaluate_workflow_progress(
     Evaluates step dependencies for a workflow and unblocks ready steps.
     Transitions jobs from WAITING_FOR_DEPENDENCY to QUEUED when parents SUCCEED.
     Transitions dependent jobs to FAILED if any required parent fails.
+    Cascades transitions across multiple dependency levels in a single evaluation.
+    Respects workflow failure_policy ('fail_fast' vs 'continue_on_failure').
     Returns True if any job or workflow state was modified.
     """
     if workflow.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED, JOB_STATE_FAILED):
@@ -195,71 +200,93 @@ def evaluate_workflow_progress(
     changed = False
     all_jobs = jobs_db.get("jobs", {})
     steps = workflow.get("steps", {})
-    completed_count = 0
-    any_failed = False
-    any_running = False
 
-    for step_id, step in steps.items():
-        job_id = step.get("job_id")
-        job = all_jobs.get(job_id)
-        if not job:
-            continue
-
-        raw_status = job.get("status")
-        canon_status = canonicalize_job_state(raw_status)
-        step["status"] = canon_status
-
-        if canon_status == JOB_STATE_SUCCEEDED:
-            completed_count += 1
-        elif canon_status in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_CANCELLED):
-            any_failed = True
-        elif canon_status in (JOB_STATE_RUNNING, JOB_STATE_ASSIGNED):
-            any_running = True
-
-        # Check if this step is waiting for dependencies
-        if canon_status == JOB_STATE_WAITING_FOR_DEPENDENCY:
-            parent_step_ids = step.get("depends_on", [])
-            parent_jobs = [all_jobs.get(steps[p]["job_id"]) for p in parent_step_ids if p in steps]
-
-            # Check if any parent failed
-            failed_parent = next((p for p in parent_jobs if p and canonicalize_job_state(p.get("status")) in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_CANCELLED)), None)
-            if failed_parent:
-                parent_st = canonicalize_job_state(failed_parent.get("status"))
-                job["status"] = JOB_STATE_FAILED
-                job["state"] = JOB_STATE_FAILED
-                job["finished_at"] = get_current_iso_timestamp()
-                job["retry_reason"] = f"Upstream dependency failed: step '{failed_parent.get('workflow_step_id')}' had status {parent_st}"
-                job["waiting_reason"] = None
-                step["status"] = JOB_STATE_FAILED
-                changed = True
-                any_failed = True
+    # Iteratively cascade dependency changes across arbitrary DAG depths
+    while True:
+        iteration_changed = False
+        for step_id, step in steps.items():
+            job_id = step.get("job_id")
+            job = all_jobs.get(job_id)
+            if not job:
                 continue
 
-            # Check if all parents succeeded
-            all_parents_succeeded = parent_jobs and all(
-                p and canonicalize_job_state(p.get("status")) == JOB_STATE_SUCCEEDED
-                for p in parent_jobs
-            )
-            if all_parents_succeeded:
-                job["status"] = JOB_STATE_QUEUED
-                job["state"] = JOB_STATE_QUEUED
-                job["waiting_reason"] = None
-                step["status"] = JOB_STATE_QUEUED
-                changed = True
+            raw_status = job.get("status")
+            canon_status = canonicalize_job_state(raw_status)
+            step["status"] = canon_status
+
+            # Check if this step is waiting for dependencies
+            if canon_status == JOB_STATE_WAITING_FOR_DEPENDENCY:
+                parent_step_ids = step.get("depends_on", [])
+                parent_jobs = [all_jobs.get(steps[p]["job_id"]) for p in parent_step_ids if p in steps]
+
+                # Check if any parent permanently failed or was cancelled
+                failed_parent = next((p for p in parent_jobs if p and canonicalize_job_state(p.get("status")) in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_CANCELLED)), None)
+                if failed_parent:
+                    parent_st = canonicalize_job_state(failed_parent.get("status"))
+                    job["status"] = JOB_STATE_FAILED
+                    job["state"] = JOB_STATE_FAILED
+                    job["finished_at"] = get_current_iso_timestamp()
+                    job["retry_reason"] = f"Upstream dependency failed: step '{failed_parent.get('workflow_step_id')}' had status {parent_st}"
+                    job["waiting_reason"] = None
+                    step["status"] = JOB_STATE_FAILED
+                    changed = True
+                    iteration_changed = True
+                    continue
+
+                # Check if all parents succeeded
+                all_parents_succeeded = parent_jobs and all(
+                    p and canonicalize_job_state(p.get("status")) == JOB_STATE_SUCCEEDED
+                    for p in parent_jobs
+                )
+                if all_parents_succeeded:
+                    job["status"] = JOB_STATE_QUEUED
+                    job["state"] = JOB_STATE_QUEUED
+                    job["waiting_reason"] = None
+                    step["status"] = JOB_STATE_QUEUED
+                    changed = True
+                    iteration_changed = True
+
+        if not iteration_changed:
+            break
 
     total = len(steps)
+    completed_count = sum(1 for s in steps.values() if s.get("status") == JOB_STATE_SUCCEEDED)
+    failed_count = sum(1 for s in steps.values() if s.get("status") in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT))
+    cancelled_count = sum(1 for s in steps.values() if s.get("status") == JOB_STATE_CANCELLED)
+    terminal_count = completed_count + failed_count + cancelled_count
+
     workflow["completed_steps"] = completed_count
     workflow["progress_percent"] = round((completed_count / total * 100), 1) if total > 0 else 100.0
 
-    if completed_count == total:
-        workflow["status"] = JOB_STATE_SUCCEEDED
-        workflow["finished_at"] = get_current_iso_timestamp()
-        changed = True
-    elif any_failed and not any_running:
+    policy = workflow.get("failure_policy", "fail_fast")
+    if failed_count > 0 and policy == "fail_fast":
+        # Fail-fast: Cancel all remaining non-terminal steps so no sibling is stranded
+        now_iso = get_current_iso_timestamp()
+        for s in steps.values():
+            if s.get("status") not in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
+                j = all_jobs.get(s.get("job_id"))
+                if j and canonicalize_job_state(j.get("status")) not in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
+                    j["status"] = JOB_STATE_CANCELLED
+                    j["state"] = JOB_STATE_CANCELLED
+                    j["cancel_reason"] = "Cancelled due to workflow fail-fast policy"
+                    j["finished_at"] = now_iso
+                s["status"] = JOB_STATE_CANCELLED
+                changed = True
         workflow["status"] = JOB_STATE_FAILED
+        workflow["finished_at"] = now_iso
+        changed = True
+
+    elif terminal_count == total:
+        if completed_count == total:
+            workflow["status"] = JOB_STATE_SUCCEEDED
+        elif failed_count > 0:
+            workflow["status"] = JOB_STATE_FAILED
+        else:
+            workflow["status"] = JOB_STATE_CANCELLED
         workflow["finished_at"] = get_current_iso_timestamp()
         changed = True
-    elif completed_count > 0 or any_running:
+
+    elif completed_count > 0 or any(s.get("status") in (JOB_STATE_RUNNING, JOB_STATE_ASSIGNED) for s in steps.values()):
         if workflow.get("status") == JOB_STATE_QUEUED:
             workflow["status"] = "RUNNING"
             workflow["started_at"] = workflow.get("started_at") or get_current_iso_timestamp()

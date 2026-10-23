@@ -14,6 +14,10 @@ import time
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
+import socket
+import ipaddress
+import secrets
 import threading
 from pathlib import Path
 
@@ -334,20 +338,97 @@ class JobExecutor:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
+            allow_internal = bool(params.get("allow_internal", False))
+
+            # Pre-validate hostname target to prevent SSRF against loopback or private networks
+            if not allow_internal:
+                try:
+                    parsed_u = urllib.parse.urlsplit(url)
+                    host_to_check = parsed_u.hostname
+                    if not host_to_check:
+                        raise ValueError(f"Invalid host in URL: {url}")
+                    resolved_addrs = socket.getaddrinfo(host_to_check, None)
+                    for _, _, _, _, saddr in resolved_addrs:
+                        ip_obj = ipaddress.ip_address(saddr[0])
+                        if (
+                            ip_obj.is_loopback
+                            or ip_obj.is_private
+                            or ip_obj.is_link_local
+                            or ip_obj.is_multicast
+                            or ip_obj.is_reserved
+                            or ip_obj.is_unspecified
+                        ):
+                            return {
+                                "job_id": job_id,
+                                "status": JOB_STATE_FAILED,
+                                "exit_code": 1,
+                                "stdout": "",
+                                "stderr": f"Security violation (SSRF): Request to restricted destination '{saddr[0]}' is blocked.",
+                                "duration_ms": 0,
+                                "started_at": started_iso,
+                                "finished_at": started_iso
+                            }
+                except ValueError as ve:
+                    return {
+                        "job_id": job_id,
+                        "status": JOB_STATE_FAILED,
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": str(ve),
+                        "duration_ms": 0,
+                        "started_at": started_iso,
+                        "finished_at": started_iso
+                    }
+                except Exception as e:
+                    return {
+                        "job_id": job_id,
+                        "status": JOB_STATE_FAILED,
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": f"Host resolution failed for '{url}': {e}",
+                        "duration_ms": 0,
+                        "started_at": started_iso,
+                        "finished_at": started_iso
+                    }
+
             expected_status = int(params.get("expected_status", 200))
             req_method = str(params.get("method", "GET")).upper()
             http_timeout = min(60, max(1, int(params.get("http_timeout", timeout_sec))))
             custom_headers = params.get("headers") or {}
+            allow_int_flag = "1" if allow_internal else "0"
             cmd = [
                 sys.executable, "-c",
                 """
-import sys, time, json, urllib.request, urllib.error
-url, method, exp_status, tout, hdrs_json = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+import sys, time, json, urllib.request, urllib.error, urllib.parse, socket, ipaddress
+url, method, exp_status, tout, hdrs_json, allow_int_str = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+allow_int = (allow_int_str == "1")
 hdrs = json.loads(hdrs_json) if hdrs_json else {}
+
+def is_ip_restricted(target_url):
+    try:
+        p = urllib.parse.urlsplit(target_url)
+        h = p.hostname
+        if not h: return True
+        for _, _, _, _, sa in socket.getaddrinfo(h, None):
+            ip = ipaddress.ip_address(sa[0])
+            if (ip.is_loopback or ip.is_private or ip.is_link_local or 
+                ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+                return True
+        return False
+    except Exception:
+        return True
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not allow_int and is_ip_restricted(newurl):
+            raise urllib.error.HTTPError(newurl, 403, "SSRF Blocked: Redirect to restricted destination prohibited", headers, None)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+opener = urllib.request.build_opener(SafeRedirectHandler)
 req = urllib.request.Request(url, headers=hdrs, method=method)
 t0 = time.time()
 try:
-    with urllib.request.urlopen(req, timeout=tout) as resp:
+    with opener.open(req, timeout=tout) as resp:
         duration_ms = int((time.time() - t0) * 1000)
         code = resp.getcode()
         body = resp.read(2048).decode('utf-8', errors='replace')
@@ -362,7 +443,7 @@ except Exception as e:
     print(f"Connection error: {e}", file=sys.stderr)
     sys.exit(2)
 """,
-                url, req_method, str(expected_status), str(http_timeout), json.dumps(custom_headers)
+                url, req_method, str(expected_status), str(http_timeout), json.dumps(custom_headers), allow_int_flag
             ]
 
         elif job_type == "dns-check":
@@ -431,12 +512,20 @@ except Exception as e:
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
+            # Secure execution: write script to a temporary script file to prevent command injection
+            # and argument interpolation issues in PowerShell / Bash
             if sys.platform == "win32":
-                cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+                script_file = RUNTIME_DIR / f"ps_script_{job_id}_{secrets.token_hex(4)}.ps1"
+                script_file.write_text(script, encoding="utf-8")
+                custom_script = script_file
+                cmd = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_file)]
                 if args:
                     cmd.extend([str(a) for a in args])
             else:
-                cmd = ["bash", "-c", script, "script"]
+                script_file = RUNTIME_DIR / f"sh_script_{job_id}_{secrets.token_hex(4)}.sh"
+                script_file.write_text(script, encoding="utf-8")
+                custom_script = script_file
+                cmd = ["bash", str(script_file)]
                 if args:
                     cmd.extend([str(a) for a in args])
 
@@ -1200,6 +1289,7 @@ except Exception as e:
             "job_id": job_id,
             "correlation_id": corr_id,
             "attempt": attempt,
+            "lease_generation": int(job.get("lease_generation", 1)),
             "status": status,
             "exit_code": exit_code,
             "stdout": stdout_clean,
@@ -1210,6 +1300,7 @@ except Exception as e:
             "diagnostics": {
                 "runtime": runtime if "runtime" in locals() and runtime else "native",
                 "attempt": attempt,
+                "lease_generation": int(job.get("lease_generation", 1)),
                 "failure_reason": stderr_clean if status != JOB_STATE_SUCCEEDED else None,
                 "is_timeout": status == JOB_STATE_TIMEOUT
             }
@@ -1223,6 +1314,13 @@ except Exception as e:
             job_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+        # Cleanup custom temporary script file if generated
+        if custom_script and isinstance(custom_script, Path) and custom_script.exists():
+            try:
+                custom_script.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         with JobExecutor._ACTIVE_JOBS_LOCK:
             JobExecutor._ACTIVE_JOBS.pop(job_id, None)

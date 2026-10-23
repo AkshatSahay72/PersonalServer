@@ -85,7 +85,8 @@ def store_artifact_bytes(
     art_dir = (storage_root / artifact_id).resolve()
     art_dir.mkdir(parents=True, exist_ok=True)
     target_file = validate_artifact_path(art_dir, filename)
-    tmp_file = target_file.with_suffix(".tmp")
+    # Use unique tmp filename to prevent collisions during concurrent operations
+    tmp_file = art_dir / f"{target_file.name}.{secrets.token_hex(4)}.tmp"
 
     hasher = hashlib.sha256()
     hasher.update(content_bytes)
@@ -129,6 +130,82 @@ def store_artifact_bytes(
     return record
 
 
+def store_artifact_stream(
+    storage_root: Path,
+    artifact_id: str,
+    filename: str,
+    stream: Any,
+    total_bytes_expected: int = 0,
+    expected_sha256: Optional[str] = None,
+    job_id: Optional[str] = None,
+    workflow_id: Optional[str] = None,
+    content_type: str = "application/octet-stream",
+    metadata: Optional[Dict[str, Any]] = None,
+    chunk_size: int = 65536
+) -> Dict[str, Any]:
+    """
+    Streams artifact bytes from an open file or socket directly into a temporary file
+    with streaming SHA-256 computation, verifying checksum before atomic promotion.
+    """
+    art_dir = (storage_root / artifact_id).resolve()
+    art_dir.mkdir(parents=True, exist_ok=True)
+    target_file = validate_artifact_path(art_dir, filename)
+    tmp_file = art_dir / f"{target_file.name}.{secrets.token_hex(4)}.tmp"
+
+    hasher = hashlib.sha256()
+    bytes_read = 0
+
+    try:
+        with open(tmp_file, "wb") as f:
+            while True:
+                to_read = chunk_size
+                if total_bytes_expected > 0:
+                    remaining = total_bytes_expected - bytes_read
+                    if remaining <= 0:
+                        break
+                    to_read = min(chunk_size, remaining)
+                chunk = stream.read(to_read)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                f.write(chunk)
+                hasher.update(chunk)
+                bytes_read += len(chunk)
+
+        actual_sha256 = hasher.hexdigest()
+        if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
+            raise ValueError(f"Checksum mismatch: expected {expected_sha256}, got {actual_sha256}")
+
+        shutil.move(str(tmp_file), str(target_file))
+    finally:
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass
+
+    record = {
+        "artifact_id": artifact_id,
+        "name": target_file.name,
+        "filename": target_file.name,
+        "path": str(target_file),
+        "size_bytes": bytes_read,
+        "sha256": actual_sha256,
+        "content_type": content_type,
+        "job_id": job_id,
+        "workflow_id": workflow_id,
+        "created_at": get_current_iso_timestamp(),
+        "metadata": metadata or {}
+    }
+
+    meta_path = art_dir / "metadata.json"
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        json.dump(record, mf, indent=2)
+
+    return record
+
+
 def verify_artifact_integrity(record: Dict[str, Any]) -> bool:
     """Verifies that an artifact on disk matches its recorded SHA-256 and size."""
     file_path = Path(record.get("path", ""))
@@ -148,4 +225,6 @@ class ArtifactManager:
     compute_file_sha256 = staticmethod(compute_file_sha256)
     validate_path = staticmethod(validate_artifact_path)
     store_bytes = staticmethod(store_artifact_bytes)
+    store_stream = staticmethod(store_artifact_stream)
     verify_integrity = staticmethod(verify_artifact_integrity)
+
