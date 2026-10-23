@@ -466,6 +466,22 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         parameters = body.get("parameters", {}) or {}
         requirements = body.get("requirements", {}) or {}
 
+        # Privileged capability check: allow_internal and privileged requirements require admin credentials
+        is_admin = constant_time_compare(token, enrollment_token)
+        if parameters.get("allow_internal") and not is_admin:
+            handler.send_json(403, {
+                "error": "Forbidden: 'allow_internal' parameter requires administrator credentials.",
+                "status": JOB_STATE_REJECTED
+            })
+            return True
+
+        if requirements.get("privileged") and not is_admin:
+            handler.send_json(403, {
+                "error": "Forbidden: Privileged workloads require administrator credentials.",
+                "status": JOB_STATE_REJECTED
+            })
+            return True
+
         # Validation: Safe allowlisted workload type rejection
         if job_type not in ALLOWLISTED_WORKLOADS:
             handler.send_json(400, {

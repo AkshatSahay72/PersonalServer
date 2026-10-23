@@ -842,6 +842,32 @@ class TestHttpJobRoutesSecurity(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(self.handler.send_json.call_args[0][0], 401)
 
+    def test_10_allow_internal_requires_admin_credentials(self):
+        """POST /jobs with allow_internal=True is rejected with 403 Forbidden when called by a worker token."""
+        self.handler.is_authenticated_admin_or_node.return_value = True
+        # 1. Worker token attempting allow_internal is rejected
+        handled = handle_job_post(
+            self.handler,
+            "/jobs",
+            {"type": "http-check", "parameters": {"url": "http://127.0.0.1:8080", "allow_internal": True}},
+            token="worker-node-token-123",
+            query={}
+        )
+        self.assertTrue(handled)
+        self.assertEqual(self.handler.send_json.call_args[0][0], 403)
+        self.assertIn("requires administrator credentials", self.handler.send_json.call_args[0][1]["error"])
+
+        # 2. Administrator token is permitted
+        handled_admin = handle_job_post(
+            self.handler,
+            "/jobs",
+            {"type": "http-check", "parameters": {"url": "http://127.0.0.1:8080", "allow_internal": True}},
+            token=self.enrollment_token,
+            query={}
+        )
+        self.assertTrue(handled_admin)
+        self.assertEqual(self.handler.send_json.call_args[0][0], 200)
+
 
 if __name__ == "__main__":
     unittest.main()
