@@ -7,15 +7,24 @@ execution result reporting, retry recovery, and cancellation.
 """
 
 import math
+import base64
+import math
+import os
 import secrets
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+from common.artifact_manager import (
+    generate_artifact_id,
+    store_artifact_bytes,
+    verify_artifact_integrity,
+)
 from common.crypto_utils import constant_time_compare
 from common.time_utils import get_current_iso_timestamp
-from config.platform_config import get_controller_runtime_config
+from config.platform_config import get_controller_paths, get_controller_runtime_config
 from config.structured_logger import (
     controller_logger,
     generate_correlation_id,
@@ -27,19 +36,25 @@ from controller.constants import (
     APP_STATE_FAILED,
     APP_STATE_RUNNING,
     APP_STATE_STOPPED,
+    JOB_STATE_ASSIGNED,
     JOB_STATE_CANCELLED,
     JOB_STATE_CLAIMED,
     JOB_STATE_FAILED,
+    JOB_STATE_NEEDS_ATTENTION,
     JOB_STATE_QUEUED,
     JOB_STATE_RECOVERING,
     JOB_STATE_REJECTED,
+    JOB_STATE_RETRY_WAIT,
     JOB_STATE_RUNNING,
     JOB_STATE_SUCCEEDED,
     JOB_STATE_TIMEOUT,
+    JOB_STATE_TIMED_OUT,
+    JOB_STATE_WAITING_FOR_DEPENDENCY,
     STATE_DEBOARDING,
     STATE_DRAINING,
     STATE_OFFLINE,
     STATE_REMOVED,
+    canonicalize_job_state,
     validate_job_transition,
 )
 
@@ -50,19 +65,160 @@ from controller.notifications import notify_job_failure
 from controller.onboarding import get_or_create_enrollment_token
 from controller.stores import (
     load_apps_db,
+    load_artifacts_db,
     load_jobs_db,
     load_nodes_db,
+    load_workflows_db,
     save_apps_db,
+    save_artifacts_db,
     save_jobs_db,
+    save_workflows_db,
 )
-from scheduler.scheduler import ResourceScheduler, compute_node_liveness
+from controller.workflow_engine import (
+    WorkflowValidationError,
+    cancel_workflow,
+    instantiate_workflow,
+    progress_workflows,
+)
+from scheduler.scheduler import (
+    ResourceScheduler,
+    compute_node_liveness,
+    is_node_eligible,
+)
 
 
 def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
     """
-    Handles GET requests for job querying and worker job lease claims.
+    Handles GET requests for job querying, metrics, workflows, artifacts,
+    and worker job lease claims.
     Returns True if handled, False otherwise.
     """
+    # GET /jobs/metrics - Distributed scheduler and queue observability
+    if path == "/jobs/metrics":
+        jobs_db = load_jobs_db()
+        nodes_db = load_nodes_db()
+        workflows_db = load_workflows_db()
+        artifacts_db = load_artifacts_db()
+        sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
+
+        all_jobs = list(jobs_db.get("jobs", {}).values())
+        status_counts: Dict[str, int] = {}
+        total_duration_ms = 0
+        dur_count = 0
+        active_leases = 0
+        now_ts = time.time()
+
+        for j in all_jobs:
+            st = j.get("status", "UNKNOWN")
+            status_counts[st] = status_counts.get(st, 0) + 1
+            if j.get("lease_expires_at") and j.get("lease_expires_at") > now_ts and st in (JOB_STATE_CLAIMED, JOB_STATE_RUNNING):
+                active_leases += 1
+            dur = (j.get("result") or {}).get("duration_ms")
+            if dur is not None and isinstance(dur, (int, float)) and dur > 0:
+                total_duration_ms += dur
+                dur_count += 1
+
+        avg_duration_ms = round(total_duration_ms / dur_count, 1) if dur_count > 0 else 0
+        queue_depth = sum(
+            status_counts.get(s, 0)
+            for s in (
+                JOB_STATE_QUEUED,
+                JOB_STATE_ASSIGNED,
+                JOB_STATE_RETRY_WAIT,
+                JOB_STATE_WAITING_FOR_DEPENDENCY,
+                JOB_STATE_RECOVERING,
+                JOB_STATE_NEEDS_ATTENTION,
+            )
+        )
+
+        handler.send_json(200, {
+            "queue_depth": queue_depth,
+            "total_jobs": len(all_jobs),
+            "status_counts": status_counts,
+            "active_leases": active_leases,
+            "avg_duration_ms": avg_duration_ms,
+            "total_workflows": len(workflows_db.get("workflows", {})),
+            "total_artifacts": len(artifacts_db.get("artifacts", {})),
+            "heartbeat_timeout_sec": handler.heartbeat_timeout,
+        })
+        return True
+
+    # GET /workflows - List DAG workflows
+    if path == "/workflows":
+        workflows_db = load_workflows_db()
+        jobs_db = load_jobs_db()
+        if progress_workflows(workflows_db, jobs_db):
+            save_workflows_db(workflows_db)
+            save_jobs_db(jobs_db)
+        wfs = list(workflows_db.get("workflows", {}).values())
+        handler.send_json(200, {
+            "workflows": wfs,
+            "count": len(wfs)
+        })
+        return True
+
+    # GET /workflows/<workflow_id> - Workflow details & progress
+    if path.startswith("/workflows/"):
+        wf_id = path[11:].strip()
+        workflows_db = load_workflows_db()
+        jobs_db = load_jobs_db()
+        if progress_workflows(workflows_db, jobs_db):
+            save_workflows_db(workflows_db)
+            save_jobs_db(jobs_db)
+        wf = workflows_db.get("workflows", {}).get(wf_id)
+        if not wf:
+            handler.send_json(404, {"error": f"Workflow '{wf_id}' not found"})
+            return True
+        handler.send_json(200, {"workflow": wf})
+        return True
+
+    # GET /artifacts - List cluster artifacts
+    if path == "/artifacts":
+        artifacts_db = load_artifacts_db()
+        arts = list(artifacts_db.get("artifacts", {}).values())
+        handler.send_json(200, {
+            "artifacts": arts,
+            "count": len(arts)
+        })
+        return True
+
+    # GET /artifacts/<artifact_id>/metadata - Artifact metadata & checksum status
+    if path.startswith("/artifacts/") and path.endswith("/metadata"):
+        art_id = path[11:-9].strip()
+        artifacts_db = load_artifacts_db()
+        art = artifacts_db.get("artifacts", {}).get(art_id)
+        if not art:
+            handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
+            return True
+        is_valid = verify_artifact_integrity(art)
+        handler.send_json(200, {"artifact": art, "integrity_verified": is_valid})
+        return True
+
+    # GET /artifacts/<artifact_id>/download or GET /artifacts/<artifact_id>
+    if path.startswith("/artifacts/"):
+        art_id = path[11:].rstrip("/")
+        if art_id.endswith("/download"):
+            art_id = art_id[:-9]
+        artifacts_db = load_artifacts_db()
+        art = artifacts_db.get("artifacts", {}).get(art_id)
+        if not art:
+            handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
+            return True
+        file_path = art.get("path")
+        if not file_path or not os.path.exists(file_path):
+            handler.send_json(404, {"error": f"Artifact file on disk missing for '{art_id}'"})
+            return True
+        with open(file_path, "rb") as f:
+            content = f.read()
+        handler.send_response(200)
+        handler.send_header("Content-Type", art.get("content_type", "application/octet-stream"))
+        handler.send_header("Content-Length", str(len(content)))
+        handler.send_header("Content-Disposition", f'attachment; filename="{art.get("filename", art_id)}"')
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.end_headers()
+        handler.wfile.write(content)
+        return True
+
     # GET /nodes/<node_id>/jobs/next (Node Agent fetching its assigned job with Lease)
     if path.startswith("/nodes/") and path.endswith("/jobs/next"):
         node_id = path[7:-10].strip()
@@ -86,15 +242,22 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
 
         now_epoch = time.time()
         # Find jobs waiting for this node (respecting retry_after backoff)
+        # Also auto-match jobs targeting "auto" if no node was assigned yet and this node is eligible!
         claimable_jobs = [
             j for j in jobs_db.get("jobs", {}).values()
-            if j.get("target_node") == node_id and (
-                j.get("status") == JOB_STATE_QUEUED
+            if (
+                j.get("target_node") == node_id
                 or (
-                    j.get("status") == JOB_STATE_RECOVERING
+                    not j.get("target_node")
+                    and is_node_eligible(node, j.get("requirements", {}))
+                )
+            ) and (
+                j.get("status") in (JOB_STATE_QUEUED, JOB_STATE_ASSIGNED)
+                or (
+                    j.get("status") in (JOB_STATE_RECOVERING, JOB_STATE_RETRY_WAIT)
                     and now_epoch >= j.get("retry_after", 0)
                 )
-            )
+            ) and j.get("status") != JOB_STATE_WAITING_FOR_DEPENDENCY
         ]
 
         if not claimable_jobs:
@@ -108,10 +271,20 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         timeout_sec = next_job.get("timeout", 60)
         lease_duration = timeout_sec + DEFAULT_LEASE_GRACE_SEC
 
+        next_job["target_node"] = node_id
+        next_job["assigned_node"] = node_id
         next_job["status"] = JOB_STATE_CLAIMED
+        next_job["state"] = JOB_STATE_ASSIGNED
         next_job["claimed_at"] = now_iso
         next_job["started_at"] = now_iso
         next_job["lease_expires_at"] = now_epoch + lease_duration
+
+        if next_job.get("target") == "auto":
+            next_job["scheduler"] = {
+                "mode": "resource-aware-claimed",
+                "selected_node": node_id,
+                "reason": f"Claimed by eligible worker '{node_id}'"
+            }
 
         save_jobs_db(jobs_db)
 
@@ -127,6 +300,21 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
             lease_duration_sec=lease_duration
         )
         handler.send_json(200, {"job": next_job})
+        return True
+
+    # GET /jobs/<job_id>/artifacts
+    if path.startswith("/jobs/") and path.endswith("/artifacts"):
+        job_id = path[6:-10].strip()
+        artifacts_db = load_artifacts_db()
+        matching = [
+            a for a in artifacts_db.get("artifacts", {}).values()
+            if a.get("job_id") == job_id
+        ]
+        handler.send_json(200, {
+            "job_id": job_id,
+            "artifacts": matching,
+            "count": len(matching)
+        })
         return True
 
     # GET /jobs
@@ -263,27 +451,48 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         scheduler_info = None
 
         # Path A: Automatic Resource-Aware Scheduling
+        jobs_db = load_jobs_db()
+        waiting_reason = None
+        initial_status = JOB_STATE_QUEUED
+
         if target.lower() == "auto":
-            decision = ResourceScheduler.select_node(requirements, nodes_db, handler.heartbeat_timeout)
+            decision = ResourceScheduler.select_node(
+                requirements,
+                nodes_db,
+                handler.heartbeat_timeout,
+                cluster_jobs=jobs_db.get("jobs", {})
+            )
             if not decision["selected_node"]:
-                handler.send_json(400, {
-                    "error": f"Scheduling Failed: {decision['reason']}",
-                    "status": JOB_STATE_REJECTED,
-                    "scheduler": decision
-                })
-                return True
-            target_node = decision["selected_node"]
-            scheduler_info = {
-                "mode": "resource-aware",
-                "selected_node": target_node,
-                "score": decision["score"],
-                "reason": decision["reason"],
-                "candidates_count": len(decision["candidates"])
-            }
-            print(f"[CONTROLLER-SCHEDULER] Auto-selected node '{target_node}': {decision['reason']}")
+                if body.get("fail_if_no_nodes", False):
+                    handler.send_json(400, {
+                        "error": f"Scheduling Failed: {decision['reason']}",
+                        "status": JOB_STATE_REJECTED,
+                        "scheduler": decision
+                    })
+                    return True
+                target_node = None
+                scheduler_info = {
+                    "mode": "resource-aware-pending",
+                    "selected_node": None,
+                    "score": 0,
+                    "reason": decision["reason"],
+                    "candidates_count": len(decision.get("candidates", []))
+                }
+                waiting_reason = f"Awaiting eligible worker: {decision['reason']}"
+            else:
+                target_node = decision["selected_node"]
+                scheduler_info = {
+                    "mode": "resource-aware",
+                    "selected_node": target_node,
+                    "score": decision["score"],
+                    "reason": decision["reason"],
+                    "candidates_count": len(decision["candidates"])
+                }
+                print(f"[CONTROLLER-SCHEDULER] Auto-selected node '{target_node}': {decision['reason']}")
 
         # Path B: Explicit Target Node (Preserves explicit target policy)
         else:
+            is_pinned = bool(body.get("pinned", False) or body.get("pin_node"))
             target_node = target
             node_entry = nodes_db.get("nodes", {}).get(target_node)
 
@@ -303,11 +512,20 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
 
             live_status = compute_node_liveness(node_entry, handler.heartbeat_timeout)
             if live_status == STATE_OFFLINE:
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
+                if is_pinned or body.get("wait_if_offline", False):
+                    waiting_reason = f"Pinned node '{target_node}' is currently OFFLINE; awaiting reconnection."
+                    initial_status = JOB_STATE_NEEDS_ATTENTION
+                    scheduler_info = {
+                        "mode": "explicit-pinned",
+                        "target_node": target_node,
+                        "reason": waiting_reason
+                    }
+                else:
+                    handler.send_json(400, {
+                        "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
+                        "status": JOB_STATE_REJECTED
+                    })
+                    return True
 
             if live_status in (STATE_DRAINING, STATE_DEBOARDING) or node_entry.get("status") in (STATE_DRAINING, STATE_DEBOARDING):
                 handler.send_json(400, {
@@ -316,11 +534,12 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 })
                 return True
 
-            scheduler_info = {
-                "mode": "explicit",
-                "target_node": target_node,
-                "reason": "Explicit node specified by client"
-            }
+            if not scheduler_info:
+                scheduler_info = {
+                    "mode": "explicit-pinned" if is_pinned else "explicit",
+                    "target_node": target_node,
+                    "reason": "Pinned node specified by client" if is_pinned else "Explicit node specified by client"
+                }
 
         timeout_sec = max(5, min(timeout_sec, 300))
         job_id = f"job-{secrets.token_hex(6)}"
@@ -338,6 +557,11 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "target": target,
             "target_node": target_node,
             "assigned_node": target_node,
+            "pinned": bool(body.get("pinned", False) or body.get("pin_node")),
+            "priority": body.get("priority", "normal"),
+            "waiting_reason": waiting_reason,
+            "inputs": body.get("inputs", []),
+            "expected_outputs": body.get("expected_outputs", []),
             "scheduler": scheduler_info,
             "timeout": timeout_sec,
             "max_attempts": max_attempts,
@@ -347,8 +571,8 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "created_at": now,
             "started_at": None,
             "finished_at": None,
-            "status": JOB_STATE_QUEUED,
-            "state": JOB_STATE_QUEUED,
+            "status": initial_status,
+            "state": initial_status,
             "retryable": bool(body.get("retryable", True)),
             "backoff_sec": body.get("backoff_sec"),
             "retry_reason": None,
@@ -356,7 +580,6 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "result": None
         }
 
-        jobs_db = load_jobs_db()
         jobs_db.setdefault("jobs", {})[job_id] = job_record
         save_jobs_db(jobs_db)
 
@@ -372,7 +595,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             reason=scheduler_info.get("reason")
         )
         handler.send_json(200, {
-            "status": JOB_STATE_QUEUED,
+            "status": initial_status,
             "job_id": job_id,
             "id": job_id,
             "target_node": target_node,
@@ -693,6 +916,28 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     app["updated_at"] = now_iso
                 save_apps_db(apps_db)
 
+        # Progress any parent workflow if job belongs to a workflow
+        wf_id = job.get("workflow_id")
+        if wf_id:
+            try:
+                workflows_db = load_workflows_db()
+                if progress_workflows(workflows_db, jobs_db):
+                    save_workflows_db(workflows_db)
+            except Exception as e:
+                print(f"[CONTROLLER-WORKFLOW] Error progressing workflow '{wf_id}': {e}", file=sys.stderr)
+
+        reported_artifacts = body.get("artifacts")
+        if reported_artifacts and isinstance(reported_artifacts, list):
+            try:
+                artifacts_db = load_artifacts_db()
+                for art in reported_artifacts:
+                    if isinstance(art, dict) and art.get("artifact_id"):
+                        art["job_id"] = job_id
+                        artifacts_db.setdefault("artifacts", {})[art["artifact_id"]] = art
+                save_artifacts_db(artifacts_db)
+            except Exception as e:
+                print(f"[CONTROLLER-ARTIFACTS] Error storing reported artifacts: {e}", file=sys.stderr)
+
         save_jobs_db(jobs_db)
 
         handler.send_json(200, {
@@ -820,6 +1065,149 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "status": "ok",
             "job_id": job_id,
             "current_status": new_status
+        })
+        return True
+
+    # POST /workflows - Create and instantiate multi-step DAG workflow
+    if path == "/workflows":
+        if not body:
+            handler.send_json(400, {"error": "Missing JSON request body"})
+            return True
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to create workflows"})
+            return True
+
+        jobs_db = load_jobs_db()
+        workflows_db = load_workflows_db()
+        try:
+            workflow_record, created_jobs = instantiate_workflow(body, jobs_db)
+        except WorkflowValidationError as e:
+            handler.send_json(400, {"error": f"Invalid workflow specification: {e}"})
+            return True
+        except Exception as e:
+            handler.send_json(400, {"error": f"Failed to instantiate workflow: {e}"})
+            return True
+
+        wf_id = workflow_record["workflow_id"]
+        workflows_db.setdefault("workflows", {})[wf_id] = workflow_record
+        save_workflows_db(workflows_db)
+        save_jobs_db(jobs_db)
+
+        corr_id = getattr(handler, "current_correlation_id", None) or generate_correlation_id()
+        controller_logger.info(
+            "workflow.created",
+            f"Created workflow '{wf_id}' ({workflow_record['name']}) with {len(created_jobs)} steps",
+            correlation_id=corr_id,
+            workflow_id=wf_id,
+            total_steps=len(created_jobs)
+        )
+        handler.send_json(201, {
+            "status": "CREATED",
+            "workflow": workflow_record,
+            "jobs_count": len(created_jobs)
+        })
+        return True
+
+    # POST /workflows/<workflow_id>/cancel - Cancel DAG workflow
+    if path.startswith("/workflows/") and path.endswith("/cancel"):
+        wf_id = path[11:-7].strip()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to cancel workflow"})
+            return True
+
+        workflows_db = load_workflows_db()
+        jobs_db = load_jobs_db()
+        reason = (body.get("reason") if body else "") or "Cancelled by operator"
+        cancelled_wf = cancel_workflow(wf_id, workflows_db, jobs_db, reason=reason)
+        if not cancelled_wf:
+            handler.send_json(404, {"error": f"Workflow '{wf_id}' not found"})
+            return True
+
+        save_workflows_db(workflows_db)
+        save_jobs_db(jobs_db)
+        handler.send_json(200, {
+            "status": "CANCELLED",
+            "workflow_id": wf_id,
+            "workflow": cancelled_wf,
+            "message": f"Workflow '{wf_id}' and all pending/active steps cancelled."
+        })
+        return True
+
+    # POST /artifacts/upload - Secure atomic artifact upload with SHA-256
+    if path == "/artifacts/upload":
+        if not body:
+            handler.send_json(400, {"error": "Missing JSON request body"})
+            return True
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to upload artifacts"})
+            return True
+
+        filename = body.get("filename") or body.get("name")
+        content_b64 = body.get("content_base64")
+        if not filename or content_b64 is None:
+            handler.send_json(400, {"error": "Missing required 'filename' or 'content_base64'"})
+            return True
+
+        try:
+            content_bytes = base64.b64decode(content_b64)
+        except Exception as e:
+            handler.send_json(400, {"error": f"Invalid base64 encoding: {e}"})
+            return True
+
+        expected_sha256 = body.get("sha256")
+        job_id = body.get("job_id")
+        workflow_id = body.get("workflow_id")
+        content_type = body.get("content_type", "application/octet-stream")
+        metadata = body.get("metadata", {})
+
+        storage_root = get_controller_paths().artifacts_dir
+        art_id = generate_artifact_id()
+
+        try:
+            art_record = store_artifact_bytes(
+                storage_root=storage_root,
+                artifact_id=art_id,
+                filename=filename,
+                content_bytes=content_bytes,
+                expected_sha256=expected_sha256,
+                job_id=job_id,
+                workflow_id=workflow_id,
+                content_type=content_type,
+                metadata=metadata
+            )
+        except ValueError as e:
+            handler.send_json(400, {"error": str(e)})
+            return True
+        except Exception as e:
+            handler.send_json(500, {"error": f"Failed to store artifact: {e}"})
+            return True
+
+        artifacts_db = load_artifacts_db()
+        artifacts_db.setdefault("artifacts", {})[art_id] = art_record
+        save_artifacts_db(artifacts_db)
+
+        handler.send_json(201, {
+            "status": "UPLOADED",
+            "artifact": art_record
+        })
+        return True
+
+    # POST /artifacts/<artifact_id>/verify - Verify integrity of artifact on disk
+    if path.startswith("/artifacts/") and path.endswith("/verify"):
+        art_id = path[11:-7].strip()
+        artifacts_db = load_artifacts_db()
+        art = artifacts_db.get("artifacts", {}).get(art_id)
+        if not art:
+            handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
+            return True
+        is_valid = verify_artifact_integrity(art)
+        handler.send_json(200, {
+            "artifact_id": art_id,
+            "integrity_verified": is_valid,
+            "artifact": art
         })
         return True
 

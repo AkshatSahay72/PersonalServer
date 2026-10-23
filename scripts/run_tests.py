@@ -46,6 +46,7 @@ INTEGRATION_TEST_FILES = [
     "tests/controller/test_local_worker.py",
     "tests/controller/test_multi_node_simulation.py",
     "tests/controller/test_notifications.py",
+    "tests/controller/test_distributed_scheduler.py",
     # Storage domain
     "tests/storage/test_storage_explorer_api.py",
     "tests/storage/test_storage_folder_features.py",

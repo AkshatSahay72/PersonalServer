@@ -2250,6 +2250,34 @@ a:hover {
   background: #f85149;
 }
 
+.node-status-badge.status-warning {
+  background: rgba(240, 136, 62, 0.15);
+  color: #f0883e;
+  border: 1px solid rgba(240, 136, 62, 0.35);
+}
+.node-status-badge.status-warning .status-dot {
+  background: #f0883e;
+  box-shadow: 0 0 6px rgba(240, 136, 62, 0.4);
+}
+
+.node-status-badge.status-waiting {
+  background: rgba(163, 113, 247, 0.12);
+  color: #a371f7;
+  border: 1px solid rgba(163, 113, 247, 0.3);
+}
+.node-status-badge.status-waiting .status-dot {
+  background: #a371f7;
+}
+
+.node-status-badge.status-cancelled {
+  background: rgba(139, 148, 158, 0.12);
+  color: #8b949e;
+  border: 1px solid rgba(139, 148, 158, 0.25);
+}
+.node-status-badge.status-cancelled .status-dot {
+  background: #8b949e;
+}
+
 /* Storage Share Modal & Toggle Switch */
 .switch-toggle {
   position: relative;

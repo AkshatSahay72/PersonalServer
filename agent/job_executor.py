@@ -41,11 +41,18 @@ MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB limit
 
 # Centralized Job States
 JOB_STATE_QUEUED = "QUEUED"
+JOB_STATE_WAITING_FOR_DEPENDENCY = "WAITING_FOR_DEPENDENCY"
+JOB_STATE_ASSIGNED = "ASSIGNED"
+JOB_STATE_CLAIMED = "CLAIMED"
 JOB_STATE_RUNNING = "RUNNING"
+JOB_STATE_RETRY_WAIT = "RETRY_WAIT"
+JOB_STATE_RECOVERING = "RECOVERING"
 JOB_STATE_SUCCEEDED = "SUCCEEDED"
 JOB_STATE_FAILED = "FAILED"
+JOB_STATE_TIMED_OUT = "TIMED_OUT"
 JOB_STATE_TIMEOUT = "TIMEOUT"
 JOB_STATE_CANCELLED = "CANCELLED"
+JOB_STATE_NEEDS_ATTENTION = "NEEDS_ATTENTION"
 JOB_STATE_REJECTED = "REJECTED"
 
 # Allowlisted Workload Types
@@ -53,7 +60,11 @@ ALLOWLISTED_WORKLOADS = {
     "system-info": "Gather system hardware and OS metrics",
     "health-check": "Run node health check script",
     "node-status": "Run node status check script",
+    "ping-check": "Run safe ICMP or network ping probe",
+    "http-check": "Run safe HTTP/HTTPS endpoint probe",
+    "dns-check": "Run DNS resolution and connectivity diagnostic",
     "python-script": "Execute safe inline python script or function",
+    "shell-script": "Execute approved structured shell script on compatible hosts",
     "echo": "Echo back test message",
     "failing-test": "Controlled error-handling test workload",
     "timeout-test": "Controlled timeout test workload",
@@ -289,20 +300,145 @@ class JobExecutor:
             sleep_duration = int(params.get("sleep", timeout_sec + 10))
             cmd = [sys.executable, "-c", "import time, sys; time.sleep(float(sys.argv[1]))", str(sleep_duration)]
 
+        elif job_type == "ping-check":
+            host = str(params.get("host") or params.get("target") or "127.0.0.1").strip()
+            # Security: Validate host characters to prevent flag injection or shell tricks
+            if not host or not re.match(r'^[a-zA-Z0-9.-]+$', host) or host.startswith("-"):
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_FAILED,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": f"Security validation failed: Invalid or unsafe ping target '{host}'.",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
+            count = min(10, max(1, int(params.get("count", 3))))
+            ping_timeout = min(15, max(1, int(params.get("ping_timeout", 3))))
+            if sys.platform == "win32":
+                cmd = ["ping", "-n", str(count), "-w", str(ping_timeout * 1000), host]
+            else:
+                cmd = ["ping", "-c", str(count), "-W", str(ping_timeout), host]
+
+        elif job_type == "http-check":
+            url = str(params.get("url") or "").strip()
+            if not url or not (url.startswith("http://") or url.startswith("https://")):
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_FAILED,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "Invalid or missing 'url' parameter (must begin with http:// or https://)",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
+            expected_status = int(params.get("expected_status", 200))
+            req_method = str(params.get("method", "GET")).upper()
+            http_timeout = min(60, max(1, int(params.get("http_timeout", timeout_sec))))
+            custom_headers = params.get("headers") or {}
+            cmd = [
+                sys.executable, "-c",
+                """
+import sys, time, json, urllib.request, urllib.error
+url, method, exp_status, tout, hdrs_json = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+hdrs = json.loads(hdrs_json) if hdrs_json else {}
+req = urllib.request.Request(url, headers=hdrs, method=method)
+t0 = time.time()
+try:
+    with urllib.request.urlopen(req, timeout=tout) as resp:
+        duration_ms = int((time.time() - t0) * 1000)
+        code = resp.getcode()
+        body = resp.read(2048).decode('utf-8', errors='replace')
+        print(f"HTTP {code} ({duration_ms}ms)")
+        print(body[:500])
+        sys.exit(0 if (code == exp_status or exp_status == 0) else 1)
+except urllib.error.HTTPError as e:
+    duration_ms = int((time.time() - t0) * 1000)
+    print(f"HTTP {e.code} ({duration_ms}ms)", file=sys.stderr)
+    sys.exit(0 if e.code == exp_status else 1)
+except Exception as e:
+    print(f"Connection error: {e}", file=sys.stderr)
+    sys.exit(2)
+""",
+                url, req_method, str(expected_status), str(http_timeout), json.dumps(custom_headers)
+            ]
+
+        elif job_type == "dns-check":
+            domain = str(params.get("domain") or params.get("host") or "").strip()
+            if not domain or not re.match(r'^[a-zA-Z0-9.-]+$', domain) or domain.startswith("-"):
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_FAILED,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": f"Invalid domain name for DNS resolution: '{domain}'.",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
+            cmd = [
+                sys.executable, "-c",
+                """
+import sys, socket, time
+domain = sys.argv[1]
+t0 = time.time()
+try:
+    name, aliases, addresses = socket.gethostbyname_ex(domain)
+    duration_ms = int((time.time() - t0) * 1000)
+    print(f"Resolved {domain} in {duration_ms}ms")
+    print(f"Canonical Name: {name}")
+    print(f"Addresses: {', '.join(addresses)}")
+    sys.exit(0)
+except Exception as e:
+    print(f"DNS Resolution failed for {domain}: {e}", file=sys.stderr)
+    sys.exit(1)
+""",
+                domain
+            ]
+
         elif job_type == "python-script":
-            code = params.get("code", "")
+            code = params.get("code") or params.get("script") or ""
+            args = params.get("args") or []
             if not code:
                 return {
                     "job_id": job_id,
                     "status": JOB_STATE_FAILED,
                     "exit_code": 1,
                     "stdout": "",
-                    "stderr": "Missing 'code' in parameters for python-script workload.",
+                    "stderr": "Missing 'code' or 'script' in parameters for python-script workload.",
                     "duration_ms": 0,
                     "started_at": started_iso,
                     "finished_at": started_iso
                 }
             cmd = [sys.executable, "-c", code]
+            if args:
+                cmd.append("--")
+                cmd.extend([str(a) for a in args])
+
+        elif job_type == "shell-script":
+            script = params.get("script") or params.get("command") or ""
+            args = params.get("args") or []
+            if not script:
+                return {
+                    "job_id": job_id,
+                    "status": JOB_STATE_FAILED,
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "Missing 'script' or 'command' parameter for shell-script workload.",
+                    "duration_ms": 0,
+                    "started_at": started_iso,
+                    "finished_at": started_iso
+                }
+            if sys.platform == "win32":
+                cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+                if args:
+                    cmd.extend([str(a) for a in args])
+            else:
+                cmd = ["bash", "-c", script, "script"]
+                if args:
+                    cmd.extend([str(a) for a in args])
 
         elif job_type == "image-build":
             try:

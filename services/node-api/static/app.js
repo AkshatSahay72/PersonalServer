@@ -233,20 +233,27 @@ function getFileIcon(filename, isDir) {
   return "📄";
 }
 
-function renderStatusPill(state) {
+function renderStatusPill(state, waitingReason = null) {
   const s = (state || "").toUpperCase();
+  const titleAttr = waitingReason ? ` title="${escapeHtml(waitingReason)}"` : "";
   if (s === "ONLINE" || s === "SUCCEEDED" || s === "RUNNING") {
-    return `<span class="node-status-badge status-online"><span class="status-dot"></span>${s}</span>`;
+    return `<span class="node-status-badge status-online"${titleAttr}><span class="status-dot"></span>${s}</span>`;
+  } else if (s === "NEEDS_ATTENTION") {
+    return `<span class="node-status-badge status-warning"${titleAttr}><span class="status-dot"></span>NEEDS ATTENTION</span>`;
+  } else if (s === "WAITING_FOR_DEPENDENCY" || s === "WAITING") {
+    return `<span class="node-status-badge status-waiting"${titleAttr}><span class="status-dot"></span>WAITING DEP</span>`;
   } else if (s === "DRAINING" || s === "DEBOARDING") {
-    return `<span class="node-status-badge status-draining"><span class="status-dot"></span>${s}</span>`;
-  } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING" || s === "DEPLOYING" || s === "REMOVING") {
-    return `<span class="node-status-badge status-draining"><span class="status-dot"></span>${s}</span>`;
+    return `<span class="node-status-badge status-draining"${titleAttr}><span class="status-dot"></span>${s}</span>`;
+  } else if (s === "QUEUED" || s === "CLAIMED" || s === "ASSIGNED" || s === "RECOVERING" || s === "RETRY_WAIT" || s === "DEPLOYING" || s === "REMOVING") {
+    return `<span class="node-status-badge status-draining"${titleAttr}><span class="status-dot"></span>${s}</span>`;
+  } else if (s === "CANCELLED") {
+    return `<span class="node-status-badge status-cancelled"${titleAttr}><span class="status-dot"></span>CANCELLED</span>`;
   } else if (s === "STOPPED" || s === "CREATED" || s === "REMOVED") {
-    return `<span class="cell-muted mono">${s}</span>`;
-  } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED" || s === "OFFLINE") {
-    return `<span class="node-status-badge status-offline"><span class="status-dot"></span>${s}</span>`;
+    return `<span class="cell-muted mono"${titleAttr}>${s}</span>`;
+  } else if (s === "FAILED" || s === "TIMEOUT" || s === "TIMED_OUT" || s === "REJECTED" || s === "OFFLINE") {
+    return `<span class="node-status-badge status-offline"${titleAttr}><span class="status-dot"></span>${s}</span>`;
   }
-  return `<span class="cell-muted mono">${s || "UNKNOWN"}</span>`;
+  return `<span class="cell-muted mono"${titleAttr}>${s || "UNKNOWN"}</span>`;
 }
 
 function updateLastRefreshed() {
@@ -1880,14 +1887,18 @@ async function loadJobs() {
       const createdStr = j.created_at || j.submitted_at ? formatDateIST(j.created_at || j.submitted_at) : "-";
       const attemptStr = `${j.attempt || 1}/${j.max_attempts || 3}`;
       const st = (j.status || j.state || "").toUpperCase();
-      const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING");
+      const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING" || st === "ASSIGNED" || st === "RETRY_WAIT" || st === "WAITING_FOR_DEPENDENCY" || st === "NEEDS_ATTENTION");
+      const waitingNotice = j.waiting_reason ? `<div style="font-size: 10px; color: #d29922; margin-top: 2px;" title="${escapeHtml(j.waiting_reason)}">⏳ ${escapeHtml(j.waiting_reason.slice(0, 32))}${j.waiting_reason.length > 32 ? "..." : ""}</div>` : "";
 
       return `
         <tr>
           <td class="mono"><strong>${escapeHtml(jobId)}</strong></td>
           <td><span class="mono" style="font-size: 11px; padding: 2px 6px; background: var(--bg-hover); border-radius: 4px; border: 1px solid var(--border-color);">${escapeHtml(j.type || "-")}</span></td>
           <td class="mono cell-muted">${escapeHtml(target)}</td>
-          <td>${renderStatusPill(st)}</td>
+          <td>
+            ${renderStatusPill(st, j.waiting_reason || (j.scheduler && j.scheduler.reason))}
+            ${waitingNotice}
+          </td>
           <td class="mono cell-muted">${attemptStr}</td>
           <td class="mono cell-muted">${duration}</td>
           <td class="mono cell-muted" style="white-space: nowrap;">${createdStr}</td>
@@ -2071,7 +2082,7 @@ window.viewJobById = function(jobId) {
     const st = (j.status || j.state || "").toUpperCase();
     if (statusPill) statusPill.innerHTML = renderStatusPill(st);
 
-    const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING");
+    const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING" || st === "ASSIGNED" || st === "RETRY_WAIT" || st === "WAITING_FOR_DEPENDENCY" || st === "NEEDS_ATTENTION");
     if (cancelBtn) {
       cancelBtn.style.display = isCancellable ? "inline-block" : "none";
     }
@@ -2088,19 +2099,25 @@ window.viewJobById = function(jobId) {
     const finishedStr = j.finished_at || j.cancelled_at ? formatDateIST(j.finished_at || j.cancelled_at) : "-";
     const retryReason = j.retry_reason || (j.diagnostics && j.diagnostics.failure_reason) || "None";
     const cancelReason = j.cancel_reason || "None";
+    const schedMode = sched.mode || (j.pinned ? "explicit-pinned" : "default");
+    const schedReason = sched.reason || (j.waiting_reason ? `Waiting: ${j.waiting_reason}` : "Standard placement");
 
     if (sumGrid) {
       sumGrid.innerHTML = `
-        <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(st)}</span></div>
+        <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(st, j.waiting_reason)}</span></div>
         <div class="detail-item"><span class="detail-label">Workload</span><span class="detail-value">${escapeHtml(j.type || "-")}</span></div>
         <div class="detail-item"><span class="detail-label">Target Node</span><span class="detail-value mono">${escapeHtml(targetNode)}</span></div>
         <div class="detail-item"><span class="detail-label">Assigned Worker</span><span class="detail-value mono">${escapeHtml(assignedNode)}</span></div>
+        <div class="detail-item"><span class="detail-label">Priority</span><span class="detail-value mono">${escapeHtml(j.priority || "normal")}</span></div>
         <div class="detail-item"><span class="detail-label">Attempt</span><span class="detail-value mono">${j.attempt || 1}/${j.max_attempts || 3}</span></div>
         <div class="detail-item"><span class="detail-label">Duration</span><span class="detail-value mono">${durationStr}</span></div>
         <div class="detail-item"><span class="detail-label">Exit Code</span><span class="detail-value mono">${res.exit_code !== undefined ? res.exit_code : '-'}</span></div>
+        <div class="detail-item" style="grid-column: span 2;"><span class="detail-label">Scheduler Rationale</span><span class="detail-value" style="font-size: 11px;">${escapeHtml(schedReason)}</span></div>
         <div class="detail-item"><span class="detail-label">Submitted At</span><span class="detail-value mono">${escapeHtml(submittedStr)}</span></div>
         <div class="detail-item"><span class="detail-label">Finished At</span><span class="detail-value mono">${escapeHtml(finishedStr)}</span></div>
-        <div class="detail-item"><span class="detail-label">Retry Reason</span><span class="detail-value">${escapeHtml(retryReason)}</span></div>
+        ${j.waiting_reason ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">Waiting Reason</span><span class="detail-value text-draining">⏳ ${escapeHtml(j.waiting_reason)}</span></div>` : ""}
+        ${j.workflow_id ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">DAG Workflow</span><span class="detail-value mono">Workflow: ${escapeHtml(j.workflow_id)} | Step: ${escapeHtml(j.workflow_step_id || "-")}</span></div>` : ""}
+        ${retryReason !== "None" ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">Retry History</span><span class="detail-value text-offline">${escapeHtml(retryReason)}</span></div>` : ""}
         ${j.cancel_reason ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">Cancel Reason</span><span class="detail-value text-offline">${escapeHtml(cancelReason)}</span></div>` : ""}
       `;
     }
@@ -2136,12 +2153,47 @@ window.closeJobDetail = function() {
   activeDetailJobId = null;
 };
 
+window.applyJobTemplate = function(val) {
+  const typeSelect = document.getElementById("job-type");
+  const paramsInput = document.getElementById("job-params");
+  const timeoutInput = document.getElementById("job-timeout");
+  if (!val || !typeSelect || !paramsInput) return;
+
+  if (val === "ping") {
+    typeSelect.value = "ping-check";
+    paramsInput.value = JSON.stringify({ host: "8.8.8.8", count: 4 });
+    if (timeoutInput) timeoutInput.value = "15";
+  } else if (val === "http") {
+    typeSelect.value = "http-check";
+    paramsInput.value = JSON.stringify({ url: "https://httpbin.org/status/200", expected_status: 200, timeout: 5 });
+    if (timeoutInput) timeoutInput.value = "20";
+  } else if (val === "dns") {
+    typeSelect.value = "dns-check";
+    paramsInput.value = JSON.stringify({ host: "google.com" });
+    if (timeoutInput) timeoutInput.value = "15";
+  } else if (val === "python") {
+    typeSelect.value = "python-script";
+    paramsInput.value = JSON.stringify({ script: "import sys, platform\nprint(f'PersonalServer node: {platform.node()} (Python {sys.version})')" });
+    if (timeoutInput) timeoutInput.value = "30";
+  } else if (val === "shell") {
+    typeSelect.value = "shell-script";
+    paramsInput.value = JSON.stringify({ script: "echo PersonalServer Cluster Node Health OK" });
+    if (timeoutInput) timeoutInput.value = "30";
+  } else if (val === "sysinfo") {
+    typeSelect.value = "system-info";
+    paramsInput.value = "{}";
+    if (timeoutInput) timeoutInput.value = "30";
+  }
+};
+
 // Dispatch job
 document.getElementById("job-submit-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const type = document.getElementById("job-type").value;
   const target = document.getElementById("job-target").value;
   const timeout = parseInt(document.getElementById("job-timeout").value, 10) || 60;
+  const pinned = document.getElementById("job-pinned")?.checked || false;
+  const priority = document.getElementById("job-priority")?.value || "normal";
   const paramsRaw = document.getElementById("job-params").value.trim();
 
   let params = {};
@@ -2162,7 +2214,14 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
     await apiFetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type, target, timeout, parameters: params })
+      body: JSON.stringify({
+        type,
+        target,
+        timeout,
+        parameters: params,
+        pinned: Boolean(pinned),
+        priority
+      })
     });
     toggleSubmitJobCard(false);
     jobCurrentPage = 1;

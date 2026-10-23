@@ -331,13 +331,29 @@
           <form id="job-submit-form" class="job-form">
             <div class="form-grid">
               <div class="form-cell">
-                <label for="job-type">Workload</label>
+                <label for="job-template-select">Workload Template</label>
+                <select id="job-template-select" class="form-input" onchange="applyJobTemplate(this.value)">
+                  <option value="">-- Choose Template --</option>
+                  <option value="ping">Ping Check (8.8.8.8)</option>
+                  <option value="http">HTTP Health Check</option>
+                  <option value="dns">DNS Resolution</option>
+                  <option value="python">Python Script Execution</option>
+                  <option value="shell">Shell Script Execution</option>
+                  <option value="sysinfo">System Info</option>
+                </select>
+              </div>
+              <div class="form-cell">
+                <label for="job-type">Workload Type</label>
                 <select id="job-type" class="form-input" required>
+                  <option value="ping-check">ping-check (ICMP)</option>
+                  <option value="http-check">http-check (HTTP/S)</option>
+                  <option value="dns-check">dns-check (DNS)</option>
+                  <option value="python-script">python-script</option>
+                  <option value="shell-script">shell-script</option>
                   <option value="system-info">system-info</option>
                   <option value="health-check">health-check</option>
                   <option value="node-status">node-status</option>
                   <option value="echo">echo</option>
-                  <option value="python-script">python-script</option>
                   <option value="failing-test">failing-test</option>
                   <option value="timeout-test">timeout-test</option>
                 </select>
@@ -345,19 +361,30 @@
               <div class="form-cell">
                 <label for="job-target">Target Node</label>
                 <select id="job-target" class="form-input mono">
-                  <option value="auto">Auto (Scheduler)</option>
+                  <option value="auto">Auto (Resource Scheduler)</option>
+                </select>
+              </div>
+              <div class="form-cell">
+                <label for="job-priority">Priority</label>
+                <select id="job-priority" class="form-input">
+                  <option value="normal" selected>Normal</option>
+                  <option value="high">High</option>
+                  <option value="low">Low</option>
                 </select>
               </div>
               <div class="form-cell">
                 <label for="job-timeout">Timeout (s)</label>
                 <input type="number" id="job-timeout" class="form-input mono" value="60" min="5" max="300">
               </div>
-              <div class="form-cell">
+              <div class="form-cell" style="grid-column: span 2;">
                 <label for="job-params">Parameters (JSON)</label>
-                <input type="text" id="job-params" class="form-input mono" placeholder='{"message": "ping"}'>
+                <input type="text" id="job-params" class="form-input mono" placeholder='{"host": "8.8.8.8", "count": 4}'>
               </div>
-              <div class="form-cell form-btn-cell">
-                <button type="submit" class="btn btn-primary">Dispatch Job</button>
+              <div class="form-cell form-btn-cell" style="display: flex; align-items: flex-end; gap: 8px;">
+                <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 8px; cursor: pointer;">
+                  <input type="checkbox" id="job-pinned" style="cursor: pointer;"> Pin to Node
+                </label>
+                <button type="submit" class="btn btn-primary" style="margin-bottom: 4px;">Dispatch Job</button>
               </div>
             </div>
           </form>
@@ -378,22 +405,31 @@
             <select id="jobs-filter-status" class="form-input form-input-sm jobs-filter-select">
               <option value="all">All Statuses</option>
               <option value="QUEUED">Queued</option>
+              <option value="WAITING_FOR_DEPENDENCY">Waiting Dep</option>
+              <option value="ASSIGNED">Assigned</option>
               <option value="CLAIMED">Claimed</option>
               <option value="RUNNING">Running</option>
               <option value="RECOVERING">Recovering</option>
+              <option value="RETRY_WAIT">Retry Wait</option>
+              <option value="NEEDS_ATTENTION">Needs Attention</option>
               <option value="SUCCEEDED">Succeeded</option>
               <option value="FAILED">Failed</option>
               <option value="CANCELLED">Cancelled</option>
               <option value="TIMEOUT">Timeout</option>
+              <option value="TIMED_OUT">Timed Out</option>
               <option value="REJECTED">Rejected</option>
             </select>
             <select id="jobs-filter-type" class="form-input form-input-sm jobs-filter-select">
               <option value="all">All Workloads</option>
+              <option value="ping-check">ping-check</option>
+              <option value="http-check">http-check</option>
+              <option value="dns-check">dns-check</option>
+              <option value="python-script">python-script</option>
+              <option value="shell-script">shell-script</option>
               <option value="system-info">system-info</option>
               <option value="health-check">health-check</option>
               <option value="node-status">node-status</option>
               <option value="echo">echo</option>
-              <option value="python-script">python-script</option>
               <option value="failing-test">failing-test</option>
               <option value="timeout-test">timeout-test</option>
               <option value="docker-deploy">docker-deploy</option>

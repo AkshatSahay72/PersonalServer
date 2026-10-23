@@ -16,6 +16,8 @@ from controller.stores.nodes_store import load_nodes_db, save_nodes_db
 from controller.stores.jobs_store import load_jobs_db, save_jobs_db
 from controller.stores.apps_store import load_apps_db, save_apps_db
 from controller.stores.onboarding_store import load_onboarding_codes_db, save_onboarding_codes_db
+from controller.stores.workflows_store import load_workflows_db, save_workflows_db
+from controller.stores.artifacts_store import load_artifacts_db, save_artifacts_db
 from controller.stores.shares_store import (
     load_shares_db,
     save_shares_db,
@@ -36,6 +38,10 @@ __all__ = [
     "save_nodes_db",
     "load_jobs_db",
     "save_jobs_db",
+    "load_workflows_db",
+    "save_workflows_db",
+    "load_artifacts_db",
+    "save_artifacts_db",
     "load_apps_db",
     "save_apps_db",
     "load_onboarding_codes_db",
