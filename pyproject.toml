@@ -25,9 +25,10 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = [
+    "diagnostics",
     "scratch",
     "runtime",
-    "storage",
+    "./storage",
     "install",
     "data",
     "controller/data",
@@ -46,6 +47,7 @@ addopts = "-ra --strict-markers"
 target-version = "py39"
 line-length = 120
 exclude = [
+    "diagnostics",
     "scratch",
     "runtime",
     "storage",

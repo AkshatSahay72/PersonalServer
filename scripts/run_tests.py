@@ -23,43 +23,51 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Unit test suites: Pure Python, in-memory, no sockets, no background threads
 UNIT_TEST_FILES = [
-    "tests/test_common_utils.py",
-    "tests/test_persistence_stores.py",
-    "tests/test_platform_config.py",
-    "tests/test_portable_config.py",
-    "tests/test_reproducibility.py",
-    "tests/test_security_audit.py",
-    "tests/test_logging_diagnostics.py",
-    "tests/test_node_telemetry.py",
-    "tests/test_cross_platform_reliability.py",
-    "tests/test_notifications.py",
-    "tests/test_job_deletion.py",
+    "tests/unit/test_common_utils.py",
+    "tests/unit/test_persistence_stores.py",
+    "tests/unit/test_platform_config.py",
+    "tests/unit/test_portable_config.py",
+    "tests/unit/test_reproducibility.py",
+    "tests/unit/test_logging_diagnostics.py",
+    "tests/unit/test_node_telemetry_metrics.py",
+    "tests/unit/test_cross_platform_reliability.py",
 ]
 
 # Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing, HA
 INTEGRATION_TEST_FILES = [
-    "tests/test_reliable_job_lifecycle.py",
-    "tests/test_multi_node_simulation.py",
-    "tests/test_image_build_deploy.py",
-    "tests/test_local_worker.py",
-    "tests/test_ha_failover.py",
-    "tests/test_ha_global_header.py",
-    "tests/test_ha_leader_identity_audit.py",
-    "tests/test_jobs_cancellation_and_pagination.py",
-    "tests/test_nodes_diagnostics_and_failover.py",
-    "tests/test_shell_layout_stability.py",
-    "tests/test_dashboard_js_syntax.py",
-    "tests/test_phase15a_image_deployment.py",
-    "tests/test_phase14c_deboarding.py",
-    "tests/test_phase14b_telemetry.py",
-    "tests/test_phase12c_public_routing.py",
-    "tests/test_phase11b_docker.py",
-    "tests/test_phase11c_storage_modals_and_app_files.py",
-    "tests/test_phase11d_docker_runtime.py",
-    "tests/test_phase12_application_routing.py",
-    "tests/test_phase13_source_deployment.py",
-    "tests/test_storage_explorer_ui.py",
-    "tests/test_storage_sharing.py",
+    # Controller domain
+    "tests/controller/test_job_lifecycle.py",
+    "tests/controller/test_job_cancellation_pagination.py",
+    "tests/controller/test_job_deletion.py",
+    "tests/controller/test_node_deboarding.py",
+    "tests/controller/test_node_diagnostics.py",
+    "tests/controller/test_node_telemetry.py",
+    "tests/controller/test_local_worker.py",
+    "tests/controller/test_multi_node_simulation.py",
+    "tests/controller/test_notifications.py",
+    # Storage domain
+    "tests/storage/test_storage_explorer_api.py",
+    "tests/storage/test_storage_folder_features.py",
+    "tests/storage/test_storage_sharing.py",
+    "tests/storage/test_app_storage_and_modals.py",
+    # Routing domain
+    "tests/routing/test_app_routing.py",
+    "tests/routing/test_public_ingress_routing.py",
+    # Deployment domain
+    "tests/deployment/test_docker_capabilities.py",
+    "tests/deployment/test_docker_runtime.py",
+    "tests/deployment/test_image_build.py",
+    "tests/deployment/test_image_deployment.py",
+    "tests/deployment/test_source_deployment.py",
+    # Security domain
+    "tests/security/test_security_audit.py",
+    # High Availability domain
+    "tests/ha/test_ha_failover.py",
+    "tests/ha/test_ha_global_header.py",
+    "tests/ha/test_ha_leader_identity_audit.py",
+    # Web UI domain
+    "tests/ui/test_dashboard_js_syntax.py",
+    "tests/ui/test_shell_layout_stability.py",
 ]
 
 
@@ -115,7 +123,7 @@ def run_lint_checks() -> int:
     errors = 0
     checked = 0
     for root, dirs, files in os.walk(str(BASE_DIR)):
-        dirs[:] = [d for d in dirs if d not in {".git", ".venv", "backups", "scratch", "storage", "__pycache__"}]
+        dirs[:] = [d for d in dirs if d not in {".git", ".venv", "backups", "diagnostics", "scratch", "storage", "__pycache__"}]
         for f in files:
             if f.endswith(".py"):
                 checked += 1
@@ -140,7 +148,14 @@ def main():
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--unit", action="store_true", help="Run fast unit tests (in-memory, no sockets)")
-    group.add_argument("--integration", action="store_true", help="Run integration tests (simulated workers, lifecycle, routing)")
+    group.add_argument("--integration", action="store_true", help="Run all integration tests across domains")
+    group.add_argument("--controller", action="store_true", help="Run controller domain tests (jobs, nodes, notifications)")
+    group.add_argument("--storage", action="store_true", help="Run storage domain tests (explorer, sharing, folders)")
+    group.add_argument("--routing", action="store_true", help="Run routing domain tests (app router, public ingress)")
+    group.add_argument("--deployment", action="store_true", help="Run deployment domain tests (docker, image, git source)")
+    group.add_argument("--security", action="store_true", help="Run security audit tests")
+    group.add_argument("--ha", action="store_true", help="Run high availability & leader election tests")
+    group.add_argument("--ui", action="store_true", help="Run web UI layout & JS syntax tests")
     group.add_argument("--all", action="store_true", help="Run all test suites")
     group.add_argument("--lint", action="store_true", help="Run formatting and static syntax checks")
 
@@ -159,6 +174,27 @@ def main():
     elif args.integration:
         selected_files = INTEGRATION_TEST_FILES
         category_name = "Integration Tests"
+    elif args.controller:
+        selected_files = [f for f in INTEGRATION_TEST_FILES if f.startswith("tests/controller/")]
+        category_name = "Controller Domain Tests"
+    elif args.storage:
+        selected_files = [f for f in INTEGRATION_TEST_FILES if f.startswith("tests/storage/")]
+        category_name = "Storage Domain Tests"
+    elif args.routing:
+        selected_files = [f for f in INTEGRATION_TEST_FILES if f.startswith("tests/routing/")]
+        category_name = "Routing Domain Tests"
+    elif args.deployment:
+        selected_files = [f for f in INTEGRATION_TEST_FILES if f.startswith("tests/deployment/")]
+        category_name = "Deployment Domain Tests"
+    elif args.security:
+        selected_files = [f for f in INTEGRATION_TEST_FILES if f.startswith("tests/security/")]
+        category_name = "Security Domain Tests"
+    elif args.ha:
+        selected_files = [f for f in INTEGRATION_TEST_FILES if f.startswith("tests/ha/")]
+        category_name = "High Availability Domain Tests"
+    elif args.ui:
+        selected_files = [f for f in INTEGRATION_TEST_FILES if f.startswith("tests/ui/")]
+        category_name = "UI Domain Tests"
     else:
         selected_files = UNIT_TEST_FILES + INTEGRATION_TEST_FILES
         category_name = "All Tests (Unit + Integration)"
