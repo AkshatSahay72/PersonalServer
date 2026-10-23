@@ -21,6 +21,8 @@ import threading
 import time
 import socket
 import secrets
+import zipfile
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime, timezone
@@ -34,7 +36,11 @@ sys.path.insert(0, str(BASE_DIR))
 import mimetypes
 from common.time_utils import get_current_iso_timestamp
 from common.crypto_utils import constant_time_compare
-from common.storage_utils import resolve_safe_path
+from common.storage_utils import (
+    resolve_safe_path,
+    sanitize_relative_path,
+    get_unique_conflict_path,
+)
 from config.platform_config import get_platform_config
 from controller.stores.shares_store import (
     load_shares_db,
@@ -785,19 +791,23 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         if auth_hdr:
             headers["Authorization"] = auth_hdr if auth_hdr.startswith("Bearer ") else f"Bearer {auth_hdr}"
 
+        timeout_sec = 60 if subpath in ("/storage/download", "/storage/upload") else 20
         req = urllib.request.Request(target_url, data=body_bytes, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=15) as response:
-                resp_data = response.read()
+            with urllib.request.urlopen(req, timeout=timeout_sec) as response:
                 self.send_response(response.status)
-                for hdr in ("Content-Type", "Content-Disposition"):
-                    if response.headers.get(hdr):
-                        self.send_header(hdr, response.headers.get(hdr))
-                self.send_header("Content-Length", str(len(resp_data)))
+                for hdr in ("Content-Type", "Content-Disposition", "Content-Length"):
+                    hdr_val = response.headers.get(hdr)
+                    if hdr_val:
+                        self.send_header(hdr, hdr_val)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 try:
-                    self.wfile.write(resp_data)
+                    while True:
+                        chunk = response.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
                     self.close_connection = True
         except urllib.error.HTTPError as e:
@@ -1377,17 +1387,107 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(403, {"error": str(e)})
                 return
 
-            if not target_file.exists() or not target_file.is_file():
-                self.send_json(404, {"error": "File not found"})
+            if not target_file.exists():
+                self.send_json(404, {"error": "File or folder not found"})
                 return
 
+            # Directory ZIP archive download
+            if target_file.is_dir():
+                folder_name = target_file.name if target_file != STORAGE_ROOT else "storage_archive"
+                if not folder_name:
+                    folder_name = "storage_archive"
+                zip_filename = f"{folder_name}.zip"
+
+                tmp_zip = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+                tmp_zip_path = Path(tmp_zip.name)
+                tmp_zip.close()
+
+                try:
+                    with zipfile.ZipFile(tmp_zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                        for root_dir, dirs, files in os.walk(target_file, followlinks=False):
+                            root_path = Path(root_dir)
+                            # Safe symlink handling for directories: prevent symlink escapes
+                            safe_dirs = []
+                            for d in dirs:
+                                d_path = root_path / d
+                                if d_path.is_symlink():
+                                    try:
+                                        resolved = d_path.resolve()
+                                        resolved.relative_to(target_file)
+                                        safe_dirs.append(d)
+                                    except Exception:
+                                        continue
+                                else:
+                                    safe_dirs.append(d)
+                            dirs[:] = safe_dirs
+
+                            # Preserve empty directories
+                            if not dirs and not files and root_path != target_file:
+                                rel_dir = os.path.relpath(root_path, target_file).replace("\\", "/")
+                                if rel_dir != "." and not rel_dir.startswith("/") and ".." not in rel_dir.split("/"):
+                                    zinfo = zipfile.ZipInfo(f"{rel_dir}/")
+                                    zinfo.external_attr = 0o755 << 16
+                                    zf.writestr(zinfo, b"")
+
+                            for f in files:
+                                f_path = root_path / f
+                                if f_path.is_symlink():
+                                    try:
+                                        resolved = f_path.resolve()
+                                        resolved.relative_to(target_file)
+                                    except Exception:
+                                        continue
+                                rel_file = os.path.relpath(f_path, target_file).replace("\\", "/")
+                                if rel_file.startswith("/") or rel_file.startswith("\\") or ".." in rel_file.split("/"):
+                                    continue
+                                try:
+                                    zf.write(f_path, arcname=rel_file)
+                                except (OSError, IOError, PermissionError) as e:
+                                    self.send_json(500, {"error": f"Failed to read file '{f}' for archive: {e}"})
+                                    return
+
+                    zip_size = tmp_zip_path.stat().st_size
+                    ascii_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', zip_filename)
+                    utf8_filename = urllib.parse.quote(zip_filename, safe="")
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(zip_size))
+                    self.send_header("Content-Disposition", f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_filename}')
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+
+                    with open(tmp_zip_path, "rb") as zf_in:
+                        while True:
+                            chunk = zf_in.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout):
+                    self.close_connection = True
+                    return
+                except Exception as e:
+                    self.send_json(500, {"error": f"Failed to generate ZIP archive: {e}"})
+                    return
+                finally:
+                    if tmp_zip_path.exists():
+                        try:
+                            tmp_zip_path.unlink()
+                        except Exception:
+                            pass
+                return
+
+            # Single file download
             file_size = target_file.stat().st_size
             filename = target_file.name
+            ascii_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
+            utf8_filename = urllib.parse.quote(filename, safe="")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(file_size))
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_filename}')
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
             # Stream file in 64KB chunks
@@ -1727,10 +1827,16 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 return
 
             folder_name = body.get("name", "").strip()
-            # Validate folder name
-            if re.search(r'[\\/:\*\?"<>\|\x00]', folder_name) or ".." in folder_name:
+            allow_subpaths = bool(body.get("parents") or body.get("recursive") or "/" in folder_name or "\\" in folder_name)
+            if not allow_subpaths and (re.search(r'[\\/:\*\?"<>\|\x00]', folder_name) or ".." in folder_name):
                 self.send_json(400, {"error": "Invalid directory name"})
                 return
+            if allow_subpaths:
+                try:
+                    folder_name = sanitize_relative_path(folder_name)
+                except ValueError as e:
+                    self.send_json(400, {"error": f"Invalid directory path: {e}"})
+                    return
 
             parent_rel = query.get("path", [""])[0] or body.get("path", "")
             try:
@@ -1787,8 +1893,34 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Upload target directory does not exist"})
                 return
 
+            # Conflict policy: 'fail' (default), 'overwrite', 'skip', 'rename'
+            conflict = query.get("conflict", ["fail"])[0].lower()
+            if query.get("overwrite", ["false"])[0].lower() in ("true", "1"):
+                conflict = "overwrite"
+
+            # Case: Empty directory creation via upload
+            is_dir_upload = query.get("is_dir", ["false"])[0].lower() in ("true", "1")
+            if is_dir_upload:
+                dir_rel = query.get("relative_path", [""])[0] or query.get("filepath", [""])[0]
+                if not dir_rel:
+                    self.send_json(400, {"error": "Missing directory path for is_dir upload"})
+                    return
+                try:
+                    clean_rel = sanitize_relative_path(dir_rel)
+                    created_dir = (target_dir / clean_rel).resolve()
+                    created_dir.relative_to(STORAGE_ROOT)
+                    created_dir.relative_to(target_dir)
+                    created_dir.mkdir(parents=True, exist_ok=True)
+                    self.send_json(200, {
+                        "status": "created",
+                        "path": str(created_dir.relative_to(STORAGE_ROOT)).replace("\\", "/")
+                    })
+                except Exception as e:
+                    self.send_json(400, {"error": str(e)})
+                return
+
             content_type = self.headers.get("Content-Type", "")
-            
+
             # Case A: Multipart form upload
             if "multipart/form-data" in content_type:
                 boundary = ""
@@ -1800,10 +1932,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 if not boundary:
                     self.send_json(400, {"error": "Missing boundary in multipart form data"})
                     return
-                
+
                 raw_data = self.rfile.read(content_len)
                 boundary_bytes = boundary.encode("utf-8")
-                
+
                 parts = raw_data.split(b"--" + boundary_bytes)
                 saved_files = []
 
@@ -1814,18 +1946,63 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                             file_data = file_data[:-2]
                         elif file_data.endswith(b"\n"):
                             file_data = file_data[:-1]
-                        
+
                         match = re.search(rb'filename="?([^";\r\n]+)"?', header_part)
                         if match:
                             raw_filename = match.group(1).decode("utf-8", errors="ignore").strip()
-                            safe_name = os.path.basename(raw_filename)
-                            # Neutralize directory traversal and invalid path characters
-                            safe_name = re.sub(r'[\\/:\*\?"<>\|\x00]', '_', safe_name).strip()
-                            if not safe_name or safe_name in (".", ".."):
-                                safe_name = "uploaded_file"
 
-                            dest_path = target_dir / safe_name
-                            tmp_path = target_dir / f".tmp_{safe_name}_{secrets.token_hex(4)}"
+                            # Check for relative_path in query or multipart filename
+                            rel_candidate = query.get("relative_path", [""])[0] or query.get("filepath", [""])[0]
+                            if not rel_candidate and ("/" in raw_filename or "\\" in raw_filename):
+                                rel_candidate = raw_filename
+
+                            if rel_candidate:
+                                try:
+                                    clean_rel = sanitize_relative_path(rel_candidate)
+                                except ValueError as e:
+                                    self.send_json(400, {"error": f"Invalid relative path: {e}"})
+                                    return
+                                dest_path = (target_dir / clean_rel).resolve()
+                            else:
+                                safe_name = os.path.basename(raw_filename)
+                                safe_name = re.sub(r'[\\/:\*\?"<>\|\x00-\x1f]', '_', safe_name).strip()
+                                if not safe_name or safe_name in (".", ".."):
+                                    safe_name = "uploaded_file"
+                                dest_path = (target_dir / safe_name).resolve()
+
+                            # Security: Strict containment check
+                            try:
+                                dest_path.relative_to(STORAGE_ROOT)
+                                dest_path.relative_to(target_dir)
+                            except Exception:
+                                self.send_json(403, {"error": "Access Denied: Path escapes upload root"})
+                                return
+
+                            # Conflict resolution
+                            if dest_path.exists():
+                                rel_display = str(dest_path.relative_to(target_dir)).replace("\\", "/")
+                                if conflict == "fail":
+                                    self.send_json(409, {
+                                        "error": f"File already exists: {rel_display}",
+                                        "code": "CONFLICT",
+                                        "file": rel_display
+                                    })
+                                    return
+                                elif conflict == "skip":
+                                    saved_files.append({
+                                        "name": dest_path.name,
+                                        "file": rel_display,
+                                        "status": "skipped",
+                                        "reason": "already_exists"
+                                    })
+                                    continue
+                                elif conflict == "rename":
+                                    dest_path = get_unique_conflict_path(dest_path)
+
+                            dest_parent = dest_path.parent
+                            dest_parent.mkdir(parents=True, exist_ok=True)
+                            tmp_path = dest_parent / f".tmp_{dest_path.name}_{secrets.token_hex(4)}"
+
                             try:
                                 with open(tmp_path, "wb") as f:
                                     f.write(file_data)
@@ -1838,7 +2015,14 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                                         pass
                                 raise
 
-                            saved_files.append(safe_name)
+                            rel_display = str(dest_path.relative_to(target_dir)).replace("\\", "/")
+                            saved_files.append({
+                                "name": dest_path.name,
+                                "file": rel_display,
+                                "path": str(dest_path.relative_to(STORAGE_ROOT)).replace("\\", "/"),
+                                "status": "uploaded",
+                                "size_bytes": len(file_data)
+                            })
 
                 if not saved_files:
                     self.send_json(400, {"error": "No valid file data found in upload request"})
@@ -1846,18 +2030,59 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
                 self.send_json(200, {
                     "status": "uploaded",
-                    "files": saved_files,
+                    "files": [f["name"] for f in saved_files],
+                    "items": saved_files,
                     "target_dir": str(target_dir.relative_to(STORAGE_ROOT)).replace("\\", "/")
                 })
                 return
 
             # Case B: Raw body upload
             else:
-                filename = query.get("filename", ["upload.dat"])[0]
-                safe_name = os.path.basename(filename)
-                safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
-                dest_path = target_dir / safe_name
-                tmp_path = target_dir / f".tmp_{safe_name}_{secrets.token_hex(4)}"
+                rel_candidate = query.get("relative_path", [""])[0] or query.get("filepath", [""])[0]
+                if rel_candidate:
+                    try:
+                        clean_rel = sanitize_relative_path(rel_candidate)
+                    except ValueError as e:
+                        self.send_json(400, {"error": f"Invalid relative path: {e}"})
+                        return
+                    dest_path = (target_dir / clean_rel).resolve()
+                else:
+                    filename = query.get("filename", ["upload.dat"])[0]
+                    safe_name = os.path.basename(filename)
+                    safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
+                    dest_path = (target_dir / safe_name).resolve()
+
+                # Security: Strict containment check
+                try:
+                    dest_path.relative_to(STORAGE_ROOT)
+                    dest_path.relative_to(target_dir)
+                except Exception:
+                    self.send_json(403, {"error": "Access Denied: Path escapes upload root"})
+                    return
+
+                # Conflict resolution
+                if dest_path.exists():
+                    rel_display = str(dest_path.relative_to(target_dir)).replace("\\", "/")
+                    if conflict == "fail":
+                        self.send_json(409, {
+                            "error": f"File already exists: {rel_display}",
+                            "code": "CONFLICT",
+                            "file": rel_display
+                        })
+                        return
+                    elif conflict == "skip":
+                        self.send_json(200, {
+                            "status": "skipped",
+                            "file": rel_display,
+                            "reason": "already_exists"
+                        })
+                        return
+                    elif conflict == "rename":
+                        dest_path = get_unique_conflict_path(dest_path)
+
+                dest_parent = dest_path.parent
+                dest_parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = dest_parent / f".tmp_{dest_path.name}_{secrets.token_hex(4)}"
 
                 try:
                     with open(tmp_path, "wb") as f:
@@ -1895,9 +2120,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                             pass
                     raise
 
+                rel_display = str(dest_path.relative_to(target_dir)).replace("\\", "/")
                 self.send_json(200, {
                     "status": "uploaded",
-                    "file": safe_name,
+                    "file": rel_display,
+                    "name": dest_path.name,
+                    "path": str(dest_path.relative_to(STORAGE_ROOT)).replace("\\", "/"),
                     "bytes": content_len
                 })
                 return

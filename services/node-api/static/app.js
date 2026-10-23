@@ -2361,17 +2361,40 @@ async function loadStorage(path = "", node = selectedStorageNode, pushHistory = 
   const actionsContainer = document.getElementById("storage-actions-container");
   if (actionsContainer) {
     if (isOnline) {
+      const currentFolderName = path ? (path.split("/").pop() || "Folder") : "";
       actionsContainer.innerHTML = `
         <input type="file" id="file-upload-input" style="display:none" multiple>
+        <input type="file" id="folder-upload-input" style="display:none" webkitdirectory directory multiple>
         <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
+        <button id="upload-folder-btn" class="btn btn-sm">Upload Folder</button>
+        ${path ? `<button id="download-current-zip-btn" class="btn btn-sm" onclick="downloadFolderZip(event, '${escapeHtml(path)}', '${escapeHtml(node)}', '${escapeHtml(currentFolderName)}')" title="Download current folder as ZIP">Download ZIP</button>` : ''}
         <button id="create-folder-btn" class="btn btn-sm">New Folder</button>
       `;
       document.getElementById("upload-file-btn")?.addEventListener("click", () => {
         document.getElementById("file-upload-input")?.click();
       });
+      document.getElementById("upload-folder-btn")?.addEventListener("click", () => {
+        const folderInput = document.getElementById("folder-upload-input");
+        if (folderInput) {
+          if (!("webkitdirectory" in folderInput)) {
+            showCustomAlert({
+              title: "Browser Compatibility",
+              message: "Your browser does not support native folder selection. You can select multiple files or drag and drop a folder into the explorer.",
+              isError: false
+            });
+          }
+          folderInput.click();
+        }
+      });
       document.getElementById("file-upload-input")?.addEventListener("change", (e) => {
         if (e.target.files && e.target.files.length > 0) {
           uploadFiles(e.target.files);
+          e.target.value = "";
+        }
+      });
+      document.getElementById("folder-upload-input")?.addEventListener("change", (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          handleFolderUpload(e.target.files);
           e.target.value = "";
         }
       });
@@ -2518,6 +2541,7 @@ function renderStorageTable() {
           <div class="explorer-row-actions">
             ${!isDir ? `<button class="btn btn-sm btn-primary storage-btn-preview" data-action="preview" data-path="${encodeURIComponent(itemRelPath)}" onclick="event.stopPropagation(); openPreviewModal(decodeURIComponent('${safeJsPath}'))" title="Preview file">Preview</button>` : ''}
             ${!isDir ? `<a href="${downloadUrl}" class="btn btn-sm storage-btn-download" download title="Download file" onclick="event.stopPropagation()">Download</a>` : ''}
+            ${isDir ? `<button class="btn btn-sm storage-btn-zip" onclick="downloadFolderZip(event, decodeURIComponent('${safeJsPath}'), '${node}', decodeURIComponent('${safeJsName}'))" title="Download folder as ZIP">ZIP</button>` : ''}
             <button class="btn btn-sm storage-btn-share" data-action="share" data-is-dir="${isDir}" data-path="${encodeURIComponent(itemRelPath)}" onclick="event.stopPropagation(); openShareModal(decodeURIComponent('${safeJsPath}'), ${isDir})" title="${isDir ? 'Share folder' : 'Share link'}">Share</button>
             ${isOnline ? `<button class="btn btn-sm" onclick="event.stopPropagation(); renameItem(decodeURIComponent('${safeJsPath}'))" title="Rename">Rename</button>` : ''}
             ${isOnline ? `<button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteItem(decodeURIComponent('${safeJsPath}'), ${isDir})" title="Delete">Delete</button>` : ''}
@@ -2554,6 +2578,43 @@ function renderBreadcrumbs(path) {
   container.innerHTML = html;
 }
 
+// Download folder as ZIP handler
+window.downloadFolderZip = async function(event, path, node, folderName) {
+  if (event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+  const btn = event?.currentTarget;
+  const originalText = btn ? btn.textContent : "";
+  if (btn) {
+    btn.textContent = "Zipping...";
+    btn.disabled = true;
+  }
+  try {
+    const nodeObj = cachedStorageNodes.find(n => n.name === node || n.node_id === node);
+    const isLocal = !nodeObj || nodeObj.is_local;
+    const url = isLocal
+      ? `/storage/download?path=${encodeURIComponent(path)}&format=zip`
+      : `/storage/download?node=${encodeURIComponent(node)}&path=${encodeURIComponent(path)}&format=zip`;
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${folderName || 'folder'}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } catch (err) {
+    showCustomAlert({ title: "ZIP Download Failed", message: err.message, isError: true });
+  } finally {
+    if (btn) {
+      setTimeout(() => {
+        btn.textContent = originalText;
+        btn.disabled = false;
+      }, 1500);
+    }
+  }
+};
+
 // Drag and Drop File Dropzone
 const dropzone = document.getElementById("storage-dropzone");
 if (dropzone) {
@@ -2573,15 +2634,71 @@ if (dropzone) {
     }, false);
   });
 
-  dropzone.addEventListener('drop', (e) => {
+  dropzone.addEventListener('drop', async (e) => {
     e.preventDefault();
     e.stopPropagation();
     dropzone.classList.remove('drag-active');
     const dt = e.dataTransfer;
-    if (dt && dt.files && dt.files.length > 0) {
+    if (dt && dt.items && dt.items.length > 0) {
+      await handleDroppedEntries(dt.items);
+    } else if (dt && dt.files && dt.files.length > 0) {
       uploadFiles(dt.files);
     }
   }, false);
+}
+
+// Handle dropped items with directory traversal support
+async function handleDroppedEntries(dataTransferItems) {
+  const entries = [];
+  for (let i = 0; i < dataTransferItems.length; i++) {
+    const item = dataTransferItems[i];
+    if (typeof item.webkitGetAsEntry === "function") {
+      const entry = item.webkitGetAsEntry();
+      if (entry) entries.push(entry);
+    }
+  }
+
+  if (entries.length === 0) return;
+
+  const fileEntries = [];
+  async function readEntry(entry, path = "") {
+    if (entry.isFile) {
+      const file = await new Promise((resolve) => entry.file(resolve));
+      Object.defineProperty(file, "webkitRelativePath", {
+        value: path ? `${path}/${file.name}` : file.name,
+        writable: true
+      });
+      fileEntries.push(file);
+    } else if (entry.isDirectory) {
+      const dirReader = entry.createReader();
+      const subEntries = await new Promise((resolve) => {
+        const results = [];
+        function readBatch() {
+          dirReader.readEntries((batch) => {
+            if (!batch || batch.length === 0) {
+              resolve(results);
+            } else {
+              results.push(...batch);
+              readBatch();
+            }
+          }, () => resolve(results));
+        }
+        readBatch();
+      });
+      const newPath = path ? `${path}/${entry.name}` : entry.name;
+      for (const sub of subEntries) {
+        await readEntry(sub, newPath);
+      }
+    }
+  }
+
+  for (const entry of entries) {
+    await readEntry(entry, "");
+  }
+
+  if (fileEntries.length > 0) {
+    handleFolderUpload(fileEntries);
+  }
 }
 
 // Upload file(s) helper
@@ -2614,6 +2731,274 @@ async function uploadFiles(fileList) {
     }
   }
 
+  loadStorage(currentPath, selectedStorageNode, false);
+}
+
+// Folder Upload State and Orchestration
+let folderUploadState = {
+  active: false,
+  cancelled: false,
+  files: [],
+  failedQueue: [],
+  completedCount: 0,
+  completedBytes: 0,
+  totalBytes: 0,
+  targetPath: "",
+  targetNode: "",
+  abortController: null
+};
+
+window.openFolderUploadModal = function() {
+  const modal = document.getElementById("storage-upload-modal-backdrop");
+  if (!modal) return;
+  modal.style.display = "flex";
+  const progContainer = document.getElementById("upload-progress-container");
+  const summaryContainer = document.getElementById("upload-summary-container");
+  if (progContainer) progContainer.style.display = "block";
+  if (summaryContainer) summaryContainer.style.display = "none";
+  document.getElementById("upload-cancel-btn").style.display = "inline-block";
+  document.getElementById("upload-cancel-btn").disabled = false;
+  document.getElementById("upload-done-btn").style.display = "none";
+  document.getElementById("upload-retry-btn").style.display = "none";
+  document.getElementById("upload-overwrite-retry-btn").style.display = "none";
+};
+
+window.closeFolderUploadModal = function() {
+  if (folderUploadState.active && !folderUploadState.cancelled && folderUploadState.completedCount < folderUploadState.files.length) {
+    if (confirm("Upload is currently in progress. Cancel remaining uploads?")) {
+      cancelFolderUpload();
+    } else {
+      return;
+    }
+  }
+  const modal = document.getElementById("storage-upload-modal-backdrop");
+  if (modal) modal.style.display = "none";
+  folderUploadState.active = false;
+};
+
+window.cancelFolderUpload = function() {
+  folderUploadState.cancelled = true;
+  document.getElementById("upload-cancel-btn").disabled = true;
+  document.getElementById("upload-progress-status").textContent = "Cancelling remaining uploads...";
+  if (folderUploadState.abortController) {
+    try {
+      folderUploadState.abortController.abort();
+    } catch (e) {}
+  }
+};
+
+window.handleFolderUpload = async function(fileList, overwrite = false) {
+  if (!fileList || fileList.length === 0) return;
+  const files = Array.from(fileList);
+
+  folderUploadState.active = true;
+  folderUploadState.cancelled = false;
+  folderUploadState.files = files;
+  folderUploadState.failedQueue = [];
+  folderUploadState.completedCount = 0;
+  folderUploadState.completedBytes = 0;
+  folderUploadState.targetPath = currentPath;
+  folderUploadState.targetNode = selectedStorageNode;
+  folderUploadState.totalBytes = files.reduce((acc, f) => acc + (f.size || 0), 0);
+
+  openFolderUploadModal();
+  await executeFolderUploadQueue(overwrite);
+};
+
+window.retryFailedUploads = async function(overwrite = false) {
+  const retryFiles = folderUploadState.failedQueue.map(item => item.file);
+  if (retryFiles.length === 0) return;
+
+  folderUploadState.active = true;
+  folderUploadState.cancelled = false;
+  folderUploadState.files = retryFiles;
+  folderUploadState.failedQueue = [];
+  folderUploadState.completedCount = 0;
+  folderUploadState.completedBytes = 0;
+  folderUploadState.totalBytes = retryFiles.reduce((acc, f) => acc + (f.size || 0), 0);
+
+  const progContainer = document.getElementById("upload-progress-container");
+  const summaryContainer = document.getElementById("upload-summary-container");
+  if (progContainer) progContainer.style.display = "block";
+  if (summaryContainer) summaryContainer.style.display = "none";
+  document.getElementById("upload-cancel-btn").style.display = "inline-block";
+  document.getElementById("upload-cancel-btn").disabled = false;
+  document.getElementById("upload-done-btn").style.display = "none";
+  document.getElementById("upload-retry-btn").style.display = "none";
+  document.getElementById("upload-overwrite-retry-btn").style.display = "none";
+
+  await executeFolderUploadQueue(overwrite);
+};
+
+async function executeFolderUploadQueue(overwrite = false) {
+  const uploadBtn = document.getElementById("upload-file-btn");
+  const folderBtn = document.getElementById("upload-folder-btn");
+  if (uploadBtn) uploadBtn.disabled = true;
+  if (folderBtn) folderBtn.disabled = true;
+
+  const nodeObj = cachedStorageNodes.find(n => n.name === folderUploadState.targetNode || n.node_id === folderUploadState.targetNode);
+  const isLocal = !nodeObj || nodeObj.is_local;
+  const conflictMode = overwrite ? "overwrite" : "fail";
+  const files = folderUploadState.files;
+  const totalFiles = files.length;
+
+  for (let i = 0; i < totalFiles; i++) {
+    if (folderUploadState.cancelled) break;
+
+    const file = files[i];
+    const relPath = file.webkitRelativePath || file.name;
+
+    // Update progress UI
+    const pct = folderUploadState.totalBytes > 0
+      ? Math.round((folderUploadState.completedBytes / folderUploadState.totalBytes) * 100)
+      : Math.round((i / totalFiles) * 100);
+
+    const progStatus = document.getElementById("upload-progress-status");
+    const progPct = document.getElementById("upload-progress-pct");
+    const progBar = document.getElementById("upload-progress-bar");
+    const currFile = document.getElementById("upload-current-file");
+    const statsDetail = document.getElementById("upload-stats-detail");
+
+    if (progStatus) progStatus.textContent = `Uploading file ${i + 1} of ${totalFiles}...`;
+    if (progPct) progPct.textContent = `${pct}%`;
+    if (progBar) progBar.style.width = `${pct}%`;
+    if (currFile) currFile.textContent = relPath;
+    if (statsDetail) {
+      statsDetail.textContent = `${folderUploadState.completedCount} / ${totalFiles} completed (${formatBytes(folderUploadState.completedBytes)} / ${formatBytes(folderUploadState.totalBytes)})`;
+    }
+
+    // Client-side 100 MB check
+    if (file.size > 100 * 1024 * 1024) {
+      folderUploadState.failedQueue.push({
+        file,
+        relPath,
+        error: "File exceeds 100 MB limit",
+        isConflict: false
+      });
+      continue;
+    }
+
+    folderUploadState.abortController = new AbortController();
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const uploadUrl = (isLocal ? '/storage/upload' : '/storage/upload') +
+      `?path=${encodeURIComponent(folderUploadState.targetPath)}` +
+      `&relative_path=${encodeURIComponent(relPath)}` +
+      (isLocal ? '' : `&node=${encodeURIComponent(folderUploadState.targetNode)}`) +
+      `&conflict=${conflictMode}`;
+
+    try {
+      const res = await fetch(uploadUrl, {
+        method: "POST",
+        body: formData,
+        signal: folderUploadState.abortController.signal
+      });
+
+      if (res.status === 409) {
+        const errJson = await res.json().catch(() => ({}));
+        folderUploadState.failedQueue.push({
+          file,
+          relPath,
+          error: "File already exists",
+          isConflict: true
+        });
+      } else if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        folderUploadState.failedQueue.push({
+          file,
+          relPath,
+          error: errJson.error || res.statusText || `HTTP ${res.status}`,
+          isConflict: false
+        });
+      } else {
+        folderUploadState.completedCount++;
+        folderUploadState.completedBytes += file.size;
+      }
+    } catch (err) {
+      if (err.name === "AbortError" || folderUploadState.cancelled) {
+        folderUploadState.failedQueue.push({
+          file,
+          relPath,
+          error: "Upload cancelled by user",
+          isConflict: false
+        });
+        break;
+      } else {
+        folderUploadState.failedQueue.push({
+          file,
+          relPath,
+          error: err.message || "Network error",
+          isConflict: false
+        });
+      }
+    }
+  }
+
+  // Restore toolbar buttons
+  if (uploadBtn) uploadBtn.disabled = false;
+  if (folderBtn) folderBtn.disabled = false;
+  folderUploadState.active = false;
+
+  // Render Completion Summary
+  const progContainer = document.getElementById("upload-progress-container");
+  const summaryContainer = document.getElementById("upload-summary-container");
+  const summaryBadge = document.getElementById("upload-summary-badge");
+  const resultsList = document.getElementById("upload-results-list");
+  const resultsTitle = document.getElementById("upload-results-title");
+
+  if (progContainer) progContainer.style.display = "none";
+  if (summaryContainer) summaryContainer.style.display = "block";
+
+  const cancelBtn = document.getElementById("upload-cancel-btn");
+  const doneBtn = document.getElementById("upload-done-btn");
+  const retryBtn = document.getElementById("upload-retry-btn");
+  const overwriteRetryBtn = document.getElementById("upload-overwrite-retry-btn");
+
+  if (cancelBtn) cancelBtn.style.display = "none";
+  if (doneBtn) doneBtn.style.display = "inline-block";
+
+  const hasConflicts = folderUploadState.failedQueue.some(item => item.isConflict);
+  const hasOtherErrors = folderUploadState.failedQueue.some(item => !item.isConflict && item.error !== "Upload cancelled by user");
+
+  if (folderUploadState.cancelled) {
+    if (summaryBadge) {
+      summaryBadge.style.background = "rgba(234, 179, 8, 0.15)";
+      summaryBadge.style.color = "#eab308";
+      summaryBadge.textContent = `Upload Cancelled: ${folderUploadState.completedCount} uploaded, ${folderUploadState.failedQueue.length} skipped.`;
+    }
+  } else if (folderUploadState.failedQueue.length === 0) {
+    if (summaryBadge) {
+      summaryBadge.style.background = "rgba(34, 197, 94, 0.15)";
+      summaryBadge.style.color = "#22c55e";
+      summaryBadge.textContent = `✓ Successfully uploaded all ${folderUploadState.completedCount} files (${formatBytes(folderUploadState.completedBytes)}).`;
+    }
+    if (resultsList) resultsList.innerHTML = `<div class="cell-muted" style="color: #22c55e;">All items uploaded cleanly.</div>`;
+    if (resultsTitle) resultsTitle.style.display = "none";
+  } else {
+    if (summaryBadge) {
+      summaryBadge.style.background = "rgba(239, 68, 68, 0.15)";
+      summaryBadge.style.color = "#ef4444";
+      summaryBadge.textContent = `Uploaded ${folderUploadState.completedCount} of ${totalFiles} files. ${folderUploadState.failedQueue.length} item(s) failed or conflicted.`;
+    }
+    if (resultsTitle) resultsTitle.style.display = "block";
+    if (resultsList) {
+      resultsList.innerHTML = folderUploadState.failedQueue.map(item => `
+        <div style="padding: 4px 0; border-bottom: 1px solid var(--border-color, #333); display: flex; justify-content: space-between; gap: 8px;">
+          <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(item.relPath)}</span>
+          <span style="color: ${item.isConflict ? '#eab308' : '#ef4444'}; font-weight: 500; flex-shrink: 0;">${escapeHtml(item.error)}</span>
+        </div>
+      `).join("");
+    }
+    if (hasConflicts && overwriteRetryBtn) {
+      overwriteRetryBtn.style.display = "inline-block";
+    }
+    if (hasOtherErrors && retryBtn) {
+      retryBtn.style.display = "inline-block";
+    }
+  }
+
+  // Refresh storage directory listing
   loadStorage(currentPath, selectedStorageNode, false);
 }
 

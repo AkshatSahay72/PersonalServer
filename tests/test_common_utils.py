@@ -176,6 +176,41 @@ class TestStorageUtils(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_app_id(None)
 
+    def test_sanitize_relative_path(self):
+        from common.storage_utils import sanitize_relative_path
+        self.assertEqual(sanitize_relative_path("folder/sub/file.txt"), "folder/sub/file.txt")
+        self.assertEqual(sanitize_relative_path("folder\\sub\\file.txt"), "folder/sub/file.txt")
+        self.assertEqual(sanitize_relative_path("My Documents/Resume (2026).pdf"), "My Documents/Resume (2026).pdf")
+        self.assertEqual(sanitize_relative_path("Unicode/Résumé/cv.pdf"), "Unicode/Résumé/cv.pdf")
+
+        # Traversal and absolute escapes
+        with self.assertRaises(ValueError):
+            sanitize_relative_path("../escape.txt")
+        with self.assertRaises(ValueError):
+            sanitize_relative_path("sub/../../escape.txt")
+        with self.assertRaises(ValueError):
+            sanitize_relative_path("/etc/passwd")
+        with self.assertRaises(ValueError):
+            sanitize_relative_path("C:\\windows\\system32")
+        with self.assertRaises(ValueError):
+            sanitize_relative_path("test\0bad.txt")
+        with self.assertRaises(ValueError):
+            sanitize_relative_path("")
+        with self.assertRaises(ValueError):
+            sanitize_relative_path("   ")
+
+    def test_get_unique_conflict_path(self):
+        from common.storage_utils import get_unique_conflict_path
+        f1 = Path(self.base_path) / "file.txt"
+        self.assertEqual(get_unique_conflict_path(f1), f1)
+        f1.touch()
+        f2 = get_unique_conflict_path(f1)
+        self.assertEqual(f2.name, "file (1).txt")
+        f2.touch()
+        f3 = get_unique_conflict_path(f1)
+        self.assertEqual(f3.name, "file (2).txt")
+
 
 if __name__ == "__main__":
     unittest.main()
+

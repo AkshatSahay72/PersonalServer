@@ -510,7 +510,9 @@
 
               <div class="storage-actions" id="storage-actions-container">
                 <input type="file" id="file-upload-input" style="display:none" multiple>
+                <input type="file" id="folder-upload-input" style="display:none" webkitdirectory directory multiple>
                 <button id="upload-file-btn" class="btn btn-sm btn-primary">Upload</button>
+                <button id="upload-folder-btn" class="btn btn-sm">Upload Folder</button>
                 <button id="create-folder-btn" class="btn btn-sm">New Folder</button>
               </div>
 
@@ -1205,6 +1207,41 @@
           <button type="button" class="btn btn-sm" onclick="closeHADetailsModal()">Close</button>
           <button type="button" class="btn btn-sm btn-outline-warning" id="ha-modal-failover-btn" onclick="triggerFailoverFromModal()">Simulate Failover</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Storage Folder Upload Progress & Summary Modal -->
+  <div id="storage-upload-modal-backdrop" class="modal-backdrop" style="display:none">
+    <div class="modal-frame" style="max-width: 580px; width: 92%;" role="dialog" aria-modal="true" aria-labelledby="upload-modal-title">
+      <div class="modal-header">
+        <span class="modal-title mono" id="upload-modal-title">Folder Upload</span>
+        <button type="button" class="modal-close-btn" id="upload-modal-close-btn" onclick="closeFolderUploadModal()" title="Close">✕</button>
+      </div>
+      <div class="modal-body" style="padding: 18px 20px;">
+        <div id="upload-progress-container">
+          <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+            <span class="mono" id="upload-progress-status" style="font-size: 13px;">Preparing upload...</span>
+            <span class="mono" id="upload-progress-pct" style="font-weight: 600; font-size: 13px;">0%</span>
+          </div>
+          <div style="width: 100%; height: 8px; background: var(--bg-surface, #222); border-radius: 4px; overflow: hidden; margin-bottom: 12px; border: 1px solid var(--border-color, #333);">
+            <div id="upload-progress-bar" style="width: 0%; height: 100%; background: var(--accent-color, #3b82f6); transition: width 0.15s ease;"></div>
+          </div>
+          <div class="mono cell-muted" id="upload-current-file" style="font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 12px;">--</div>
+          <div class="mono cell-muted" id="upload-stats-detail" style="font-size: 11px;">0 / 0 files completed</div>
+        </div>
+
+        <div id="upload-summary-container" style="display:none;">
+          <div id="upload-summary-badge" style="padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-size: 13px; font-weight: 500;"></div>
+          <div class="modal-label" id="upload-results-title" style="margin-bottom: 6px; font-weight: 600;">Details:</div>
+          <div id="upload-results-list" class="mono" style="max-height: 200px; overflow-y: auto; background: var(--bg-surface, #1e1e1e); border: 1px solid var(--border-color, #333); border-radius: 6px; padding: 8px 12px; font-size: 12px;"></div>
+        </div>
+      </div>
+      <div class="modal-footer" id="upload-modal-footer">
+        <button type="button" class="btn btn-sm btn-danger" id="upload-cancel-btn" onclick="cancelFolderUpload()">Cancel</button>
+        <button type="button" class="btn btn-sm btn-primary" id="upload-done-btn" onclick="closeFolderUploadModal()" style="display:none;">Done</button>
+        <button type="button" class="btn btn-sm btn-warning" id="upload-retry-btn" onclick="retryFailedUploads(false)" style="display:none;">Retry Failed</button>
+        <button type="button" class="btn btn-sm btn-danger" id="upload-overwrite-retry-btn" onclick="retryFailedUploads(true)" style="display:none;">Overwrite & Retry</button>
       </div>
     </div>
   </div>
