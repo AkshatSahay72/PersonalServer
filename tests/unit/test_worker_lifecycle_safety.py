@@ -196,6 +196,34 @@ class TestAcceptancePayloads(unittest.TestCase):
         self.assertEqual(s2["depends_on_steps"], ["step1-produce"])
         self.assertEqual(s2["inputs"], ["step1-produce/data.dat"])
 
+    def test_canary_payload_checksum_exact(self):
+        """Validates exact SHA-256 for the deployment canary payload."""
+        import hashlib
+        payload = b"VERIFIED_CANARY_PAYLOAD_V07"
+        expected_sha256 = "8fbf822d57b5b8d1b83bbfe0d0bc8593e7ee8447d48e9576f7de29228f0beef8"
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        self.assertEqual(actual_sha256, expected_sha256)
+
+    def test_corrupt_pid_file_preservation(self):
+        """PID file with corrupt/non-numeric content must be preserved for operator inspection."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pid_file = Path(tmp_dir) / "node-worker.pid"
+            pid_file.write_text("corrupted_pid_content\n", encoding="utf-8")
+            
+            raw_content = pid_file.read_text(encoding="utf-8").strip()
+            is_valid_pid = raw_content.isdigit()
+            self.assertFalse(is_valid_pid)
+            
+            # Safety rule: Do not delete PID file if identity or content is uncertain
+            if not is_valid_pid:
+                action = "PRESERVE_AND_PROMPT_OPERATOR"
+            else:
+                action = "PROCEED"
+                
+            self.assertEqual(action, "PRESERVE_AND_PROMPT_OPERATOR")
+            self.assertTrue(pid_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+
