@@ -334,6 +334,68 @@ class TestResourceAwareScheduler(unittest.TestCase):
         self.assertIn("node-alpha", job["waiting_reason"])
         self.assertIn("offline", job["waiting_reason"].lower())
 
+    def test_05_resource_filtering_cpu_and_storage(self):
+        """Scheduler accurately filters by minimum CPU cores and storage requirements."""
+        # Node Alpha has 8 cores, 40GB free storage. Node Beta has 4 cores, 15GB free storage.
+        self.assertTrue(is_node_eligible(self.node_a, {"min_cpu_cores": 6}))
+        self.assertFalse(is_node_eligible(self.node_b, {"min_cpu_cores": 6}))
+
+        self.assertTrue(is_node_eligible(self.node_a, {"min_storage_gb": 30}))
+        self.assertFalse(is_node_eligible(self.node_b, {"min_storage_gb": 30}))
+
+        # Select node requiring 6 cores: Alpha chosen, Beta rejected for CPU
+        decision = ResourceScheduler.select_node({"min_cpu_cores": 6}, self.nodes_db)
+        self.assertEqual(decision["selected_node"], "node-alpha")
+        self.assertIn("Insufficient CPU cores", decision["rejected"]["node-beta"])
+
+    def test_06_insufficient_resources_keeps_job_queued_with_reason(self):
+        """When no worker meets resource requirements, select_node returns None with explicit reasons."""
+        # Request 16GB RAM when Alpha has ~6GB and Beta has ~3GB
+        decision = ResourceScheduler.select_node({"min_memory_mb": 16000}, self.nodes_db)
+        self.assertIsNone(decision["selected_node"])
+        self.assertEqual(decision["score"], 0.0)
+        self.assertIn("No eligible nodes met the requirements", decision["reason"])
+        self.assertIn("node-alpha", decision["rejected"])
+        self.assertIn("node-beta", decision["rejected"])
+        self.assertIn("Insufficient available memory", decision["rejected"]["node-alpha"])
+
+    def test_07_unavailable_workers_filtered_with_clear_reasons(self):
+        """Offline and draining nodes are rejected with distinct, actionable reasons."""
+        self.node_a["status"] = "DRAINING"
+        stale_time = "2026-10-01T00:00:00Z"
+        self.node_b["last_seen"] = stale_time
+        self.node_b["last_heartbeat"]["timestamp"] = stale_time
+
+        decision = ResourceScheduler.select_node({"role": "compute"}, self.nodes_db, timeout_seconds=10)
+        self.assertIsNone(decision["selected_node"])
+        self.assertIn("DRAINING", decision["rejected"]["node-alpha"])
+        self.assertIn("OFFLINE", decision["rejected"]["node-beta"])
+
+    def test_08_lease_sweeper_dispatches_pending_auto_job_when_worker_becomes_available(self):
+        """Lease sweeper evaluates unassigned pending auto-scheduled jobs and assigns eligible workers."""
+        jobs_db = {
+            "jobs": {
+                "job-pending-auto": {
+                    "job_id": "job-pending-auto",
+                    "target": "auto",
+                    "target_node": None,
+                    "assigned_node": None,
+                    "status": JOB_STATE_QUEUED,
+                    "requirements": {"min_memory_mb": 5000},
+                    "waiting_reason": "Awaiting eligible worker"
+                }
+            }
+        }
+        # Node Alpha is currently online with ~6144MB free
+        changed = sweep_expired_leases(jobs_db, self.nodes_db, timeout_seconds=60)
+        self.assertTrue(changed)
+        job = jobs_db["jobs"]["job-pending-auto"]
+        self.assertEqual(job["target_node"], "node-alpha")
+        self.assertEqual(job["assigned_node"], "node-alpha")
+        self.assertIsNone(job["waiting_reason"])
+        self.assertEqual(job["scheduler"]["mode"], "resource-aware")
+
+
 
 class TestArtifactManager(unittest.TestCase):
     """Test secure artifact storage, SHA-256 verification, and path traversal protection."""
@@ -867,6 +929,132 @@ class TestHttpJobRoutesSecurity(unittest.TestCase):
         )
         self.assertTrue(handled_admin)
         self.assertEqual(self.handler.send_json.call_args[0][0], 200)
+
+    def test_11_insufficient_resources_keeps_job_queued_with_waiting_reason(self):
+        """Submitting job with unsatisfiable requirements leaves job QUEUED with descriptive waiting_reason."""
+        self.handler.parse_auth_token.return_value = self.enrollment_token
+        self.handler.is_authenticated_admin_or_node.return_value = True
+
+        handled = handle_job_post(
+            self.handler,
+            "/jobs",
+            {
+                "type": "echo",
+                "parameters": {"message": "heavy-job"},
+                "requirements": {"min_memory_mb": 128000},
+                "target": "auto"
+            },
+            token=self.enrollment_token,
+            query={}
+        )
+        self.assertTrue(handled)
+        call_code = self.handler.send_json.call_args[0][0]
+        call_body = self.handler.send_json.call_args[0][1]
+        self.assertEqual(call_code, 200)
+        self.assertEqual(call_body["status"], JOB_STATE_QUEUED)
+        self.assertIsNone(call_body["target_node"])
+        self.assertEqual(call_body["scheduler"]["mode"], "resource-aware-pending")
+        self.assertIn("Awaiting eligible worker", call_body["job"]["waiting_reason"])
+
+    def test_12_worker_poll_claims_only_when_eligible(self):
+        """Worker polling /jobs/next claims auto-scheduled job only if node satisfies requirements."""
+        from controller.stores import load_jobs_db, save_jobs_db, load_nodes_db, save_nodes_db
+        jobs_db = load_jobs_db(self.paths)
+        nodes_db = load_nodes_db(self.paths)
+
+        # Register weak worker (1 core, 512MB RAM) and strong worker (8 cores, 8192MB RAM)
+        nodes_db.setdefault("nodes", {})["node-weak"] = {
+            "node_id": "node-weak",
+            "name": "Weak Node",
+            "role": "compute",
+            "status": "ONLINE",
+            "auth_token": "token-weak",
+            "last_seen": get_current_iso_timestamp(),
+            "resources": {"cpu_cores": 1, "ram_mb": 512, "storage_gb": 10},
+            "last_heartbeat": {"system": {"cpu_cores": 1, "memory": "100M/512M", "storage": "2G/10G"}}
+        }
+        nodes_db.setdefault("nodes", {})["node-strong"] = {
+            "node_id": "node-strong",
+            "name": "Strong Node",
+            "role": "compute",
+            "status": "ONLINE",
+            "auth_token": "token-strong",
+            "last_seen": get_current_iso_timestamp(),
+            "resources": {"cpu_cores": 8, "ram_mb": 8192, "storage_gb": 100},
+            "last_heartbeat": {"system": {"cpu_cores": 8, "memory": "2Gi/8Gi", "storage": "20G/100G"}}
+        }
+        save_nodes_db(nodes_db, self.paths)
+
+        # Queue job requiring 4 cores
+        test_job_id = "job-req-4cores"
+        jobs_db.setdefault("jobs", {})[test_job_id] = {
+            "job_id": test_job_id,
+            "target": "auto",
+            "target_node": None,
+            "assigned_node": None,
+            "status": JOB_STATE_QUEUED,
+            "requirements": {"min_cpu_cores": 4},
+            "timeout": 30
+        }
+        save_jobs_db(jobs_db, self.paths)
+
+        # 1. Weak worker polls -> cannot claim
+        self.handler.parse_auth_token.return_value = "token-weak"
+        self.handler.is_authenticated_admin_or_node.return_value = False
+        h1 = handle_job_get(self.handler, "/nodes/node-weak/jobs/next", {})
+        self.assertTrue(h1)
+        res_weak = self.handler.send_json.call_args[0][1]
+        self.assertIsNone(res_weak.get("job"))
+
+        # 2. Strong worker polls -> successfully claims
+        self.handler.parse_auth_token.return_value = "token-strong"
+        h2 = handle_job_get(self.handler, "/nodes/node-strong/jobs/next", {})
+        self.assertTrue(h2)
+        res_strong = self.handler.send_json.call_args[0][1]
+        self.assertIsNotNone(res_strong.get("job"))
+        claimed_job = res_strong["job"]
+        self.assertEqual(claimed_job["job_id"], test_job_id)
+        self.assertEqual(claimed_job["target_node"], "node-strong")
+        self.assertEqual(claimed_job["status"], JOB_STATE_CLAIMED)
+        self.assertIsNone(claimed_job["waiting_reason"])
+
+    def test_13_explicit_target_requirements_mismatch_rejected(self):
+        """Explicitly targeting a node that does not satisfy requirements returns 400."""
+        from controller.stores import load_nodes_db, save_nodes_db
+        nodes_db = load_nodes_db(self.paths)
+        nodes_db.setdefault("nodes", {})["node-under-resourced"] = {
+            "node_id": "node-under-resourced",
+            "name": "Under Resourced",
+            "role": "compute",
+            "status": "ONLINE",
+            "auth_token": "token-under",
+            "last_seen": get_current_iso_timestamp(),
+            "resources": {"cpu_cores": 1, "ram_mb": 512, "storage_gb": 10},
+            "last_heartbeat": {"system": {"cpu_cores": 1, "memory": "200M/512M", "storage": "2G/10G"}}
+        }
+        save_nodes_db(nodes_db, self.paths)
+
+        self.handler.parse_auth_token.return_value = self.enrollment_token
+        self.handler.is_authenticated_admin_or_node.return_value = True
+
+        handled = handle_job_post(
+            self.handler,
+            "/jobs",
+            {
+                "type": "echo",
+                "parameters": {"message": "hello"},
+                "requirements": {"min_cpu_cores": 4},
+                "target": "node-under-resourced"
+            },
+            token=self.enrollment_token,
+            query={}
+        )
+        self.assertTrue(handled)
+        call_code = self.handler.send_json.call_args[0][0]
+        call_body = self.handler.send_json.call_args[0][1]
+        self.assertEqual(call_code, 400)
+        self.assertIn("does not satisfy job requirements", call_body["error"])
+        self.assertIn("Insufficient CPU cores", call_body["error"])
 
 
 if __name__ == "__main__":

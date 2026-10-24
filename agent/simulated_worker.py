@@ -208,6 +208,7 @@ class SimulatedWorker:
             "status": "online",
             "timestamp": now_iso,
             "capabilities": dict(self.capabilities),
+            "resources": dict(self.resources),
             "services": services or {"simulated_worker": "running"},
             "workloads": workloads or {"active_jobs": len(self.active_jobs)},
             "system": {

@@ -171,7 +171,37 @@ def sweep_expired_leases(
 
                 changed = True
 
-        # B: Queued Pinned Node Evaluation (Prevent infinite silent queueing)
+        # B: Queued Auto Jobs (Evaluate newly eligible workers)
+        elif canon_status == JOB_STATE_QUEUED and not target_node and job.get("target", "auto") == "auto":
+            decision = ResourceScheduler.select_node(
+                job.get("requirements", {}),
+                nodes_db,
+                timeout_seconds,
+                cluster_jobs=jobs_db.get("jobs", {})
+            )
+            if decision.get("selected_node"):
+                sel_node = decision["selected_node"]
+                job["target_node"] = sel_node
+                job["assigned_node"] = sel_node
+                job["waiting_reason"] = None
+                job["scheduler"] = {
+                    "mode": "resource-aware",
+                    "selected_node": sel_node,
+                    "score": decision["score"],
+                    "reason": decision["reason"],
+                    "candidates_count": len(decision.get("candidates", []))
+                }
+                changed = True
+            else:
+                new_waiting = f"Awaiting eligible worker: {decision['reason']}"
+                if job.get("waiting_reason") != new_waiting:
+                    job["waiting_reason"] = new_waiting
+                    if "scheduler" in job and isinstance(job["scheduler"], dict):
+                        job["scheduler"]["reason"] = decision["reason"]
+                        job["scheduler"]["rejected"] = decision.get("rejected", {})
+                    changed = True
+
+        # C: Queued Pinned Node Evaluation (Prevent infinite silent queueing)
         elif canon_status in (JOB_STATE_QUEUED, JOB_STATE_NEEDS_ATTENTION):
             target_mode = job.get("target", "auto")
             is_pinned = job.get("pinned", False) or target_mode != "auto" or bool(job.get("target_node") and not job.get("target"))

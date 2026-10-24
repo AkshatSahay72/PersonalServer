@@ -118,6 +118,8 @@ def resolve_controller_node_id(node_id: Optional[str] = None, paths=None) -> str
 
                 # Check for IP match (e.g. Tailscale IP)
                 for nid, n in nodes.items():
+                    if (n.get("status") or "").upper() == "REMOVED":
+                        continue
                     n_ts = n.get("tailscale_ip")
                     n_host = n.get("host")
                     n_ip = n.get("ip")
@@ -128,6 +130,8 @@ def resolve_controller_node_id(node_id: Optional[str] = None, paths=None) -> str
                 try:
                     cur_host = socket.gethostname().lower()
                     for nid, n in nodes.items():
+                        if (n.get("status") or "").upper() == "REMOVED":
+                            continue
                         n_name = (n.get("name") or "").lower()
                         n_hostname = (n.get("hostname") or "").lower()
                         if cur_host and (cur_host == n_name or cur_host == n_hostname):

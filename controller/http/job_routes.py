@@ -338,7 +338,7 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                 j.get("target_node") == node_id
                 or (
                     not j.get("target_node")
-                    and is_node_eligible(node, j.get("requirements", {}))
+                    and is_node_eligible(node, j.get("requirements", {}), handler.heartbeat_timeout)
                 )
             ) and (
                 j.get("status") in (JOB_STATE_QUEUED, JOB_STATE_ASSIGNED)
@@ -367,6 +367,7 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         next_job["claimed_at"] = now_iso
         next_job["started_at"] = now_iso
         next_job["lease_expires_at"] = now_epoch + lease_duration
+        next_job["waiting_reason"] = None
         # Increment lease generation as a fencing token to prevent duplicate / stale execution
         next_job["lease_generation"] = int(next_job.get("lease_generation", 0)) + 1
 
@@ -383,7 +384,7 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         next_job["correlation_id"] = corr_id
         controller_logger.info(
             "job.claimed",
-            f"Job {next_job['job_id']} ({next_job['type']}) CLAIMED by node '{node_id}' (Attempt {next_job.get('attempt', 1)}, Lease {lease_duration}s)",
+            f"Job {next_job['job_id']} ({next_job.get('type', next_job.get('job_type', 'unknown'))}) CLAIMED by node '{node_id}' (Attempt {next_job.get('attempt', 1)}, Lease {lease_duration}s)",
             correlation_id=corr_id,
             job_id=next_job["job_id"],
             node_id=node_id,
@@ -593,6 +594,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     "selected_node": None,
                     "score": 0,
                     "reason": decision["reason"],
+                    "rejected": decision.get("rejected", {}),
                     "candidates_count": len(decision.get("candidates", []))
                 }
                 waiting_reason = f"Awaiting eligible worker: {decision['reason']}"
@@ -650,6 +652,26 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     "status": JOB_STATE_REJECTED
                 })
                 return True
+
+            if requirements and live_status not in (STATE_OFFLINE, STATE_DRAINING, STATE_DEBOARDING):
+                is_eligible, ineligibility_reason = ResourceScheduler.is_node_eligible(
+                    node_entry, requirements, handler.heartbeat_timeout
+                )
+                if not is_eligible:
+                    if is_pinned or body.get("wait_if_insufficient", False):
+                        waiting_reason = f"Pinned node '{target_node}' does not satisfy requirements: {ineligibility_reason}"
+                        initial_status = JOB_STATE_NEEDS_ATTENTION
+                        scheduler_info = {
+                            "mode": "explicit-pinned",
+                            "target_node": target_node,
+                            "reason": waiting_reason
+                        }
+                    else:
+                        handler.send_json(400, {
+                            "error": f"Target node '{target_node}' does not satisfy job requirements: {ineligibility_reason}",
+                            "status": JOB_STATE_REJECTED
+                        })
+                        return True
 
             if not scheduler_info:
                 scheduler_info = {
@@ -717,6 +739,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "job_id": job_id,
             "id": job_id,
             "target_node": target_node,
+            "waiting_reason": waiting_reason,
             "scheduler": scheduler_info,
             "job": job_record
         })

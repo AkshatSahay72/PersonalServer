@@ -341,7 +341,7 @@ async function loadDashboard() {
     let nodes = [];
     if (clusterData.status === "fulfilled") {
       const c = clusterData.value;
-      nodes = (c.nodes || []).filter(n => n.status !== "REMOVED");
+      nodes = (c.nodes || []).filter(n => n && n.node_id && n.status !== "REMOVED");
       cachedNodes = nodes;
 
       const onlineCount = nodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
@@ -1091,7 +1091,7 @@ async function loadNodes() {
     const data = clusterRes.value || { nodes: [] };
     cachedUtilMap = (utilRes.status === "fulfilled" && utilRes.value?.nodes) ? utilRes.value.nodes : {};
 
-    cachedNodes = (data.nodes || []).filter(n => n.status !== "REMOVED");
+    cachedNodes = (data.nodes || []).filter(n => n && n.node_id && n.status !== "REMOVED");
 
     const onlineCount = cachedNodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
     const countHdr = document.getElementById("nodes-count-header");
@@ -1101,7 +1101,7 @@ async function loadNodes() {
     if (targetSelect) {
       const cur = targetSelect.value;
       targetSelect.innerHTML = `<option value="auto">Auto (Scheduler)</option>` +
-        cachedNodes.map(n => `<option value="${n.node_id}">${n.name || n.node_id} (${n.node_id.slice(0, 8)})</option>`).join("");
+        cachedNodes.map(n => `<option value="${n.node_id}">${n.name || n.node_id} (${(n.node_id || '').slice(0, 8)})</option>`).join("");
       targetSelect.value = cur;
     }
 

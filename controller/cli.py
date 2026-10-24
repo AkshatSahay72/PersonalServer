@@ -182,19 +182,26 @@ def submit_job(
 
     target_node = None
     scheduler_info = None
+    waiting_reason = None
 
     if not target_or_auto or target_or_auto.lower() == "auto":
         decision = ResourceScheduler.select_node(reqs, nodes_db)
-        if not decision["selected_node"]:
-            print(f"Scheduling Error: {decision['reason']}", file=sys.stderr)
-            return 1
-        target_node = decision["selected_node"]
-        scheduler_info = {
-            "mode": "resource-aware",
-            "selected_node": target_node,
-            "score": decision["score"],
-            "reason": decision["reason"]
-        }
+        if decision.get("selected_node"):
+            target_node = decision["selected_node"]
+            scheduler_info = {
+                "mode": "resource-aware",
+                "selected_node": target_node,
+                "score": decision["score"],
+                "reason": decision["reason"]
+            }
+        else:
+            target_node = None
+            waiting_reason = f"Awaiting eligible worker: {decision['reason']}"
+            scheduler_info = {
+                "mode": "resource-aware-pending",
+                "reason": decision["reason"],
+                "rejected": decision.get("rejected", {})
+            }
     else:
         target_node = target_or_auto
         node = nodes_db.get("nodes", {}).get(target_node)
@@ -208,6 +215,11 @@ def submit_job(
         if live_status == STATE_OFFLINE:
             print(f"Error: Node '{target_node}' is OFFLINE. Cannot submit job.", file=sys.stderr)
             return 1
+        if reqs:
+            eligible, err_reason = ResourceScheduler.is_node_eligible(node, reqs)
+            if not eligible:
+                print(f"Error: Node '{target_node}' does not satisfy job requirements: {err_reason}", file=sys.stderr)
+                return 1
         scheduler_info = {"mode": "explicit", "target_node": target_node, "reason": "Explicit node"}
 
     job_id = f"job-{secrets.token_hex(6)}"
@@ -224,6 +236,7 @@ def submit_job(
         "target_node": target_node,
         "assigned_node": target_node,
         "scheduler": scheduler_info,
+        "waiting_reason": waiting_reason,
         "timeout": int(timeout),
         "max_attempts": int(max_attempts),
         "attempt": 1,

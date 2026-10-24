@@ -390,6 +390,9 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
         if "capabilities" in body and isinstance(body["capabilities"], dict):
             node_entry.setdefault("capabilities", {}).update(body["capabilities"])
 
+        if "resources" in body and isinstance(body["resources"], dict):
+            node_entry.setdefault("resources", {}).update(body["resources"])
+
         node_entry["last_heartbeat"] = {
             "timestamp": body.get("timestamp", now),
             "services": body.get("services", {}),

@@ -279,25 +279,28 @@ class ResourceScheduler:
     """
 
     @classmethod
-    def is_node_eligible(cls, node, job_requirements=None, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
+    def is_node_eligible(cls, node, job_requirements=None, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT, reserved_mem_mb=0.0):
         """
-        Quick check if a single node satisfies all hard constraints of job_requirements.
+        Check if a single node satisfies all hard constraints of job_requirements.
         Returns (is_eligible: bool, reason: str).
         """
+        if not node or not isinstance(node, dict):
+            return False, "Node record is missing or invalid"
+
         reqs = job_requirements or {}
         liveness = compute_node_liveness(node, timeout_seconds)
         node_status = node.get("status")
         if liveness in (STATE_REMOVED, STATE_DRAINING, STATE_DEBOARDING, STATE_OFFLINE, STATE_UNHEALTHY, STATE_UNKNOWN) or node_status in (STATE_REMOVED, STATE_DRAINING, STATE_DEBOARDING):
             return False, f"Node status is {liveness or node_status}"
 
-        # Role
+        # 1. Role
         req_role = reqs.get("role")
         if req_role:
             node_role = node.get("role", "compute").lower()
             if node_role != req_role.lower() and node_role != "hybrid":
                 return False, f"Role mismatch: node is '{node_role}', required '{req_role}'"
 
-        # Capabilities
+        # 2. Capabilities
         req_caps = reqs.get("capabilities", [])
         if isinstance(req_caps, str):
             req_caps = [req_caps]
@@ -317,8 +320,8 @@ class ResourceScheduler:
         if req_any and isinstance(req_any, list) and not any(has_cap(c) for c in req_any):
             return False, f"Missing any of required capabilities: {req_any}"
 
-        # Architecture & Platform
-        node_raw_arch = node.get("architecture") or node.get("system", {}).get("arch") or ""
+        # 3. Architecture & Platform
+        node_raw_arch = node.get("architecture") or node.get("system", {}).get("arch") or node.get("system", {}).get("architecture", "")
         req_arch = reqs.get("architecture")
         if req_arch:
             norm_req = normalize_architecture(req_arch)
@@ -326,9 +329,57 @@ class ResourceScheduler:
             if norm_req and norm_node and norm_req != norm_node:
                 return False, f"Architecture mismatch: node is '{node_raw_arch}', required '{req_arch}'"
 
+        supp_archs = reqs.get("supported_architectures")
+        if supp_archs and isinstance(supp_archs, list):
+            norm_supp = {normalize_architecture(a) for a in supp_archs if a}
+            norm_node = normalize_architecture(node_raw_arch)
+            if norm_node and norm_supp and norm_node not in norm_supp:
+                return False, "Image does not support this node architecture."
+
         req_platform = reqs.get("platform")
         if req_platform and node.get("platform", "").lower() != req_platform.lower():
             return False, f"Platform mismatch: node is '{node.get('platform')}', required '{req_platform}'"
+
+        # 4. Resources: CPU Cores, Memory, Storage
+        resources = node.get("resources", {}) or {}
+        last_hb = node.get("last_heartbeat", {}) or {}
+        hb_system = last_hb.get("system", {}) or {}
+
+        # CPU Cores
+        min_cpu = int(reqs.get("min_cpu_cores", 0) or reqs.get("cpu_cores", 0) or reqs.get("min_cpu", 0))
+        if min_cpu > 0:
+            cpu_cores = int(hb_system.get("cpu_cores") or resources.get("cpu_cores", 1))
+            if cpu_cores < min_cpu:
+                return False, f"Insufficient CPU cores: node has {cpu_cores}, required {min_cpu}"
+
+        # Memory (MB)
+        min_mem = float(reqs.get("min_memory_mb", 0) or reqs.get("memory_mb", 0) or reqs.get("min_memory", 0))
+        if min_mem > 0:
+            mem_details = hb_system.get("memory_details")
+            if mem_details and isinstance(mem_details, dict) and "total_mb" in mem_details:
+                avail_mem_mb = float(mem_details.get("available_mb", 0.0))
+            else:
+                mem_data = hb_system.get("memory") or str(resources.get("ram_mb", "0"))
+                _, _, avail_mem_mb = parse_memory_mb(mem_data)
+
+            effective_avail_mem_mb = max(0.0, avail_mem_mb - reserved_mem_mb)
+            if effective_avail_mem_mb < min_mem:
+                if reserved_mem_mb > 0:
+                    return False, f"Insufficient unreserved memory: ~{effective_avail_mem_mb:.0f} MB available (after {reserved_mem_mb:.0f}MB active reservations), required {min_mem:.0f} MB"
+                return False, f"Insufficient available memory: ~{effective_avail_mem_mb:.0f} MB available, required {min_mem:.0f} MB"
+
+        # Storage (GB)
+        min_st = float(reqs.get("min_storage_gb", 0) or reqs.get("storage_gb", 0) or reqs.get("min_storage", 0))
+        if min_st > 0:
+            st_details = hb_system.get("storage_details")
+            if st_details and isinstance(st_details, dict) and "total_gb" in st_details:
+                avail_st_gb = float(st_details.get("available_gb", 0.0))
+            else:
+                storage_data = hb_system.get("storage") or str(resources.get("storage_gb", "0"))
+                _, _, avail_st_gb = parse_storage_gb(storage_data)
+
+            if avail_st_gb < min_st:
+                return False, f"Insufficient available storage: ~{avail_st_gb:.1f} GB available, required {min_st:.1f} GB"
 
         return True, "Eligible"
 
@@ -373,93 +424,23 @@ class ResourceScheduler:
         rejected = {}
 
         for node_id, node in nodes.items():
-            # 1. Eligibility Check (Liveness & Subsystems)
-            liveness = compute_node_liveness(node, timeout_seconds)
-            node_status = node.get("status")
-            if liveness == STATE_REMOVED or node_status == STATE_REMOVED:
-                rejected[node_id] = "Node is REMOVED from cluster"
-                continue
-            if liveness == STATE_DRAINING or node_status == STATE_DRAINING:
-                rejected[node_id] = "Node is DRAINING (no new workloads accepted)"
-                continue
-            if liveness == STATE_DEBOARDING or node_status == STATE_DEBOARDING:
-                rejected[node_id] = "Node is DEBOARDING (no new workloads accepted)"
-                continue
-            if liveness == STATE_OFFLINE:
-                rejected[node_id] = "Node is OFFLINE (heartbeat timeout exceeded)"
-                continue
-            if liveness == STATE_UNHEALTHY:
-                rejected[node_id] = "Node is UNHEALTHY (services degraded)"
-                continue
-            if liveness == STATE_UNKNOWN:
-                rejected[node_id] = "Node status is UNKNOWN"
+            reserved_mem = reserved_by_node.get(node_id, 0.0)
+            eligible, reason = ResourceScheduler.is_node_eligible(
+                node,
+                reqs,
+                timeout_seconds=timeout_seconds,
+                reserved_mem_mb=reserved_mem
+            )
+            if not eligible:
+                rejected[node_id] = reason
                 continue
 
-            # 2. Role Filtering
-            req_role = reqs.get("role")
-            if req_role:
-                node_role = node.get("role", "compute").lower()
-                if node_role != req_role.lower() and node_role != "hybrid":
-                    rejected[node_id] = f"Role mismatch: node is '{node_role}', required '{req_role}'"
-                    continue
-
-            # 3. Capabilities Filtering
-            req_caps = reqs.get("capabilities", [])
-            if isinstance(req_caps, str):
-                req_caps = [req_caps]
-            node_caps = node.get("capabilities", {})
-            if isinstance(node_caps, list):
-                node_caps_set = set(node_caps)
-                has_cap = lambda c: c in node_caps_set
-            elif isinstance(node_caps, dict):
-                has_cap = lambda c: bool(node_caps.get(c, False))
-            else:
-                has_cap = lambda c: False
-
-            missing_caps = [c for c in req_caps if not has_cap(c)]
-            if missing_caps:
-                rejected[node_id] = f"Missing required capabilities: {missing_caps}"
-                continue
-
-            req_any_caps = reqs.get("any_capabilities")
-            if req_any_caps and isinstance(req_any_caps, list):
-                if not any(has_cap(c) for c in req_any_caps):
-                    rejected[node_id] = f"Missing any of required capabilities: {req_any_caps}"
-                    continue
-
-            # 4. Architecture & Platform Filtering
-            node_raw_arch = node.get("architecture") or node.get("system", {}).get("arch") or node.get("system", {}).get("architecture", "")
-            req_arch = reqs.get("architecture")
-            if req_arch:
-                norm_req = normalize_architecture(req_arch)
-                norm_node = normalize_architecture(node_raw_arch)
-                if norm_req and norm_node and norm_req != norm_node:
-                    rejected[node_id] = f"Architecture mismatch: node is '{node_raw_arch}', required '{req_arch}'"
-                    continue
-
-            supp_archs = reqs.get("supported_architectures")
-            if supp_archs and isinstance(supp_archs, list):
-                norm_supp = {normalize_architecture(a) for a in supp_archs if a}
-                norm_node = normalize_architecture(node_raw_arch)
-                if norm_node and norm_supp and norm_node not in norm_supp:
-                    rejected[node_id] = "Image does not support this node architecture."
-                    continue
-
-            req_platform = reqs.get("platform")
-            if req_platform and node.get("platform", "").lower() != req_platform.lower():
-                rejected[node_id] = f"Platform mismatch: node is '{node.get('platform')}', required '{req_platform}'"
-                continue
-
-            # 5. Resource Evaluation & Minimum Filtering
-            resources = node.get("resources", {})
-            last_hb = node.get("last_heartbeat", {})
-            hb_system = last_hb.get("system", {})
+            # Resources extraction for scoring
+            resources = node.get("resources", {}) or {}
+            last_hb = node.get("last_heartbeat", {}) or {}
+            hb_system = last_hb.get("system", {}) or {}
 
             cpu_cores = int(hb_system.get("cpu_cores") or resources.get("cpu_cores", 1))
-            min_cpu = int(reqs.get("min_cpu_cores", 0))
-            if cpu_cores < min_cpu:
-                rejected[node_id] = f"Insufficient CPU cores: node has {cpu_cores}, required {min_cpu}"
-                continue
 
             mem_details = hb_system.get("memory_details")
             if mem_details and isinstance(mem_details, dict) and "total_mb" in mem_details:
@@ -470,28 +451,15 @@ class ResourceScheduler:
                 mem_data = hb_system.get("memory") or str(resources.get("ram_mb", "0"))
                 total_mem_mb, used_mem_mb, avail_mem_mb = parse_memory_mb(mem_data)
 
-            # Subtract active reservations
-            reserved_mem = reserved_by_node.get(node_id, 0.0)
             effective_avail_mem_mb = max(0.0, avail_mem_mb - reserved_mem)
-
-            min_mem = float(reqs.get("min_memory_mb", 0) or reqs.get("memory_mb", 0))
-            if effective_avail_mem_mb < min_mem:
-                rejected[node_id] = f"Insufficient unreserved memory: ~{effective_avail_mem_mb:.0f} MB available (after {reserved_mem:.0f}MB active reservations), required {min_mem:.0f} MB"
-                continue
 
             st_details = hb_system.get("storage_details")
             if st_details and isinstance(st_details, dict) and "total_gb" in st_details:
                 total_st_gb = float(st_details.get("total_gb", 0.0))
-                used_st_gb = float(st_details.get("used_gb", 0.0))
                 avail_st_gb = float(st_details.get("available_gb", 0.0))
             else:
                 storage_data = hb_system.get("storage") or str(resources.get("storage_gb", "0"))
                 total_st_gb, used_st_gb, avail_st_gb = parse_storage_gb(storage_data)
-
-            min_st = float(reqs.get("min_storage_gb", 0))
-            if avail_st_gb < min_st:
-                rejected[node_id] = f"Insufficient available storage: ~{avail_st_gb:.1f} GB available, required {min_st:.1f} GB"
-                continue
 
             # Load factor
             load_avg = hb_system.get("load_average", [])
@@ -506,7 +474,7 @@ class ResourceScheduler:
                 load_1m = 1.0
                 load_ratio = min(load_1m / max(cpu_cores, 1), 2.0)
 
-            # 6. Scoring (0 - 100) with least-loaded penalty and preferred bonus
+            # Scoring (0 - 100) with least-loaded penalty and preferred bonus
             mem_ratio = (effective_avail_mem_mb / max(total_mem_mb, 1.0)) if total_mem_mb > 0 else 0.5
             score_mem = min(40.0, mem_ratio * 40.0)
             score_cpu = max(0.0, (1.0 - (load_ratio / 2.0)) * 40.0)
@@ -530,6 +498,7 @@ class ResourceScheduler:
                 f"score: {total_score}/100"
             )
 
+            liveness = compute_node_liveness(node, timeout_seconds)
             candidates.append({
                 "node_id": node_id,
                 "name": node.get("name", "unknown"),
@@ -578,82 +547,19 @@ class ResourceScheduler:
 def is_node_eligible(
     node: dict,
     requirements: Optional[dict] = None,
-    timeout_seconds: int = DEFAULT_HEARTBEAT_TIMEOUT
+    timeout_seconds: int = DEFAULT_HEARTBEAT_TIMEOUT,
+    reserved_mem_mb: float = 0.0
 ) -> bool:
     """
-    Evaluates whether an individual node meets health, state, and requirement criteria.
+    Evaluates whether an individual node meets health, state, and resource requirements.
     """
-    if not node or not isinstance(node, dict):
-        return False
-
-    reqs = requirements or {}
-
-    # 1. State / Liveness
-    node_status = node.get("status", STATE_UNKNOWN)
-    if node_status in (STATE_REMOVED, STATE_DRAINING, STATE_DEBOARDING, STATE_OFFLINE):
-        return False
-
-    liveness = compute_node_liveness(node, timeout_seconds)
-    if liveness != STATE_ONLINE:
-        return False
-
-    # 2. Role Filtering
-    req_role = reqs.get("role")
-    if req_role:
-        node_role = node.get("role", "compute").lower()
-        if node_role != req_role.lower() and node_role != "hybrid":
-            return False
-
-    # 3. Capabilities
-    node_caps = node.get("capabilities", {})
-    if isinstance(node_caps, list):
-        node_caps_set = set(node_caps)
-        has_cap = lambda c: c in node_caps_set
-    elif isinstance(node_caps, dict):
-        has_cap = lambda c: bool(node_caps.get(c, False))
-    else:
-        has_cap = lambda c: False
-
-    req_caps = reqs.get("capabilities", [])
-    if isinstance(req_caps, str):
-        req_caps = [req_caps]
-    if any(not has_cap(c) for c in req_caps):
-        return False
-
-    req_any_caps = reqs.get("any_capabilities")
-    if req_any_caps and isinstance(req_any_caps, list):
-        if not any(has_cap(c) for c in req_any_caps):
-            return False
-
-    # 4. Architecture
-    node_raw_arch = node.get("architecture") or node.get("system", {}).get("arch") or node.get("system", {}).get("architecture", "")
-    req_arch = reqs.get("architecture")
-    if req_arch:
-        norm_req = normalize_architecture(req_arch)
-        norm_node = normalize_architecture(node_raw_arch)
-        if norm_req and norm_node and norm_req != norm_node:
-            return False
-
-    supp_archs = reqs.get("supported_architectures")
-    if supp_archs and isinstance(supp_archs, list):
-        norm_supp = {normalize_architecture(a) for a in supp_archs if a}
-        norm_node = normalize_architecture(node_raw_arch)
-        if norm_node and norm_supp and norm_node not in norm_supp:
-            return False
-
-    # 5. Memory check
-    min_mem = reqs.get("min_memory_mb") or reqs.get("min_memory")
-    if min_mem:
-        try:
-            hb_system = node.get("last_heartbeat", {}).get("system", {})
-            mem_str = hb_system.get("memory") or str(node.get("resources", {}).get("ram_mb", "0"))
-            _, _, avail_mem_mb = parse_memory_mb(mem_str)
-            if avail_mem_mb > 0 and avail_mem_mb < float(min_mem):
-                return False
-        except Exception:
-            pass
-
-    return True
+    eligible, _ = ResourceScheduler.is_node_eligible(
+        node,
+        requirements,
+        timeout_seconds=timeout_seconds,
+        reserved_mem_mb=reserved_mem_mb
+    )
+    return eligible
 
 
 if __name__ == "__main__":

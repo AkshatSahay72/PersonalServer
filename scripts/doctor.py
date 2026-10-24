@@ -747,6 +747,27 @@ class DiagnosticEngine:
         """Checks Tailscale status and peer reachability without mutating state."""
         tailscale_bin = shutil.which("tailscale")
         if not tailscale_bin:
+            ts_ip = None
+            try:
+                ip_out = run_cmd_safe(["ip", "-4", "addr", "show"], timeout=2.0) or run_cmd_safe(["ifconfig"], timeout=2.0)
+                for line in ip_out.splitlines():
+                    if "inet 100." in line:
+                        for token in line.split():
+                            if token.startswith("100."):
+                                ts_ip = token.split("/")[0]
+                                break
+                        if ts_ip:
+                            break
+            except Exception:
+                pass
+            if ts_ip:
+                return {
+                    "status": STATUS_HEALTHY,
+                    "installed": False,
+                    "tailscale_ip": ts_ip,
+                    "backend_state": "Running (Android VPN App)",
+                    "message": f"Tailscale active via Android VPN (IP: {ts_ip})"
+                }
             return {
                 "status": STATUS_DEGRADED,
                 "installed": False,
@@ -844,7 +865,7 @@ class DiagnosticEngine:
             self.warnings.append(f"Node API process running (PID: {effective_pid}) but untracked by runtime/node-api.pid.")
 
         # Check Health endpoint
-        code, body_json, raw = http_get_json("http://127.0.0.1:8080/health", timeout=2.5)
+        code, body_json, raw = http_get_json("http://127.0.0.1:8080/health", timeout=6.0)
         is_online = bool(code == 200 and body_json and body_json.get("status") in ("online", True, "ok", "healthy"))
         data["health_response"] = {
             "http_status": code,
@@ -1223,8 +1244,24 @@ class DiagnosticEngine:
                 "success": True
             }
 
-        # 2. Stale PID file: remove it
+        # 2. Stale PID file: adopt untracked process if running and healthy, otherwise remove it
         if proc_st == "STALE_PID_FILE":
+            alt_pid = proc_info.get("untracked_pid")
+            if alt_pid and check_process_alive(alt_pid, pattern) and is_online:
+                if dry_run:
+                    return {
+                        "service": "node_api",
+                        "action": "WOULD_ADOPT_PID",
+                        "message": f"Would adopt running Node API PID {alt_pid} into runtime/node-api.pid",
+                        "success": True
+                    }
+                NODE_API_PID_FILE.write_text(f"{alt_pid}\n", encoding="utf-8")
+                return {
+                    "service": "node_api",
+                    "action": "ADOPTED_PID",
+                    "message": f"Adopted running Node API process (PID {alt_pid})",
+                    "success": True
+                }
             if not dry_run and NODE_API_PID_FILE.exists():
                 NODE_API_PID_FILE.unlink(missing_ok=True)
 
