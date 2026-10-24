@@ -262,6 +262,18 @@ def load_node_config():
             print(f"Warning: Failed to read {NODE_CONF}: {e}", file=sys.stderr)
 
     hw = discover_hardware()
+    raw_caps = config.get("capabilities", hw["capabilities"])
+    try:
+        from agent.capability_prober import run_capability_probes
+        probe_data = run_capability_probes(raw_caps)
+        adv_caps = probe_data["advertised_capabilities"]
+        ver_caps = probe_data["verified_capabilities"]
+        probe_res = probe_data["probe_results"]
+    except Exception:
+        adv_caps = dict(raw_caps) if isinstance(raw_caps, dict) else {str(c): True for c in raw_caps}
+        ver_caps = {}
+        probe_res = {}
+
     return {
         "node_id": config.get("node_id", "unknown"),
         "name": config.get("name", config.get("node_name", hw["name"])),
@@ -272,7 +284,10 @@ def load_node_config():
         "cpu_cores": int(config.get("cpu_cores", hw["cpu_cores"])),
         "ram_mb": int(config.get("ram_mb", hw["ram_mb"])),
         "storage_gb": int(config.get("storage_gb", hw["storage_gb"])),
-        "capabilities": config.get("capabilities", hw["capabilities"])
+        "capabilities": adv_caps,
+        "advertised_capabilities": adv_caps,
+        "verified_capabilities": ver_caps,
+        "probe_results": probe_res
     }
 
 
@@ -1071,17 +1086,18 @@ def cmd_heartbeat(args=None):
     now = get_current_iso_timestamp()
 
     node_config = load_node_config() or {}
-    caps = dict(node_config.get("capabilities", {}))
-    if is_docker_available():
-        caps["container_runtime:docker"] = True
-    if is_udocker_available():
-        caps["container_runtime:udocker"] = True
+    adv_caps = dict(node_config.get("advertised_capabilities", node_config.get("capabilities", {})))
+    ver_caps = dict(node_config.get("verified_capabilities", {}))
+    probe_res = dict(node_config.get("probe_results", {}))
 
     payload_data = {
         "node_id": node_id,
         "status": "online",
         "timestamp": now,
-        "capabilities": caps,
+        "capabilities": adv_caps,
+        "advertised_capabilities": adv_caps,
+        "verified_capabilities": ver_caps,
+        "probe_results": probe_res,
         "services": services_state,
         "workloads": workload_metrics,
         "battery": system_metrics.get("battery", {}),

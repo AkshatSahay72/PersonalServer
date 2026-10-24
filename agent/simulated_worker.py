@@ -91,7 +91,8 @@ class SimulatedWorker:
         capabilities: Optional[Dict[str, Any]] = None,
         behavior: WorkerBehavior = WorkerBehavior.NORMAL,
         verified_capabilities: Optional[Dict[str, Any]] = None,
-        advertised_capabilities: Optional[Dict[str, Any]] = None
+        advertised_capabilities: Optional[Dict[str, Any]] = None,
+        probe_results: Optional[Dict[str, Any]] = None
     ):
         # Guarantee logical node ID clearly marks worker as simulated
         if not (node_id.startswith("sim-node-") or node_id.startswith("sim-")):
@@ -120,6 +121,7 @@ class SimulatedWorker:
         }
         self.verified_capabilities = verified_capabilities
         self.advertised_capabilities = advertised_capabilities
+        self.probe_results = probe_results
 
         self.behavior = behavior
         self.auth_token: Optional[str] = None
@@ -150,6 +152,8 @@ class SimulatedWorker:
             meta["verified_capabilities"] = dict(self.verified_capabilities)
         if self.advertised_capabilities is not None:
             meta["advertised_capabilities"] = dict(self.advertised_capabilities)
+        if self.probe_results is not None:
+            meta["probe_results"] = dict(self.probe_results)
         return meta
 
     def _check_network(self):
@@ -228,6 +232,12 @@ class SimulatedWorker:
                 "uptime": "simulated"
             }
         }
+        if self.verified_capabilities is not None:
+            payload["verified_capabilities"] = dict(self.verified_capabilities)
+        if self.advertised_capabilities is not None:
+            payload["advertised_capabilities"] = dict(self.advertised_capabilities)
+        if self.probe_results is not None:
+            payload["probe_results"] = dict(self.probe_results)
 
         url = f"{self.controller_url}/heartbeat"
         req = urllib.request.Request(
@@ -628,7 +638,8 @@ class SimulatedCluster:
         capabilities: Optional[Dict[str, Any]] = None,
         behavior: WorkerBehavior = WorkerBehavior.NORMAL,
         verified_capabilities: Optional[Dict[str, Any]] = None,
-        advertised_capabilities: Optional[Dict[str, Any]] = None
+        advertised_capabilities: Optional[Dict[str, Any]] = None,
+        probe_results: Optional[Dict[str, Any]] = None
     ) -> SimulatedWorker:
         """Instantiates and registers a simulated worker in the cluster."""
         worker = SimulatedWorker(
@@ -642,7 +653,8 @@ class SimulatedCluster:
             capabilities=capabilities,
             behavior=behavior,
             verified_capabilities=verified_capabilities,
-            advertised_capabilities=advertised_capabilities
+            advertised_capabilities=advertised_capabilities,
+            probe_results=probe_results
         )
         self.workers[worker.node_id] = worker
         return worker

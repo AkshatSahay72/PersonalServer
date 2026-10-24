@@ -43,6 +43,7 @@ from agent.job_executor import (
     detect_container_runtime,
     is_docker_daemon_ready
 )
+from agent.capability_prober import run_capability_probes
 
 
 class LocalWorkerError(Exception):
@@ -209,10 +210,14 @@ class LocalWorker:
         self.heartbeat_interval = heartbeat_interval
         self.poll_interval = poll_interval
 
-        # Capability detection
-        self.capabilities = self._detect_capabilities()
+        # Capability detection & verification probes
+        self.advertised_capabilities = self._detect_capabilities()
+        probe_data = run_capability_probes(self.advertised_capabilities)
+        self.capabilities = probe_data["advertised_capabilities"]
+        self.verified_capabilities = probe_data["verified_capabilities"]
+        self.probe_results = probe_data["probe_results"]
         self.supported_workloads = set(BASE_SUPPORTED_WORKLOADS)
-        if self.capabilities.get("container_runtime:docker"):
+        if self.verified_capabilities.get("container_runtime:docker") or self.capabilities.get("container_runtime:docker"):
             self.supported_workloads.update(DOCKER_WORKLOADS)
 
         # Background thread control
@@ -294,6 +299,9 @@ class LocalWorker:
             "ram_mb": hw["ram_mb"],
             "storage_gb": hw["storage_gb"],
             "capabilities": dict(self.capabilities),
+            "advertised_capabilities": dict(self.advertised_capabilities),
+            "verified_capabilities": dict(self.verified_capabilities),
+            "probe_results": dict(self.probe_results),
             "supported_workloads": sorted(list(self.supported_workloads))
         }
 
@@ -400,11 +408,22 @@ class LocalWorker:
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             hw = probe_hardware_resources()
 
+            # Periodically refresh capability verification probes
+            try:
+                probe_data = run_capability_probes(self.advertised_capabilities)
+                self.verified_capabilities = probe_data["verified_capabilities"]
+                self.probe_results = probe_data["probe_results"]
+            except Exception:
+                pass
+
             payload = {
                 "node_id": self.node_id,
                 "status": "online",
                 "timestamp": now_iso,
                 "capabilities": dict(self.capabilities),
+                "advertised_capabilities": dict(self.advertised_capabilities),
+                "verified_capabilities": dict(self.verified_capabilities),
+                "probe_results": dict(self.probe_results),
                 "services": {"local_worker": "running"},
                 "workloads": {"active_jobs": 0},
                 "system": {
