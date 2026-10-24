@@ -564,8 +564,8 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
 
         if target_lower.startswith(("capability:", "cap:")):
             is_cap_target = True
-            cap_name = target_str.split(":", 1)[1].strip()
-            if cap_name:
+            cap_names = [c.strip() for c in target_str.split(":", 1)[1].split(",") if c.strip()]
+            for cap_name in cap_names:
                 req_caps = requirements.setdefault("capabilities", [])
                 if isinstance(req_caps, list):
                     if cap_name not in req_caps:

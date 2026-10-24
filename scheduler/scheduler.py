@@ -353,9 +353,16 @@ class ResourceScheduler:
         require_verified = bool(reqs.get("require_verified", False))
 
         # Check required capabilities
-        req_caps = reqs.get("capabilities", [])
-        if isinstance(req_caps, str):
-            req_caps = [req_caps]
+        raw_req_caps = reqs.get("capabilities", [])
+        if isinstance(raw_req_caps, str):
+            req_caps = [c.strip() for c in raw_req_caps.split(",") if c.strip()]
+        else:
+            req_caps = []
+            for c in raw_req_caps:
+                if isinstance(c, str) and "," in c:
+                    req_caps.extend([part.strip() for part in c.split(",") if part.strip()])
+                elif c:
+                    req_caps.append(str(c).strip())
 
         # In standard mode, a capability is supported if present in advertised or verified capabilities
         missing = [c for c in req_caps if not advertised_caps.get(c, False) and not verified_caps.get(c, False)]

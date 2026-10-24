@@ -154,8 +154,8 @@ def instantiate_workflow(
         is_cap_target = target_str.lower().startswith(("capability:", "cap:", "role:"))
         if is_cap_target:
             if target_str.lower().startswith(("capability:", "cap:")):
-                c_name = target_str.split(":", 1)[1].strip()
-                if c_name:
+                c_names = [c.strip() for c in target_str.split(":", 1)[1].split(",") if c.strip()]
+                for c_name in c_names:
                     rc = spec.setdefault("requirements", {}).setdefault("capabilities", [])
                     if isinstance(rc, list):
                         if c_name not in rc:
@@ -246,7 +246,8 @@ def instantiate_workflow(
 def evaluate_workflow_progress(
     workflow: Dict[str, Any],
     jobs_db: Dict[str, Any],
-    artifacts_db: Optional[Dict[str, Any]] = None
+    artifacts_db: Optional[Dict[str, Any]] = None,
+    paths: Optional[Any] = None
 ) -> bool:
     """
     Evaluates step dependencies for a workflow and unblocks ready steps.
@@ -268,7 +269,7 @@ def evaluate_workflow_progress(
     if artifacts_db is None:
         try:
             from controller.stores.artifacts_store import load_artifacts_db
-            artifacts_db = load_artifacts_db()
+            artifacts_db = load_artifacts_db(paths=paths)
         except Exception:
             artifacts_db = {"artifacts": {}}
 
@@ -404,6 +405,8 @@ def evaluate_workflow_progress(
                     job["blocked_reason"] = None
                     t_mode = str(job.get("target", "auto")).lower()
                     if t_mode == "auto" or t_mode.startswith(("capability:", "cap:", "role:")):
+                        job["target_node"] = None
+                        job["assigned_node"] = None
                         job["scheduler"] = {
                             "mode": "capability-pending" if t_mode.startswith(("capability:", "cap:", "role:")) else "resource-aware-pending",
                             "selected_node": None,
@@ -466,7 +469,8 @@ def evaluate_workflow_progress(
 def progress_workflows(
     workflows_db: Dict[str, Any],
     jobs_db: Dict[str, Any],
-    artifacts_db: Optional[Dict[str, Any]] = None
+    artifacts_db: Optional[Dict[str, Any]] = None,
+    paths: Optional[Any] = None
 ) -> bool:
     """
     Evaluates all active workflows in workflows_db against current jobs in jobs_db.
@@ -476,7 +480,7 @@ def progress_workflows(
     for wf in workflows_db.get("workflows", {}).values():
         if wf.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
             continue
-        if evaluate_workflow_progress(wf, jobs_db, artifacts_db=artifacts_db):
+        if evaluate_workflow_progress(wf, jobs_db, artifacts_db=artifacts_db, paths=paths):
             changed = True
     return changed
 

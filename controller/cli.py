@@ -38,7 +38,11 @@ from controller.constants import (
     STATE_REMOVED,
 )
 from controller.ha_helper import get_ha_manager, resolve_controller_node_id
-from controller.lease_sweeper import start_background_lease_sweeper, sweep_expired_leases
+from controller.lease_sweeper import (
+    reconcile_startup_recovery,
+    start_background_lease_sweeper,
+    sweep_expired_leases,
+)
 from controller.node_manager import get_cluster_summary, sanitize_node_record
 from controller.onboarding import (
     DEFAULT_ONBOARDING_TTL_SEC,
@@ -91,12 +95,16 @@ def start_server(host: Optional[str] = None, port: Optional[int] = None, timeout
     handler_class.heartbeat_timeout = timeout
 
     # Recover orphaned jobs from previous shutdown
-    jobs_db = load_jobs_db()
-    nodes_db = load_nodes_db()
-    sweep_expired_leases(jobs_db, nodes_db, timeout)
+    jobs_db = load_jobs_db(paths=paths)
+    nodes_db = load_nodes_db(paths=paths)
+    recovery_summary = reconcile_startup_recovery(jobs_db, nodes_db, timeout, paths=paths)
+    if recovery_summary.get("active_leases_preserved") or recovery_summary.get("expired_leases_swept") or recovery_summary.get("steps_unblocked"):
+        print(f"Startup Recovery: {recovery_summary['active_leases_preserved']} active lease(s) preserved, "
+              f"{recovery_summary['expired_leases_swept']} expired lease(s) recovered, "
+              f"{recovery_summary['steps_unblocked']} workflow step(s) unblocked.")
 
     # Start background lease sweeper thread
-    start_background_lease_sweeper(timeout)
+    start_background_lease_sweeper(timeout, paths=paths)
 
     # Initialize High Availability (HA) Manager
     ha_role = role or os.environ.get("PERSONALSERVER_HA_ROLE", "auto")
