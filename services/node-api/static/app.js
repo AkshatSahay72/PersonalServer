@@ -551,14 +551,14 @@ function resolveLeaderInfo(ha) {
   if (regNode) {
     isRegistered = true;
     leaderName = regNode.name || regNode.hostname || regNode.node_id;
-    isOnline = (regNode.status || "").toUpperCase() === "ONLINE";
+    isOnline = (regNode.status || "").toUpperCase() === "ONLINE" || ha.leader_online === true || (ha.role === "leader" && ha.lease_valid !== false);
   } else if (backendName && backendName !== rawLeaderId) {
     leaderName = backendName;
     isRegistered = ha.leader_registered !== false;
-    isOnline = ha.leader_online === true;
+    isOnline = ha.leader_online === true || (ha.role === "leader" && ha.lease_valid !== false);
   } else if (ha.leader_registered === true) {
     isRegistered = true;
-    isOnline = ha.leader_online === true;
+    isOnline = ha.leader_online === true || (ha.role === "leader" && ha.lease_valid !== false);
     if (ha.leader_name) leaderName = ha.leader_name;
   }
 
@@ -1096,6 +1096,10 @@ async function loadNodes() {
     const onlineCount = cachedNodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
     const countHdr = document.getElementById("nodes-count-header");
     if (countHdr) countHdr.textContent = `${onlineCount} online · ${cachedNodes.length} total`;
+    const topbarStatus = document.getElementById("topbar-cluster-status");
+    if (topbarStatus) topbarStatus.textContent = `${onlineCount} online`;
+    const sideStatus = document.getElementById("side-cluster-online");
+    if (sideStatus) sideStatus.textContent = `${onlineCount} online`;
     if (cachedHAStatus) renderHAHeader(cachedHAStatus);
 
     if (targetSelect) {

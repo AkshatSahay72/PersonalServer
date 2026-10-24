@@ -107,7 +107,7 @@ def resolve_target_node_endpoint(node_param):
 
     # Dynamic lookup from controller to prevent arbitrary SSRF
     try:
-        controller_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+        controller_url = get_configured_controller_url()
         req = urllib.request.Request(f"{controller_url}/nodes", headers={"User-Agent": "PersonalServer-NodeAPI/1.0"})
         with urllib.request.urlopen(req, timeout=2) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -131,7 +131,7 @@ def resolve_target_node_endpoint(node_param):
 
 def get_cluster_storage_nodes():
     config = load_config()
-    controller_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+    controller_url = get_configured_controller_url()
     local_node_id = config.get("NODE_ID", config.get("node_id", "server-5387a86bf36116b1"))
     local_node_name = config.get("NODE_NAME", config.get("name", "vivo-y31"))
 
@@ -277,6 +277,33 @@ def load_config():
     return config
 
 
+def get_configured_controller_url():
+    """Resolves controller URL following registration state, controller.json, config, or default."""
+    try:
+        reg_file = RUNTIME_DIR / "registration.json"
+        if reg_file.exists():
+            with open(reg_file, "r", encoding="utf-8") as f:
+                reg_state = json.load(f)
+                if reg_state.get("controller_url"):
+                    return reg_state["controller_url"].rstrip("/")
+    except Exception:
+        pass
+
+    try:
+        ctrl_json = BASE_DIR / "config" / "controller.json"
+        if ctrl_json.exists():
+            with open(ctrl_json, "r", encoding="utf-8") as f:
+                cj = json.load(f)
+                if cj.get("url"):
+                    return cj["url"].rstrip("/")
+    except Exception:
+        pass
+
+    config = load_config()
+    if config.get("CONTROLLER_URL"):
+        return config["CONTROLLER_URL"].rstrip("/")
+
+    return DEFAULT_CONTROLLER_URL.rstrip("/")
 
 
 def command(cmd):
@@ -579,8 +606,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
     def proxy_to_controller(self, method, subpath, query_str="", body_bytes=None):
         global _CACHED_ACTIVE_CONTROLLER_URL
-        config = load_config()
-        configured_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+        configured_url = get_configured_controller_url()
         with _CONTROLLER_URL_LOCK:
             cached_url = _CACHED_ACTIVE_CONTROLLER_URL
         controller_url = cached_url or configured_url
@@ -1670,8 +1696,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # 8. Services Status: GET /api/services
         if path == "/api/services":
-            config = load_config()
-            controller_url = (config.get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+            controller_url = get_configured_controller_url()
             controller_connected = False
             try:
                 with urllib.request.urlopen(f"{controller_url}/health", timeout=2) as r:
@@ -2340,9 +2365,8 @@ def start_heartbeat_reporter(interval_seconds=15):
                 if reg_file.exists():
                     with open(reg_file, "r", encoding="utf-8") as f:
                         reg_state = json.load(f)
-                    
                     if reg_state.get("registered") and reg_state.get("auth_token"):
-                        controller_url = (reg_state.get("controller_url") or load_config().get("CONTROLLER_URL") or DEFAULT_CONTROLLER_URL).rstrip("/")
+                        controller_url = get_configured_controller_url()
                         auth_token = reg_state.get("auth_token")
                         node_id = reg_state.get("node_id")
 
