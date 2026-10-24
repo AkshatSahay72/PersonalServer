@@ -292,6 +292,8 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
             "storage": True,
             "network": True
         })
+        verified_capabilities = body.get("verified_capabilities", {})
+        advertised_capabilities = body.get("advertised_capabilities") or capabilities
 
         nodes_db = load_nodes_db()
         now = get_current_iso_timestamp()
@@ -313,6 +315,8 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
             "architecture": arch,
             "resources": resources,
             "capabilities": capabilities,
+            "verified_capabilities": verified_capabilities,
+            "advertised_capabilities": advertised_capabilities,
             "auth_token": node_auth_token,
             "ip": (body.get("ip") or body.get("tailscale_ip") or client_ip),
             "status": STATE_ONLINE,
@@ -389,6 +393,12 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
 
         if "capabilities" in body and isinstance(body["capabilities"], dict):
             node_entry.setdefault("capabilities", {}).update(body["capabilities"])
+
+        if "verified_capabilities" in body and isinstance(body["verified_capabilities"], dict):
+            node_entry.setdefault("verified_capabilities", {}).update(body["verified_capabilities"])
+
+        if "advertised_capabilities" in body and isinstance(body["advertised_capabilities"], dict):
+            node_entry.setdefault("advertised_capabilities", {}).update(body["advertised_capabilities"])
 
         if "resources" in body and isinstance(body["resources"], dict):
             node_entry.setdefault("resources", {}).update(body["resources"])

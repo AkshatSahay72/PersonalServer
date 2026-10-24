@@ -89,7 +89,9 @@ class SimulatedWorker:
         architecture: str = "amd64",
         resources: Optional[Dict[str, Any]] = None,
         capabilities: Optional[Dict[str, Any]] = None,
-        behavior: WorkerBehavior = WorkerBehavior.NORMAL
+        behavior: WorkerBehavior = WorkerBehavior.NORMAL,
+        verified_capabilities: Optional[Dict[str, Any]] = None,
+        advertised_capabilities: Optional[Dict[str, Any]] = None
     ):
         # Guarantee logical node ID clearly marks worker as simulated
         if not (node_id.startswith("sim-node-") or node_id.startswith("sim-")):
@@ -116,6 +118,8 @@ class SimulatedWorker:
             "network": True,
             "container_runtime:docker": False
         }
+        self.verified_capabilities = verified_capabilities
+        self.advertised_capabilities = advertised_capabilities
 
         self.behavior = behavior
         self.auth_token: Optional[str] = None
@@ -130,7 +134,7 @@ class SimulatedWorker:
 
     def get_metadata(self) -> Dict[str, Any]:
         """Returns registration payload."""
-        return {
+        meta = {
             "node_id": self.node_id,
             "name": self.name,
             "role": self.role,
@@ -142,6 +146,11 @@ class SimulatedWorker:
             "storage_gb": int(self.resources.get("storage_gb", 100)),
             "capabilities": dict(self.capabilities)
         }
+        if self.verified_capabilities is not None:
+            meta["verified_capabilities"] = dict(self.verified_capabilities)
+        if self.advertised_capabilities is not None:
+            meta["advertised_capabilities"] = dict(self.advertised_capabilities)
+        return meta
 
     def _check_network(self):
         """Simulates network drop or partition."""
@@ -617,7 +626,9 @@ class SimulatedCluster:
         architecture: str = "amd64",
         resources: Optional[Dict[str, Any]] = None,
         capabilities: Optional[Dict[str, Any]] = None,
-        behavior: WorkerBehavior = WorkerBehavior.NORMAL
+        behavior: WorkerBehavior = WorkerBehavior.NORMAL,
+        verified_capabilities: Optional[Dict[str, Any]] = None,
+        advertised_capabilities: Optional[Dict[str, Any]] = None
     ) -> SimulatedWorker:
         """Instantiates and registers a simulated worker in the cluster."""
         worker = SimulatedWorker(
@@ -629,7 +640,9 @@ class SimulatedCluster:
             architecture=architecture,
             resources=resources,
             capabilities=capabilities,
-            behavior=behavior
+            behavior=behavior,
+            verified_capabilities=verified_capabilities,
+            advertised_capabilities=advertised_capabilities
         )
         self.workers[worker.node_id] = worker
         return worker

@@ -551,12 +551,32 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             return True
 
         target = body.get("target") or body.get("target_node") or "auto"
+        target_str = str(target).strip()
+        is_cap_target = False
+        target_lower = target_str.lower()
+
         job_type = body.get("type")
         job_name = body.get("name", job_type or "job")
         timeout_sec = int(body.get("timeout", 60))
         max_attempts = int(body.get("max_attempts", 3))
         parameters = body.get("parameters") or body.get("params") or {}
         requirements = body.get("requirements", {}) or {}
+
+        if target_lower.startswith(("capability:", "cap:")):
+            is_cap_target = True
+            cap_name = target_str.split(":", 1)[1].strip()
+            if cap_name:
+                req_caps = requirements.setdefault("capabilities", [])
+                if isinstance(req_caps, list):
+                    if cap_name not in req_caps:
+                        req_caps.append(cap_name)
+                elif isinstance(req_caps, str):
+                    requirements["capabilities"] = [req_caps, cap_name] if req_caps != cap_name else [cap_name]
+        elif target_lower.startswith("role:"):
+            is_cap_target = True
+            role_name = target_str.split(":", 1)[1].strip()
+            if role_name:
+                requirements["role"] = role_name
 
         # Privileged capability check: allow_internal and privileged requirements require admin credentials
         is_admin = constant_time_compare(token, enrollment_token)
@@ -586,18 +606,19 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         target_node = None
         scheduler_info = None
 
-        # Path A: Automatic Resource-Aware Scheduling
+        # Path A: Automatic / Capability-Based Resource-Aware Scheduling
         jobs_db = load_jobs_db()
         waiting_reason = None
         initial_status = JOB_STATE_QUEUED
 
-        if target.lower() == "auto":
+        if target_lower == "auto" or is_cap_target:
             decision = ResourceScheduler.select_node(
                 requirements,
                 nodes_db,
                 handler.heartbeat_timeout,
                 cluster_jobs=jobs_db.get("jobs", {})
             )
+            mode_prefix = "capability-aware" if is_cap_target else "resource-aware"
             if not decision["selected_node"]:
                 if body.get("fail_if_no_nodes", False):
                     handler.send_json(400, {
@@ -608,7 +629,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     return True
                 target_node = None
                 scheduler_info = {
-                    "mode": "resource-aware-pending",
+                    "mode": f"{mode_prefix}-pending",
                     "selected_node": None,
                     "score": 0,
                     "reason": decision["reason"],
@@ -619,13 +640,13 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             else:
                 target_node = decision["selected_node"]
                 scheduler_info = {
-                    "mode": "resource-aware",
+                    "mode": mode_prefix,
                     "selected_node": target_node,
                     "score": decision["score"],
                     "reason": decision["reason"],
                     "candidates_count": len(decision["candidates"])
                 }
-                print(f"[CONTROLLER-SCHEDULER] Auto-selected node '{target_node}': {decision['reason']}")
+                print(f"[CONTROLLER-SCHEDULER] {mode_prefix.capitalize()}-selected node '{target_node}': {decision['reason']}")
 
         # Path B: Explicit Target Node (Preserves explicit target policy)
         else:

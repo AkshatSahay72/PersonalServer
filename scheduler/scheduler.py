@@ -271,6 +271,51 @@ def extract_node_telemetry(node, status=None, node_jobs=None):
     }
 
 
+def extract_node_capabilities(node: Dict[str, Any]) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+    """
+    Extracts (advertised_capabilities, verified_capabilities) from a node record.
+    Distinguishes advertised capabilities from capabilities actually verified by the worker.
+    Mere reporting in capabilities does not classify as verified unless explicitly verified.
+    """
+    advertised: Dict[str, bool] = {}
+    verified: Dict[str, bool] = {}
+
+    if not node or not isinstance(node, dict):
+        return advertised, verified
+
+    # 1. Parse advertised / reported capabilities
+    raw_caps = node.get("advertised_capabilities")
+    if raw_caps is None:
+        raw_caps = node.get("capabilities", {})
+
+    if isinstance(raw_caps, list):
+        for c in raw_caps:
+            advertised[str(c)] = True
+    elif isinstance(raw_caps, dict):
+        for k, v in raw_caps.items():
+            if isinstance(v, dict):
+                advertised[str(k)] = bool(v.get("enabled", True) if "enabled" in v else v.get("advertised", True))
+                if v.get("verified") is True:
+                    verified[str(k)] = True
+            else:
+                advertised[str(k)] = bool(v)
+
+    # 2. Parse verified capabilities
+    raw_verified = node.get("verified_capabilities")
+    if isinstance(raw_verified, list):
+        for c in raw_verified:
+            verified[str(c)] = True
+    elif isinstance(raw_verified, dict):
+        for k, v in raw_verified.items():
+            if isinstance(v, dict):
+                if v.get("verified") is True:
+                    verified[str(k)] = True
+            elif bool(v):
+                verified[str(k)] = True
+
+    return advertised, verified
+
+
 class ResourceScheduler:
     """
     Deterministic, resource-aware scheduler that filters eligible nodes
@@ -288,6 +333,9 @@ class ResourceScheduler:
             return False, "Node record is missing or invalid"
 
         reqs = job_requirements or {}
+        if "requirements" in reqs and isinstance(reqs.get("requirements"), dict):
+            reqs = reqs["requirements"]
+
         liveness = compute_node_liveness(node, timeout_seconds)
         node_status = node.get("status")
         if liveness in (STATE_REMOVED, STATE_DRAINING, STATE_DEBOARDING, STATE_OFFLINE, STATE_UNHEALTHY, STATE_UNKNOWN) or node_status in (STATE_REMOVED, STATE_DRAINING, STATE_DEBOARDING):
@@ -300,25 +348,50 @@ class ResourceScheduler:
             if node_role != req_role.lower() and node_role != "hybrid":
                 return False, f"Role mismatch: node is '{node_role}', required '{req_role}'"
 
-        # 2. Capabilities
+        # 2. Capabilities (Advertised vs Verified)
+        advertised_caps, verified_caps = extract_node_capabilities(node)
+        require_verified = bool(reqs.get("require_verified", False))
+
+        # Check required capabilities
         req_caps = reqs.get("capabilities", [])
         if isinstance(req_caps, str):
             req_caps = [req_caps]
-        node_caps = node.get("capabilities", {})
-        if isinstance(node_caps, list):
-            has_cap = lambda c: c in node_caps
-        elif isinstance(node_caps, dict):
-            has_cap = lambda c: bool(node_caps.get(c, False))
-        else:
-            has_cap = lambda c: False
 
-        missing = [c for c in req_caps if not has_cap(c)]
+        # In standard mode, a capability is supported if present in advertised or verified capabilities
+        missing = [c for c in req_caps if not advertised_caps.get(c, False) and not verified_caps.get(c, False)]
         if missing:
             return False, f"Missing required capabilities: {missing}"
 
+        # If require_verified is requested, all capabilities in 'capabilities' must be verified
+        if require_verified:
+            unverified = [c for c in req_caps if not verified_caps.get(c, False)]
+            if unverified:
+                return False, f"Capabilities advertised but unverified by worker: {unverified}"
+
+        # Explicit verified_capabilities requirement
+        req_verified = reqs.get("verified_capabilities", [])
+        if isinstance(req_verified, str):
+            req_verified = [req_verified]
+        missing_verified = [c for c in req_verified if not verified_caps.get(c, False)]
+        if missing_verified:
+            adv_unverified = [c for c in missing_verified if advertised_caps.get(c, False)]
+            if adv_unverified:
+                return False, f"Capabilities advertised but unverified by worker: {adv_unverified}"
+            return False, f"Missing required verified capabilities: {missing_verified}"
+
+        # Any capabilities (at least one must match)
         req_any = reqs.get("any_capabilities")
-        if req_any and isinstance(req_any, list) and not any(has_cap(c) for c in req_any):
-            return False, f"Missing any of required capabilities: {req_any}"
+        if req_any and isinstance(req_any, list):
+            check_caps = verified_caps if require_verified else {**advertised_caps, **verified_caps}
+            if not any(check_caps.get(c, False) for c in req_any):
+                if require_verified:
+                    return False, f"Missing any of required verified capabilities: {req_any}"
+                return False, f"Missing any of required capabilities: {req_any}"
+
+        req_any_verified = reqs.get("any_verified_capabilities")
+        if req_any_verified and isinstance(req_any_verified, list):
+            if not any(verified_caps.get(c, False) for c in req_any_verified):
+                return False, f"Missing any of required verified capabilities: {req_any_verified}"
 
         # 3. Architecture & Platform
         node_raw_arch = node.get("architecture") or node.get("system", {}).get("arch") or node.get("system", {}).get("architecture", "")

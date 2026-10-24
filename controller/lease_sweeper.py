@@ -121,15 +121,17 @@ def sweep_expired_leases(
                     job["retry_after"] = now_epoch + backoff_sec
                     job["retry_after_iso"] = datetime.fromtimestamp(now_epoch + backoff_sec, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                    target_mode = job.get("target", "auto")
-                    if target_mode == "auto":
+                    target_mode = str(job.get("target", "auto")).lower()
+                    is_dynamic_target = (target_mode == "auto" or target_mode.startswith(("capability:", "cap:", "role:")))
+                    if is_dynamic_target:
                         reqs = job.get("requirements", {})
                         decision = ResourceScheduler.select_node(reqs, nodes_db, timeout_seconds, cluster_jobs=jobs_db.get("jobs", {}))
                         if decision.get("selected_node"):
                             job["target_node"] = decision["selected_node"]
                             job["assigned_node"] = decision["selected_node"]
+                            mode_name = "capability-aware-recovery" if target_mode.startswith(("capability:", "cap:", "role:")) else "resource-aware-recovery"
                             job["scheduler"] = {
-                                "mode": "resource-aware-recovery",
+                                "mode": mode_name,
                                 "selected_node": decision["selected_node"],
                                 "score": decision["score"],
                                 "reason": f"Recovered from {target_node} ({reason})"
@@ -139,11 +141,11 @@ def sweep_expired_leases(
                             job["assigned_node"] = None
                             job["waiting_reason"] = f"Awaiting eligible worker for recovery retry: {decision.get('reason')}"
                     else:
-                        job["target_node"] = target_mode
+                        job["target_node"] = job.get("target")
                         job["scheduler"] = {
                             "mode": "explicit-recovery",
-                            "target_node": target_mode,
-                            "reason": f"Awaiting recovery on explicit target {target_mode}"
+                            "target_node": job.get("target"),
+                            "reason": f"Awaiting recovery on explicit target {job.get('target')}"
                         }
 
                     controller_logger.info(
@@ -182,8 +184,10 @@ def sweep_expired_leases(
 
                 changed = True
 
-        # B: Queued & Recovering Auto Jobs (Evaluate newly eligible workers)
-        elif canon_status in (JOB_STATE_QUEUED, JOB_STATE_RETRY_WAIT) and not target_node and job.get("target", "auto") == "auto":
+        # B: Queued & Recovering Auto / Capability Jobs (Evaluate newly eligible workers)
+        target_mode = str(job.get("target", "auto")).lower()
+        is_dynamic_target = (target_mode == "auto" or target_mode.startswith(("capability:", "cap:", "role:")))
+        if canon_status in (JOB_STATE_QUEUED, JOB_STATE_RETRY_WAIT) and not target_node and is_dynamic_target:
             decision = ResourceScheduler.select_node(
                 job.get("requirements", {}),
                 nodes_db,
@@ -195,8 +199,9 @@ def sweep_expired_leases(
                 job["target_node"] = sel_node
                 job["assigned_node"] = sel_node
                 job["waiting_reason"] = None
+                mode_name = "capability-aware" if target_mode.startswith(("capability:", "cap:", "role:")) else "resource-aware"
                 job["scheduler"] = {
-                    "mode": "resource-aware",
+                    "mode": mode_name,
                     "selected_node": sel_node,
                     "score": decision["score"],
                     "reason": decision["reason"],
@@ -212,8 +217,8 @@ def sweep_expired_leases(
                         job["scheduler"]["rejected"] = decision.get("rejected", {})
                     changed = True
 
-        # B2: Recovering Auto Jobs with Offline Target (Reset target so another worker can claim)
-        elif canon_status == JOB_STATE_RETRY_WAIT and target_node and job.get("target", "auto") == "auto":
+        # B2: Recovering Auto / Capability Jobs with Offline Target (Reset target so another worker can claim)
+        elif canon_status == JOB_STATE_RETRY_WAIT and target_node and is_dynamic_target:
             if node_live in (STATE_OFFLINE, STATE_REMOVED):
                 job["target_node"] = None
                 job["assigned_node"] = None

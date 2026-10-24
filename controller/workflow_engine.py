@@ -150,12 +150,30 @@ def instantiate_workflow(
         waiting_reason = "Waiting for dependencies to complete" if depends_on_steps else None
 
         target_val = spec.get("target") or spec.get("target_node") or "auto"
-        explicit_target_node = spec.get("target_node") if (spec.get("target_node") and spec.get("target_node") != "auto") else (spec.get("target") if (spec.get("target") and spec.get("target") != "auto") else None)
+        target_str = str(target_val).strip()
+        is_cap_target = target_str.lower().startswith(("capability:", "cap:", "role:"))
+        if is_cap_target:
+            if target_str.lower().startswith(("capability:", "cap:")):
+                c_name = target_str.split(":", 1)[1].strip()
+                if c_name:
+                    rc = spec.setdefault("requirements", {}).setdefault("capabilities", [])
+                    if isinstance(rc, list):
+                        if c_name not in rc:
+                            rc.append(c_name)
+                    elif isinstance(rc, str):
+                        spec["requirements"]["capabilities"] = [rc, c_name] if rc != c_name else [c_name]
+            elif target_str.lower().startswith("role:"):
+                r_name = target_str.split(":", 1)[1].strip()
+                if r_name:
+                    spec.setdefault("requirements", {})["role"] = r_name
+
+        is_dynamic = (target_str.lower() == "auto" or is_cap_target)
+        explicit_target_node = None if is_dynamic else (spec.get("target_node") or spec.get("target"))
 
         scheduler_meta = None
-        if target_val == "auto" and not explicit_target_node:
+        if is_dynamic:
             scheduler_meta = {
-                "mode": "resource-aware-pending",
+                "mode": "capability-pending" if is_cap_target else "resource-aware-pending",
                 "selected_node": None,
                 "reason": "Awaiting eligible worker" if not depends_on_steps else "Awaiting dependencies before scheduling"
             }
@@ -384,9 +402,10 @@ def evaluate_workflow_progress(
                     job["state"] = JOB_STATE_QUEUED
                     job["waiting_reason"] = None
                     job["blocked_reason"] = None
-                    if job.get("target") == "auto":
+                    t_mode = str(job.get("target", "auto")).lower()
+                    if t_mode == "auto" or t_mode.startswith(("capability:", "cap:", "role:")):
                         job["scheduler"] = {
-                            "mode": "resource-aware-pending",
+                            "mode": "capability-pending" if t_mode.startswith(("capability:", "cap:", "role:")) else "resource-aware-pending",
                             "selected_node": None,
                             "reason": "Awaiting eligible worker"
                         }
