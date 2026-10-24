@@ -537,7 +537,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         job_name = body.get("name", job_type or "job")
         timeout_sec = int(body.get("timeout", 60))
         max_attempts = int(body.get("max_attempts", 3))
-        parameters = body.get("parameters", {}) or {}
+        parameters = body.get("parameters") or body.get("params") or {}
         requirements = body.get("requirements", {}) or {}
 
         # Privileged capability check: allow_internal and privileged requirements require admin credentials
