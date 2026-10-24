@@ -381,7 +381,8 @@ class StagingCanaryTest(unittest.TestCase):
             "/artifacts/upload",
             {
                 "filename": "cross_node.bin",
-                "content_base64": base64.b64encode(payload).decode("ascii")
+                "content_base64": base64.b64encode(payload).decode("ascii"),
+                "authorized_nodes": [self.worker2_id]
             },
             token=self.worker1_token
         )

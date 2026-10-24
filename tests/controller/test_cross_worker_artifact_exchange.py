@@ -341,6 +341,92 @@ class TestArtifactHttpRoutesSecurity(unittest.TestCase):
         matching = [a for a in artifacts_db.get("artifacts", {}).values() if a.get("job_id") == "job-retry-1"]
         self.assertEqual(len(matching), 1)
 
+    def test_06_adhoc_artifact_producer_authorized_peer_rejected(self):
+        """Ad-hoc artifact without workflow ID is accessible to producer and admin, but blocked for peer nodes."""
+        payload = b"Ad-hoc node artifact data."
+        sha = hashlib.sha256(payload).hexdigest()
+
+        # Producer server-vivo-111 uploads ad-hoc artifact (no workflow_id)
+        self.handler.rfile = io.BytesIO(payload)
+        self.handler.headers = {
+            "Content-Length": str(len(payload)),
+            "X-Artifact-Filename": "adhoc.bin",
+            "X-Artifact-Sha256": sha,
+            "X-Job-Id": "job-adhoc-1"
+        }
+        self.handler.get_authenticated_node_id.return_value = "server-vivo-111"
+        handle_job_post(self.handler, "/artifacts/upload/raw", None, token="token-vivo-111", query={})
+        self.assertEqual(self.handler.send_json.call_args[0][0], 201)
+        art_id = self.handler.send_json.call_args[0][1]["artifact"]["artifact_id"]
+
+        # 1. Producer node accesses its own artifact metadata -> 200 OK
+        self.handler.reset_mock()
+        self.handler.get_authenticated_node_id.return_value = "server-vivo-111"
+        self.handler.parse_auth_token.return_value = "token-vivo-111"
+        handle_job_get(self.handler, f"/artifacts/{art_id}/metadata", query={})
+        self.assertEqual(self.handler.send_json.call_args[0][0], 200)
+
+        # 2. Peer node (server-realme-222) attempts to access metadata -> 403 Forbidden
+        self.handler.reset_mock()
+        self.handler.get_authenticated_node_id.return_value = "server-realme-222"
+        self.handler.parse_auth_token.return_value = "token-realme-222"
+        handle_job_get(self.handler, f"/artifacts/{art_id}/metadata", query={})
+        self.assertEqual(self.handler.send_json.call_args[0][0], 403)
+        self.assertIn("not producer or authorized node", self.handler.send_json.call_args[0][1]["error"])
+
+        # 3. Peer node (server-realme-222) attempts download -> 403 Forbidden
+        self.handler.reset_mock()
+        handle_job_get(self.handler, f"/artifacts/{art_id}/download", query={})
+        self.assertEqual(self.handler.send_json.call_args[0][0], 403)
+        self.assertIn("not producer or authorized node", self.handler.send_json.call_args[0][1]["error"])
+
+        # 4. Administrator token accesses download -> permitted (send_response 200)
+        self.handler.reset_mock()
+        self.handler.is_authenticated_admin.return_value = True
+        self.handler.parse_auth_token.return_value = self.enrollment_token
+        dl_ok = handle_job_get(self.handler, f"/artifacts/{art_id}/download", query={})
+        self.assertTrue(dl_ok)
+        self.handler.send_response.assert_called_with(200)
+
+    def test_07_adhoc_artifact_explicitly_authorized_peer_allowed(self):
+        """Ad-hoc artifact with explicit authorized_nodes grants access to listed peer, blocks others."""
+        payload = b"Shared ad-hoc data."
+        sha = hashlib.sha256(payload).hexdigest()
+
+        # Producer uploads artifact with authorized_nodes set
+        self.handler.rfile = io.BytesIO(payload)
+        self.handler.headers = {
+            "Content-Length": str(len(payload)),
+            "X-Artifact-Filename": "shared_adhoc.bin",
+            "X-Artifact-Sha256": sha,
+            "X-Job-Id": "job-adhoc-2"
+        }
+        self.handler.get_authenticated_node_id.return_value = "server-vivo-111"
+        self.handler.is_authenticated_admin.return_value = False
+        handle_job_post(self.handler, "/artifacts/upload/raw", None, token="token-vivo-111", query={})
+        art_id = self.handler.send_json.call_args[0][1]["artifact"]["artifact_id"]
+
+        # Add server-realme-222 to authorized_nodes
+        artifacts_db = load_artifacts_db()
+        artifacts_db["artifacts"][art_id]["authorized_nodes"] = ["server-realme-222"]
+        from controller.stores import save_artifacts_db
+        save_artifacts_db(artifacts_db)
+
+        # Authorized peer server-realme-222 accesses download -> 200 OK
+        self.handler.reset_mock()
+        self.handler.get_authenticated_node_id.return_value = "server-realme-222"
+        self.handler.parse_auth_token.return_value = "token-realme-222"
+        handle_job_get(self.handler, f"/artifacts/{art_id}/download", query={})
+        self.handler.send_response.assert_called_with(200)
+
+        # Unauthorized peer server-unauth-333 attempts download -> 403 Forbidden
+        self.handler.reset_mock()
+        self.handler.get_authenticated_node_id.return_value = "server-unauth-333"
+        self.handler.parse_auth_token.return_value = "token-attacker-333"
+        handle_job_get(self.handler, f"/artifacts/{art_id}/download", query={})
+        self.assertEqual(self.handler.send_json.call_args[0][0], 403)
+
+
 
 class TestWorkflowDAGArtifactProgression(unittest.TestCase):
     """Test DAG input/output dependency binding and progression."""

@@ -202,19 +202,38 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
             handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
             return True
 
-        if not constant_time_compare(token, enrollment_token):
+        is_admin = False
+        if hasattr(handler, "is_authenticated_admin"):
+            admin_val = handler.is_authenticated_admin()
+            if isinstance(admin_val, bool):
+                is_admin = admin_val
+        if not is_admin:
+            is_admin = constant_time_compare(token, enrollment_token)
+
+        if not is_admin:
             caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
             if not caller_node_id:
                 handler.send_json(401, {"error": "Unauthorized: Node credentials invalid"})
                 return True
             art_wf_id = art.get("workflow_id")
             authorized_nodes = art.get("authorized_nodes", [])
+            producing_node = art.get("producing_node")
+            if not producing_node and art.get("job_id"):
+                jobs_db = load_jobs_db()
+                j = jobs_db.get("jobs", {}).get(art["job_id"], {})
+                producing_node = j.get("assigned_node") or j.get("target_node")
+
             if art_wf_id:
                 jobs_db = load_jobs_db()
                 wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == art_wf_id]
                 node_in_wf = any(j.get("assigned_node") == caller_node_id or j.get("target_node") == caller_node_id for j in wf_jobs)
-                if not node_in_wf and caller_node_id not in authorized_nodes and art.get("producing_node") != caller_node_id:
+                if not node_in_wf and caller_node_id not in authorized_nodes and producing_node != caller_node_id:
                     handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifacts for workflow '{art_wf_id}'"})
+                    return True
+            else:
+                # Ad-hoc artifact without workflow: restrict to producing node or explicitly authorized nodes
+                if caller_node_id != producing_node and caller_node_id not in authorized_nodes:
+                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifact '{art_id}' (not producer or authorized node)"})
                     return True
 
         is_valid = verify_artifact_integrity(art)
@@ -237,20 +256,40 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
             handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
             return True
 
-        if not constant_time_compare(token, enrollment_token):
+        is_admin = False
+        if hasattr(handler, "is_authenticated_admin"):
+            admin_val = handler.is_authenticated_admin()
+            if isinstance(admin_val, bool):
+                is_admin = admin_val
+        if not is_admin:
+            is_admin = constant_time_compare(token, enrollment_token)
+
+        if not is_admin:
             caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
             if not caller_node_id:
                 handler.send_json(401, {"error": "Unauthorized: Node credentials invalid"})
                 return True
             art_wf_id = art.get("workflow_id")
             authorized_nodes = art.get("authorized_nodes", [])
+            producing_node = art.get("producing_node")
+            if not producing_node and art.get("job_id"):
+                jobs_db = load_jobs_db()
+                j = jobs_db.get("jobs", {}).get(art["job_id"], {})
+                producing_node = j.get("assigned_node") or j.get("target_node")
+
             if art_wf_id:
                 jobs_db = load_jobs_db()
                 wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == art_wf_id]
                 node_in_wf = any(j.get("assigned_node") == caller_node_id or j.get("target_node") == caller_node_id for j in wf_jobs)
-                if not node_in_wf and caller_node_id not in authorized_nodes and art.get("producing_node") != caller_node_id:
+                if not node_in_wf and caller_node_id not in authorized_nodes and producing_node != caller_node_id:
                     handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifacts for workflow '{art_wf_id}'"})
                     return True
+            else:
+                # Ad-hoc artifact without workflow: restrict to producing node or explicitly authorized nodes
+                if caller_node_id != producing_node and caller_node_id not in authorized_nodes:
+                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifact '{art_id}' (not producer or authorized node)"})
+                    return True
+
 
         file_path = art.get("path")
         if not file_path or not os.path.exists(file_path):
@@ -1024,6 +1063,8 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 for art in reported_artifacts:
                     if isinstance(art, dict) and art.get("artifact_id"):
                         art["job_id"] = job_id
+                        if not art.get("producing_node"):
+                            art["producing_node"] = target_node
                         artifacts_db.setdefault("artifacts", {})[art["artifact_id"]] = art
                 save_artifacts_db(artifacts_db)
             except Exception as e:
@@ -1335,6 +1376,19 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         except Exception as e:
             handler.send_json(500, {"error": f"Failed to store artifact: {e}"})
             return True
+
+        caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
+        if isinstance(caller_node_id, str):
+            art_record["producing_node"] = caller_node_id
+        elif job_id:
+            jobs_db = load_jobs_db()
+            j = jobs_db.get("jobs", {}).get(job_id, {})
+            if j.get("assigned_node"):
+                art_record["producing_node"] = j.get("assigned_node")
+
+        auth_nodes = body.get("authorized_nodes") or metadata.get("authorized_nodes")
+        if auth_nodes and isinstance(auth_nodes, list):
+            art_record["authorized_nodes"] = [str(n) for n in auth_nodes]
 
         artifacts_db = load_artifacts_db()
         artifacts_db.setdefault("artifacts", {})[art_id] = art_record
