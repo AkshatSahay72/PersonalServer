@@ -12,6 +12,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from common.artifact_manager import cleanup_orphan_staging_artifacts
 from common.time_utils import get_current_iso_timestamp
 from config.platform_config import get_controller_runtime_config
 from config.structured_logger import controller_logger, generate_correlation_id
@@ -337,6 +338,19 @@ def reconcile_startup_recovery(
         elif st == JOB_STATE_WAITING_FOR_DEPENDENCY:
             init_waiting_steps += 1
 
+    # Sweep unpromoted temporary staging artifacts left by crashed uploads
+    curr_paths = paths
+    if curr_paths is None:
+        try:
+            from config.platform_config import get_controller_paths
+            curr_paths = get_controller_paths()
+        except Exception:
+            curr_paths = None
+
+    staging_cleaned = 0
+    if curr_paths and hasattr(curr_paths, "artifacts_dir"):
+        staging_cleaned = cleanup_orphan_staging_artifacts(curr_paths.artifacts_dir, max_age_seconds=0.0)
+
     # Run multi-pass reconciliation
     changed = sweep_expired_leases(jobs_db, nodes_db, timeout_seconds=timeout_seconds, paths=paths)
 
@@ -362,6 +376,7 @@ def reconcile_startup_recovery(
     summary = {
         "active_leases_preserved": active_preserved,
         "expired_leases_swept": expired_count,
+        "staging_artifacts_cleaned": staging_cleaned,
         "steps_unblocked": steps_unblocked,
         "workflows_succeeded": wf_succeeded,
         "workflows_failed": wf_failed,
@@ -371,8 +386,8 @@ def reconcile_startup_recovery(
     controller_logger.info(
         "controller.startup_recovery",
         f"Controller restart recovery reconciled: {active_preserved} active lease(s) preserved, "
-        f"{expired_count} expired lease(s) swept, {steps_unblocked} workflow step(s) unblocked, "
-        f"{wf_succeeded} workflow(s) in SUCCEEDED state.",
+        f"{expired_count} expired lease(s) swept, {staging_cleaned} staging artifact(s) cleaned, "
+        f"{steps_unblocked} workflow step(s) unblocked, {wf_succeeded} workflow(s) in SUCCEEDED state.",
         **summary
     )
 

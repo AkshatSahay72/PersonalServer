@@ -33,6 +33,7 @@ UNIT_TEST_FILES = [
     "tests/unit/test_cross_platform_reliability.py",
     "tests/unit/test_doctor.py",
     "tests/unit/test_worker_lifecycle_safety.py",
+    "tests/unit/test_capability_probes.py",
 ]
 
 # Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing, HA
@@ -48,6 +49,10 @@ INTEGRATION_TEST_FILES = [
     "tests/controller/test_multi_node_simulation.py",
     "tests/controller/test_notifications.py",
     "tests/controller/test_distributed_scheduler.py",
+    "tests/controller/test_capability_scheduling.py",
+    "tests/controller/test_dag_workflows.py",
+    "tests/controller/test_controller_recovery.py",
+    "tests/controller/test_operational_reliability.py",
     "tests/controller/test_cross_worker_artifact_exchange.py",
     "tests/canary/test_staging_canary.py",
     # Storage domain

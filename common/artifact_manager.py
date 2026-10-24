@@ -226,6 +226,11 @@ def store_artifact_stream(
                 f.write(chunk)
                 hasher.update(chunk)
 
+        if total_bytes_expected > 0 and bytes_read != total_bytes_expected:
+            raise ValueError(
+                f"Incomplete artifact stream: received {bytes_read} bytes, expected {total_bytes_expected} bytes."
+            )
+
         actual_sha256 = hasher.hexdigest()
         if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
             raise ValueError(f"Checksum mismatch: expected {expected_sha256}, got {actual_sha256}")
@@ -235,6 +240,18 @@ def store_artifact_stream(
         if tmp_file.exists():
             try:
                 tmp_file.unlink()
+            except Exception:
+                pass
+        if not target_file.exists() and art_dir.exists():
+            try:
+                remaining_files = [p for p in art_dir.iterdir() if not p.name.endswith(".tmp")]
+                if not remaining_files:
+                    for leftover in list(art_dir.iterdir()):
+                        try:
+                            leftover.unlink()
+                        except Exception:
+                            pass
+                    art_dir.rmdir()
             except Exception:
                 pass
 
@@ -257,6 +274,58 @@ def store_artifact_stream(
         json.dump(record, mf, indent=2)
 
     return record
+
+
+def cleanup_orphan_staging_artifacts(storage_root: Path, max_age_seconds: float = 300.0) -> int:
+    """
+    Cleans up orphaned staging artifacts (.tmp files and unpromoted artifact directories)
+    from interrupted or crashed uploads.
+    
+    If max_age_seconds <= 0, all .tmp files and incomplete artifact directories are removed immediately.
+    Returns the total number of cleaned up items.
+    """
+    if not storage_root.exists() or not storage_root.is_dir():
+        return 0
+
+    import time
+    now = time.time()
+    cleaned_count = 0
+
+    try:
+        for entry in list(storage_root.iterdir()):
+            if entry.is_file() and entry.name.endswith(".tmp"):
+                try:
+                    file_age = now - entry.stat().st_mtime
+                    if max_age_seconds <= 0 or file_age >= max_age_seconds:
+                        entry.unlink()
+                        cleaned_count += 1
+                except Exception:
+                    pass
+            elif entry.is_dir():
+                meta_file = entry / "metadata.json"
+                tmp_files = list(entry.glob("*.tmp"))
+                for tf in tmp_files:
+                    try:
+                        tf_age = now - tf.stat().st_mtime
+                        if max_age_seconds <= 0 or tf_age >= max_age_seconds:
+                            tf.unlink()
+                            cleaned_count += 1
+                    except Exception:
+                        pass
+
+                non_tmp = [f for f in entry.iterdir() if not f.name.endswith(".tmp")]
+                if not meta_file.exists() and not non_tmp:
+                    try:
+                        dir_age = now - entry.stat().st_mtime
+                        if max_age_seconds <= 0 or dir_age >= max_age_seconds:
+                            entry.rmdir()
+                            cleaned_count += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return cleaned_count
 
 
 def verify_artifact_integrity(record: Dict[str, Any]) -> bool:
@@ -282,4 +351,5 @@ class ArtifactManager:
     store_bytes = staticmethod(store_artifact_bytes)
     store_stream = staticmethod(store_artifact_stream)
     verify_integrity = staticmethod(verify_artifact_integrity)
+    cleanup_orphan_staging = staticmethod(cleanup_orphan_staging_artifacts)
 

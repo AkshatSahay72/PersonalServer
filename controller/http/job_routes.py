@@ -871,28 +871,7 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             })
             return True
 
-        # 3. Stale worker protection: check attempt number if provided (or default to 1 for unversioned reports)
-        reported_attempt = body.get("attempt")
-        eff_reported_attempt = int(reported_attempt) if reported_attempt is not None else (1 if current_attempt > 1 else current_attempt)
-        if eff_reported_attempt < current_attempt:
-            controller_logger.warning(
-                "worker.stale_attempt",
-                f"Stale worker result for job '{job_id}': reported attempt {eff_reported_attempt} < current attempt {current_attempt}",
-                correlation_id=corr_id,
-                job_id=job_id,
-                node_id=target_node,
-                reported_attempt=eff_reported_attempt,
-                current_attempt=current_attempt
-            )
-            handler.send_json(409, {
-                "error": f"Stale worker result: reported attempt {eff_reported_attempt} is older than current attempt {current_attempt}.",
-                "job_id": job_id,
-                "current_attempt": current_attempt,
-                "stale_attempt": True
-            })
-            return True
-
-        # 4. Fencing token: reject superseded lease generations
+        # 3. Fencing token: reject superseded lease generations
         reported_gen = body.get("lease_generation")
         current_gen = int(job.get("lease_generation", 1))
         if reported_gen is not None and int(reported_gen) < current_gen:
@@ -913,9 +892,62 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             })
             return True
 
+        # 4. Stale worker protection: check attempt number if provided (or default to 1 for unversioned reports)
+        reported_attempt = body.get("attempt")
+        if reported_attempt is not None:
+            eff_reported_attempt = int(reported_attempt)
+        elif reported_gen is not None and int(reported_gen) == current_gen:
+            eff_reported_attempt = current_attempt
+        else:
+            eff_reported_attempt = 1 if current_attempt > 1 else current_attempt
+
+        if eff_reported_attempt < current_attempt:
+            controller_logger.warning(
+                "worker.stale_attempt",
+                f"Stale worker result for job '{job_id}': reported attempt {eff_reported_attempt} < current attempt {current_attempt}",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                reported_attempt=eff_reported_attempt,
+                current_attempt=current_attempt
+            )
+            handler.send_json(409, {
+                "error": f"Stale worker result: reported attempt {eff_reported_attempt} is older than current attempt {current_attempt}.",
+                "job_id": job_id,
+                "current_attempt": current_attempt,
+                "stale_attempt": True
+            })
+            return True
+
         job_status = body.get("status", JOB_STATE_FAILED)
         now_iso = get_current_iso_timestamp()
         now_epoch = time.time()
+
+        # 5. Controller-authoritative lease validity check:
+        # If the controller clock indicates the lease has expired, reject the result.
+        lease_exp = job.get("lease_expires_at")
+        if (
+            lease_exp is not None
+            and now_epoch > float(lease_exp)
+            and canon_curr_status in (JOB_STATE_ASSIGNED, JOB_STATE_RUNNING)
+        ):
+            controller_logger.warning(
+                "worker.lease_expired_on_submission",
+                f"Rejected result for job '{job_id}': controller clock indicates lease expired at {lease_exp} (now: {now_epoch})",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                current_attempt=current_attempt,
+                lease_expires_at=lease_exp,
+            )
+            sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
+            handler.send_json(409, {
+                "error": f"Cannot submit result for job '{job_id}': active lease expired at {lease_exp} (controller time: {now_epoch}).",
+                "job_id": job_id,
+                "current_attempt": current_attempt,
+                "lease_expired": True
+            })
+            return True
 
         # Record attempt
         attempt = current_attempt
@@ -1321,6 +1353,17 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             handler.send_json(400, {"error": f"Cannot renew lease for job in '{curr_st}' state"})
             return True
 
+        now_epoch = time.time()
+        lease_exp = job.get("lease_expires_at")
+        if lease_exp is not None and now_epoch > float(lease_exp):
+            sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
+            handler.send_json(409, {
+                "error": f"Cannot renew expired lease for job '{job_id}': lease expired at {lease_exp} (controller time: {now_epoch}).",
+                "job_id": job_id,
+                "lease_expired": True
+            })
+            return True
+
         extension_sec = min(300, max(10, int((body or {}).get("extension_sec", job.get("timeout", 60) + DEFAULT_LEASE_GRACE_SEC))))
         now_epoch = time.time()
         job["lease_expires_at"] = now_epoch + extension_sec
@@ -1356,8 +1399,27 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             handler.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
             return True
 
+        req_gen = body.get("lease_generation") if body else None
+        curr_gen = int(job.get("lease_generation", 1))
+        if req_gen is not None and int(req_gen) < curr_gen:
+            handler.send_json(409, {
+                "error": f"Superseded lease generation {req_gen} (current is {curr_gen})",
+                "lease_generation": curr_gen
+            })
+            return True
+
         new_status = (body.get("status") or "").upper()
         current_st = job.get("status")
+        now_epoch = time.time()
+        lease_exp = job.get("lease_expires_at")
+        if lease_exp is not None and now_epoch > float(lease_exp) and current_st in (JOB_STATE_ASSIGNED, JOB_STATE_RUNNING):
+            sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
+            handler.send_json(409, {
+                "error": f"Cannot update status for job '{job_id}': active lease expired at {lease_exp} (controller time: {now_epoch}).",
+                "job_id": job_id,
+                "lease_expired": True
+            })
+            return True
         if not validate_job_transition(current_st, new_status):
             handler.send_json(400, {
                 "error": f"Invalid state transition from '{current_st}' to '{new_status}'.",
