@@ -13,8 +13,10 @@ from common.time_utils import get_current_iso_timestamp
 from controller.constants import (
     JOB_STATE_ASSIGNED,
     JOB_STATE_CANCELLED,
+    JOB_STATE_CLAIMED,
     JOB_STATE_FAILED,
     JOB_STATE_QUEUED,
+    JOB_STATE_REJECTED,
     JOB_STATE_RUNNING,
     JOB_STATE_SUCCEEDED,
     JOB_STATE_TIMED_OUT,
@@ -35,19 +37,26 @@ def validate_workflow_dag(steps: Dict[str, Dict[str, Any]]) -> List[str]:
     Raises WorkflowValidationError if a cycle or missing dependency is found.
     """
     if not steps or not isinstance(steps, dict):
-        raise WorkflowValidationError("Workflow must contain at least one step.")
+        raise WorkflowValidationError("Workflow must contain at least one step or job.")
 
     step_ids = set(steps.keys())
     adj: Dict[str, List[str]] = {s: [] for s in step_ids}
     in_degree: Dict[str, int] = {s: 0 for s in step_ids}
 
     for step_id, spec in steps.items():
-        depends_on = spec.get("depends_on") or []
+        if not isinstance(spec, dict):
+            raise WorkflowValidationError(f"Step '{step_id}' definition must be a dictionary.")
+        depends_on = spec.get("depends_on") or spec.get("dependencies") or []
         if isinstance(depends_on, str):
-            depends_on = [depends_on]
+            depends_on = [depends_on] if depends_on.strip() else []
+        elif not isinstance(depends_on, (list, tuple, set)):
+            raise WorkflowValidationError(f"Step '{step_id}' dependencies must be a list of step/job IDs.")
+
         for dep in depends_on:
+            if not isinstance(dep, str):
+                continue
             if dep not in step_ids:
-                raise WorkflowValidationError(f"Step '{step_id}' depends on undefined step '{dep}'.")
+                raise WorkflowValidationError(f"Step '{step_id}' depends on undefined step/job '{dep}'.")
             if dep == step_id:
                 raise WorkflowValidationError(f"Self-dependency cycle detected on step '{step_id}'.")
             adj[dep].append(step_id)
@@ -66,7 +75,7 @@ def validate_workflow_dag(steps: Dict[str, Dict[str, Any]]) -> List[str]:
                 queue.append(v)
 
     if len(sorted_steps) != len(step_ids):
-        unresolved = [s for s, deg in in_degree.items() if deg > 0]
+        unresolved = sorted([s for s, deg in in_degree.items() if deg > 0])
         raise WorkflowValidationError(f"Dependency cycle detected among steps: {unresolved}")
 
     return sorted_steps
@@ -79,30 +88,50 @@ def instantiate_workflow(
     """
     Instantiates a workflow specification into a workflow record and corresponding
     child jobs, setting independent steps to QUEUED and dependent steps to WAITING_FOR_DEPENDENCY.
+    Validates DAG integrity, unique IDs, and parameter consistency prior to job creation.
     
     Returns (workflow_record, created_jobs_list).
     """
     name = workflow_spec.get("name") or "unnamed-workflow"
     description = workflow_spec.get("description", "")
-    raw_steps = workflow_spec.get("steps", {})
+    raw_steps = workflow_spec.get("steps") or workflow_spec.get("jobs") or {}
+
     if isinstance(raw_steps, list):
-        # Allow passing steps as list of dicts with 'id' or 'step_id'
+        # Validate unique step IDs when list is provided
         steps_dict = {}
-        for s in raw_steps:
-            sid = s.get("step_id") or s.get("id") or f"step-{len(steps_dict)+1}"
+        seen_ids = set()
+        for idx, s in enumerate(raw_steps):
+            if not isinstance(s, dict):
+                raise WorkflowValidationError(f"Step at index {idx} must be a dictionary.")
+            sid = s.get("step_id") or s.get("id") or s.get("job_id")
+            if not sid:
+                raise WorkflowValidationError(f"Step at index {idx} is missing required 'id', 'step_id', or 'job_id'.")
+            if sid in seen_ids:
+                raise WorkflowValidationError(f"Duplicate step/job ID '{sid}' in workflow specification.")
+            seen_ids.add(sid)
             steps_dict[sid] = s
         raw_steps = steps_dict
+    elif isinstance(raw_steps, dict):
+        for sid, s in raw_steps.items():
+            if not isinstance(s, dict):
+                raise WorkflowValidationError(f"Step '{sid}' definition must be a dictionary.")
+    else:
+        raise WorkflowValidationError("Workflow 'steps' or 'jobs' must be a dictionary or list.")
 
-    # Validate graph
+    # Validate graph structure & cycle detection before mutating jobs_db
     validate_workflow_dag(raw_steps)
 
     wf_id = f"wf-{secrets.token_hex(6)}"
     now = get_current_iso_timestamp()
 
-    # Create jobs for each step
+    # Create jobs for each step, preserving explicit IDs if unique
     step_to_job_id = {}
-    for step_id in raw_steps.keys():
-        step_to_job_id[step_id] = f"job-{secrets.token_hex(6)}"
+    for step_id, spec in raw_steps.items():
+        custom_id = spec.get("job_id") or spec.get("id")
+        if custom_id and custom_id not in jobs_db.get("jobs", {}) and not any(custom_id == v for v in step_to_job_id.values()):
+            step_to_job_id[step_id] = custom_id
+        else:
+            step_to_job_id[step_id] = f"job-{secrets.token_hex(6)}"
 
     created_jobs = []
     instantiated_steps = {}
@@ -110,15 +139,26 @@ def instantiate_workflow(
 
     for step_id, spec in raw_steps.items():
         job_id = step_to_job_id[step_id]
-        depends_on_steps = spec.get("depends_on") or []
+        depends_on_steps = spec.get("depends_on") or spec.get("dependencies") or []
         if isinstance(depends_on_steps, str):
-            depends_on_steps = [depends_on_steps]
+            depends_on_steps = [depends_on_steps] if depends_on_steps.strip() else []
 
-        depends_on_job_ids = [step_to_job_id[d] for d in depends_on_steps]
+        depends_on_job_ids = [step_to_job_id[d] for d in depends_on_steps if d in step_to_job_id]
 
         # Initial status: QUEUED if 0 dependencies, else WAITING_FOR_DEPENDENCY
         initial_status = JOB_STATE_QUEUED if not depends_on_steps else JOB_STATE_WAITING_FOR_DEPENDENCY
         waiting_reason = "Waiting for dependencies to complete" if depends_on_steps else None
+
+        target_val = spec.get("target") or spec.get("target_node") or "auto"
+        explicit_target_node = spec.get("target_node") if (spec.get("target_node") and spec.get("target_node") != "auto") else (spec.get("target") if (spec.get("target") and spec.get("target") != "auto") else None)
+
+        scheduler_meta = None
+        if target_val == "auto" and not explicit_target_node:
+            scheduler_meta = {
+                "mode": "resource-aware-pending",
+                "selected_node": None,
+                "reason": "Awaiting eligible worker" if not depends_on_steps else "Awaiting dependencies before scheduling"
+            }
 
         job_record = {
             "id": job_id,
@@ -129,8 +169,8 @@ def instantiate_workflow(
             "type": spec.get("type", "echo"),
             "parameters": spec.get("parameters", {}) or {},
             "requirements": spec.get("requirements", {}) or {},
-            "target": spec.get("target") or spec.get("target_node") or "auto",
-            "target_node": spec.get("target_node") or (spec.get("target") if spec.get("target") != "auto" else None),
+            "target": target_val,
+            "target_node": explicit_target_node,
             "assigned_node": None,
             "timeout": int(spec.get("timeout", 60)),
             "max_attempts": int(spec.get("max_attempts", 3)),
@@ -139,7 +179,10 @@ def instantiate_workflow(
             "priority": spec.get("priority", "normal"),
             "depends_on_steps": depends_on_steps,
             "depends_on_jobs": depends_on_job_ids,
+            "dependencies": depends_on_job_ids,
             "waiting_reason": waiting_reason,
+            "blocked_reason": None,
+            "scheduler": scheduler_meta,
             "status": initial_status,
             "state": initial_status,
             "created_at": now,
@@ -156,8 +199,9 @@ def instantiate_workflow(
             "step_id": step_id,
             "name": spec.get("name", step_id),
             "job_id": job_id,
-            "type": spec.get("type"),
+            "type": spec.get("type", "echo"),
             "depends_on": depends_on_steps,
+            "dependencies": depends_on_steps,
             "status": initial_status
         }
 
@@ -183,14 +227,16 @@ def instantiate_workflow(
 
 def evaluate_workflow_progress(
     workflow: Dict[str, Any],
-    jobs_db: Dict[str, Any]
+    jobs_db: Dict[str, Any],
+    artifacts_db: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
     Evaluates step dependencies for a workflow and unblocks ready steps.
     Transitions jobs from WAITING_FOR_DEPENDENCY to QUEUED when parents SUCCEED.
-    Transitions dependent jobs to FAILED if any required parent fails.
+    Transitions dependent jobs to FAILED or CANCELLED if any required parent fails.
     Cascades transitions across multiple dependency levels in a single evaluation.
     Respects workflow failure_policy ('fail_fast' vs 'continue_on_failure').
+    Resolves artifact outputs from parent jobs and cluster artifacts store.
     Returns True if any job or workflow state was modified.
     """
     if workflow.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED, JOB_STATE_FAILED):
@@ -199,6 +245,14 @@ def evaluate_workflow_progress(
     changed = False
     all_jobs = jobs_db.get("jobs", {})
     steps = workflow.get("steps", {})
+
+    # Load artifacts store if not passed in
+    if artifacts_db is None:
+        try:
+            from controller.stores.artifacts_store import load_artifacts_db
+            artifacts_db = load_artifacts_db()
+        except Exception:
+            artifacts_db = {"artifacts": {}}
 
     # Iteratively cascade dependency changes across arbitrary DAG depths
     while True:
@@ -215,25 +269,43 @@ def evaluate_workflow_progress(
 
             # Check if this step is waiting for dependencies
             if canon_status == JOB_STATE_WAITING_FOR_DEPENDENCY:
-                parent_step_ids = step.get("depends_on", [])
+                parent_step_ids = step.get("depends_on") or step.get("dependencies") or []
                 parent_jobs = [all_jobs.get(steps[p]["job_id"]) for p in parent_step_ids if p in steps]
 
                 # Check if any parent permanently failed or was cancelled
-                failed_parent = next((p for p in parent_jobs if p and canonicalize_job_state(p.get("status")) in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_CANCELLED)), None)
+                failed_parent = next((
+                    p for p in parent_jobs
+                    if p and canonicalize_job_state(p.get("status")) in (
+                        JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_CANCELLED, JOB_STATE_REJECTED
+                    )
+                ), None)
+
                 if failed_parent:
                     parent_st = canonicalize_job_state(failed_parent.get("status"))
-                    job["status"] = JOB_STATE_FAILED
-                    job["state"] = JOB_STATE_FAILED
-                    job["finished_at"] = get_current_iso_timestamp()
-                    job["retry_reason"] = f"Upstream dependency failed: step '{failed_parent.get('workflow_step_id')}' had status {parent_st}"
+                    now_iso = get_current_iso_timestamp()
+                    parent_step_label = failed_parent.get("workflow_step_id") or failed_parent.get("job_id")
+
+                    if parent_st == JOB_STATE_CANCELLED:
+                        job["status"] = JOB_STATE_CANCELLED
+                        job["state"] = JOB_STATE_CANCELLED
+                        job["cancel_reason"] = f"Upstream dependency cancelled: step '{parent_step_label}' was cancelled"
+                        job["blocked_reason"] = f"Blocked: upstream dependency '{parent_step_label}' was cancelled"
+                        step["status"] = JOB_STATE_CANCELLED
+                    else:
+                        job["status"] = JOB_STATE_FAILED
+                        job["state"] = JOB_STATE_FAILED
+                        job["retry_reason"] = f"Upstream dependency failed: step '{parent_step_label}' had status {parent_st}"
+                        job["blocked_reason"] = f"Blocked: upstream dependency '{parent_step_label}' failed with {parent_st}"
+                        step["status"] = JOB_STATE_FAILED
+
+                    job["finished_at"] = now_iso
                     job["waiting_reason"] = None
-                    step["status"] = JOB_STATE_FAILED
                     changed = True
                     iteration_changed = True
                     continue
 
                 # Check if all parents succeeded
-                all_parents_succeeded = parent_jobs and all(
+                all_parents_succeeded = parent_jobs and len(parent_jobs) == len(parent_step_ids) and all(
                     p and canonicalize_job_state(p.get("status")) == JOB_STATE_SUCCEEDED
                     for p in parent_jobs
                 )
@@ -252,20 +324,28 @@ def evaluate_workflow_progress(
                             loc_name = a_name
                         elif isinstance(inp, dict):
                             p_name = inp.get("step")
-                            a_name = inp.get("artifact") or inp.get("name")
+                            a_name = inp.get("artifact") or inp.get("name") or inp.get("filename")
                             loc_name = inp.get("name") or a_name
                         else:
                             continue
 
                         cand_parent_steps = [p_name] if p_name else parent_step_ids
                         found = None
+
                         for cand in cand_parent_steps:
                             if cand in steps:
                                 p_jid = steps[cand]["job_id"]
                                 pj = all_jobs.get(p_jid)
+                                # 1. Check parent job record
                                 if pj and pj.get("artifacts"):
                                     for art in pj["artifacts"]:
-                                        if art.get("name") == a_name or art.get("filename") == a_name:
+                                        if art.get("name") == a_name or art.get("filename") == a_name or art.get("artifact_id") == a_name:
+                                            found = art
+                                            break
+                                # 2. Check artifacts store if not in pj
+                                if not found and artifacts_db:
+                                    for art in artifacts_db.get("artifacts", {}).values():
+                                        if art.get("job_id") == p_jid and (art.get("name") == a_name or art.get("filename") == a_name or art.get("artifact_id") == a_name):
                                             found = art
                                             break
                             if found:
@@ -286,20 +366,30 @@ def evaluate_workflow_progress(
                         })
 
                     if missing_artifact_err:
+                        now_iso = get_current_iso_timestamp()
                         job["status"] = JOB_STATE_FAILED
                         job["state"] = JOB_STATE_FAILED
-                        job["finished_at"] = get_current_iso_timestamp()
+                        job["finished_at"] = now_iso
                         job["retry_reason"] = missing_artifact_err
+                        job["blocked_reason"] = missing_artifact_err
                         job["waiting_reason"] = None
                         step["status"] = JOB_STATE_FAILED
                         changed = True
                         iteration_changed = True
                         continue
 
+                    # Unblock job to QUEUED
                     job["input_artifacts"] = resolved_artifacts
                     job["status"] = JOB_STATE_QUEUED
                     job["state"] = JOB_STATE_QUEUED
                     job["waiting_reason"] = None
+                    job["blocked_reason"] = None
+                    if job.get("target") == "auto":
+                        job["scheduler"] = {
+                            "mode": "resource-aware-pending",
+                            "selected_node": None,
+                            "reason": "Awaiting eligible worker"
+                        }
                     step["status"] = JOB_STATE_QUEUED
                     changed = True
                     iteration_changed = True
@@ -309,7 +399,7 @@ def evaluate_workflow_progress(
 
     total = len(steps)
     completed_count = sum(1 for s in steps.values() if s.get("status") == JOB_STATE_SUCCEEDED)
-    failed_count = sum(1 for s in steps.values() if s.get("status") in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT))
+    failed_count = sum(1 for s in steps.values() if s.get("status") in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_REJECTED))
     cancelled_count = sum(1 for s in steps.values() if s.get("status") == JOB_STATE_CANCELLED)
     terminal_count = completed_count + failed_count + cancelled_count
 
@@ -327,6 +417,7 @@ def evaluate_workflow_progress(
                     j["status"] = JOB_STATE_CANCELLED
                     j["state"] = JOB_STATE_CANCELLED
                     j["cancel_reason"] = "Cancelled due to workflow fail-fast policy"
+                    j["blocked_reason"] = "Cancelled due to sibling step failure (fail_fast policy)"
                     j["finished_at"] = now_iso
                 s["status"] = JOB_STATE_CANCELLED
                 changed = True
@@ -344,7 +435,7 @@ def evaluate_workflow_progress(
         workflow["finished_at"] = get_current_iso_timestamp()
         changed = True
 
-    elif completed_count > 0 or any(s.get("status") in (JOB_STATE_RUNNING, JOB_STATE_ASSIGNED) for s in steps.values()):
+    elif completed_count > 0 or any(s.get("status") in (JOB_STATE_RUNNING, JOB_STATE_ASSIGNED, JOB_STATE_CLAIMED) for s in steps.values()):
         if workflow.get("status") == JOB_STATE_QUEUED:
             workflow["status"] = "RUNNING"
             workflow["started_at"] = workflow.get("started_at") or get_current_iso_timestamp()
@@ -355,7 +446,8 @@ def evaluate_workflow_progress(
 
 def progress_workflows(
     workflows_db: Dict[str, Any],
-    jobs_db: Dict[str, Any]
+    jobs_db: Dict[str, Any],
+    artifacts_db: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
     Evaluates all active workflows in workflows_db against current jobs in jobs_db.
@@ -365,7 +457,7 @@ def progress_workflows(
     for wf in workflows_db.get("workflows", {}).values():
         if wf.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
             continue
-        if evaluate_workflow_progress(wf, jobs_db):
+        if evaluate_workflow_progress(wf, jobs_db, artifacts_db=artifacts_db):
             changed = True
     return changed
 

@@ -170,7 +170,16 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         if not wf:
             handler.send_json(404, {"error": f"Workflow '{wf_id}' not found"})
             return True
-        handler.send_json(200, {"workflow": wf})
+        wf_jobs = {}
+        for step_id, step in wf.get("steps", {}).items():
+            jid = step.get("job_id")
+            if jid and jid in jobs_db.get("jobs", {}):
+                wf_jobs[step_id] = jobs_db["jobs"][jid]
+        handler.send_json(200, {
+            "workflow": wf,
+            "jobs": wf_jobs,
+            "jobs_list": list(wf_jobs.values())
+        })
         return True
 
     # GET /artifacts - List cluster artifacts
@@ -326,6 +335,15 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
             return True
 
         jobs_db = load_jobs_db()
+        # Progress workflows so any newly unblocked jobs transition to QUEUED before selecting claimable jobs
+        try:
+            workflows_db = load_workflows_db()
+            if progress_workflows(workflows_db, jobs_db):
+                save_workflows_db(workflows_db)
+                save_jobs_db(jobs_db)
+        except Exception as wf_err:
+            print(f"[CONTROLLER-WORKFLOW] Error evaluating workflows during poll: {wf_err}", file=sys.stderr)
+
         # Perform sweep before claiming
         sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
 
@@ -1177,6 +1195,17 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             job["terminated_active_workload"] = True
         save_jobs_db(jobs_db)
 
+        # Progress any parent workflow if job belongs to a workflow
+        wf_id = job.get("workflow_id")
+        if wf_id:
+            try:
+                workflows_db = load_workflows_db()
+                if progress_workflows(workflows_db, jobs_db):
+                    save_workflows_db(workflows_db)
+                    save_jobs_db(jobs_db)
+            except Exception as e:
+                print(f"[CONTROLLER-WORKFLOW] Error progressing workflow '{wf_id}' after cancellation: {e}", file=sys.stderr)
+
         print(f"[CONTROLLER] Job {job_id} CANCELLED: {reason}")
         handler.send_json(200, {
             "status": JOB_STATE_CANCELLED,
@@ -1417,6 +1446,17 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         artifacts_db.setdefault("artifacts", {})[art_id] = art_record
         save_artifacts_db(artifacts_db)
 
+        if job_id:
+            try:
+                jobs_db = load_jobs_db()
+                if job_id in jobs_db.get("jobs", {}):
+                    job_arts = jobs_db["jobs"][job_id].setdefault("artifacts", [])
+                    if not any(a.get("artifact_id") == art_id for a in job_arts):
+                        job_arts.append(art_record)
+                        save_jobs_db(jobs_db)
+            except Exception as e:
+                print(f"[CONTROLLER-ARTIFACTS] Error linking artifact to job {job_id}: {e}", file=sys.stderr)
+
         handler.send_json(201, {
             "status": "UPLOADED",
             "artifact": art_record
@@ -1538,6 +1578,17 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         artifacts_db = load_artifacts_db()
         artifacts_db.setdefault("artifacts", {})[art_id] = art_record
         save_artifacts_db(artifacts_db)
+
+        if job_id:
+            try:
+                jobs_db = load_jobs_db()
+                if job_id in jobs_db.get("jobs", {}):
+                    job_arts = jobs_db["jobs"][job_id].setdefault("artifacts", [])
+                    if not any(a.get("artifact_id") == art_id for a in job_arts):
+                        job_arts.append(art_record)
+                        save_jobs_db(jobs_db)
+            except Exception as e:
+                print(f"[CONTROLLER-ARTIFACTS] Error linking streaming artifact to job {job_id}: {e}", file=sys.stderr)
 
         handler.send_json(201, {
             "status": "UPLOADED",

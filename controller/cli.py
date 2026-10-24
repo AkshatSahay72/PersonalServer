@@ -38,7 +38,20 @@ from controller.onboarding import (
     generate_onboarding_code,
     get_or_create_enrollment_token,
 )
-from controller.stores import load_jobs_db, load_nodes_db, save_jobs_db, save_nodes_db
+from controller.stores import (
+    load_jobs_db,
+    load_nodes_db,
+    load_workflows_db,
+    save_jobs_db,
+    save_nodes_db,
+    save_workflows_db,
+)
+from controller.workflow_engine import (
+    WorkflowValidationError,
+    cancel_workflow,
+    instantiate_workflow,
+    progress_workflows,
+)
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness
 
 PATHS = get_controller_paths()
@@ -462,6 +475,149 @@ def remove_node(node_id: str) -> int:
     return 0
 
 
+def list_workflows() -> None:
+    """Lists all DAG workflows with overall progress and state."""
+    workflows_db = load_workflows_db()
+    jobs_db = load_jobs_db()
+    if progress_workflows(workflows_db, jobs_db):
+        save_workflows_db(workflows_db)
+        save_jobs_db(jobs_db)
+
+    wfs = list(workflows_db.get("workflows", {}).values())
+    if not wfs:
+        print("No workflows found.")
+        return
+
+    print("==========================================================================================")
+    print(" WORKFLOW ID       NAME                  STATUS      PROGRESS   TOTAL   COMPLETED   CREATED")
+    print("==========================================================================================")
+    for wf in wfs:
+        wid = (wf.get("workflow_id") or wf.get("id", ""))[:16].ljust(16)
+        name = (wf.get("name") or "unnamed")[:20].ljust(20)
+        status = (wf.get("status") or "UNKNOWN")[:10].ljust(10)
+        pct = f"{wf.get('progress_percent', 0.0):.1f}%".rjust(8)
+        tot = str(wf.get("total_steps", 0)).rjust(6)
+        cmp_cnt = str(wf.get("completed_steps", 0)).rjust(10)
+        created = (wf.get("created_at") or "")[:19]
+        print(f" {wid}  {name}  {status}  {pct}  {tot}  {cmp_cnt}   {created}")
+    print("==========================================================================================")
+
+
+def show_workflow_details(workflow_id: str) -> int:
+    """Displays detailed per-job workflow state and dependency graph."""
+    workflows_db = load_workflows_db()
+    jobs_db = load_jobs_db()
+    if progress_workflows(workflows_db, jobs_db):
+        save_workflows_db(workflows_db)
+        save_jobs_db(jobs_db)
+
+    wf = workflows_db.get("workflows", {}).get(workflow_id)
+    if not wf:
+        print(f"Error: Workflow '{workflow_id}' not found.", file=sys.stderr)
+        return 1
+
+    print("==========================================")
+    print(f" Workflow: {wf.get('name')} ({wf.get('workflow_id')})")
+    print("==========================================")
+    print(f"Status:          {wf.get('status')}")
+    print(f"Progress:        {wf.get('progress_percent', 0.0):.1f}% ({wf.get('completed_steps')}/{wf.get('total_steps')} steps)")
+    print(f"Failure Policy:  {wf.get('failure_policy', 'fail_fast')}")
+    print(f"Created At:      {wf.get('created_at')}")
+    print(f"Started At:      {wf.get('started_at') or 'N/A'}")
+    print(f"Finished At:     {wf.get('finished_at') or 'N/A'}")
+    if wf.get("cancel_reason"):
+        print(f"Cancel Reason:   {wf.get('cancel_reason')}")
+
+    print("\n--- Steps & Child Jobs ---")
+    all_jobs = jobs_db.get("jobs", {})
+    for step_id, step in wf.get("steps", {}).items():
+        jid = step.get("job_id")
+        job = all_jobs.get(jid, {})
+        deps = step.get("depends_on") or []
+        deps_str = ", ".join(deps) if deps else "None (root)"
+        assigned = job.get("assigned_node") or job.get("target_node") or "auto"
+        print(f"\n  • Step '{step_id}' [{step.get('type')}]:")
+        print(f"      Job ID:        {jid}")
+        print(f"      Status:        {job.get('status', step.get('status'))}")
+        print(f"      Dependencies:  {deps_str}")
+        print(f"      Assigned Node: {assigned}")
+        if job.get("waiting_reason"):
+            print(f"      Waiting:       {job.get('waiting_reason')}")
+        if job.get("blocked_reason"):
+            print(f"      Blocked:       {job.get('blocked_reason')}")
+        if job.get("retry_reason"):
+            print(f"      Retry/Error:   {job.get('retry_reason')}")
+        if job.get("cancel_reason"):
+            print(f"      Cancel Reason: {job.get('cancel_reason')}")
+        if job.get("input_artifacts"):
+            print(f"      Inputs:        {len(job['input_artifacts'])} resolved artifact(s)")
+            for a in job["input_artifacts"]:
+                print(f"        - {a.get('name')} (id={a.get('artifact_id')}, sha256={str(a.get('sha256'))[:12]}...)")
+        if job.get("artifacts"):
+            print(f"      Outputs:       {len(job['artifacts'])} artifact(s)")
+            for a in job["artifacts"]:
+                print(f"        - {a.get('name') or a.get('filename')} (id={a.get('artifact_id')}, sha256={str(a.get('sha256'))[:12]}...)")
+    print("==========================================")
+    return 0
+
+
+def submit_workflow_cmd(spec_arg: str) -> int:
+    """Instantiates and submits a DAG workflow from JSON string or file."""
+    if os.path.exists(spec_arg):
+        try:
+            with open(spec_arg, "r", encoding="utf-8") as f:
+                spec = json.load(f)
+        except Exception as e:
+            print(f"Error reading workflow spec file '{spec_arg}': {e}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            spec = json.loads(spec_arg)
+        except Exception as e:
+            print(f"Error parsing workflow JSON: {e}", file=sys.stderr)
+            return 1
+
+    jobs_db = load_jobs_db()
+    workflows_db = load_workflows_db()
+    try:
+        wf_rec, created_jobs = instantiate_workflow(spec, jobs_db)
+    except WorkflowValidationError as e:
+        print(f"Workflow Validation Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Failed to instantiate workflow: {e}", file=sys.stderr)
+        return 1
+
+    wf_id = wf_rec["workflow_id"]
+    workflows_db.setdefault("workflows", {})[wf_id] = wf_rec
+    save_workflows_db(workflows_db)
+    save_jobs_db(jobs_db)
+
+    print("==========================================")
+    print(f" Workflow Created: {wf_rec['name']}")
+    print("==========================================")
+    print(f"Workflow ID:  {wf_id}")
+    print(f"Total Steps:  {len(created_jobs)}")
+    for j in created_jobs:
+        print(f"  • {j['workflow_step_id']}: job={j['job_id']} status={j['status']}")
+    print("==========================================")
+    return 0
+
+
+def cancel_workflow_cmd(workflow_id: str, reason: str = "Cancelled by operator") -> int:
+    """Cancels an active workflow and its non-terminal child jobs."""
+    workflows_db = load_workflows_db()
+    jobs_db = load_jobs_db()
+    cancelled = cancel_workflow(workflow_id, workflows_db, jobs_db, reason=reason)
+    if not cancelled:
+        print(f"Error: Workflow '{workflow_id}' not found.", file=sys.stderr)
+        return 1
+    save_workflows_db(workflows_db)
+    save_jobs_db(jobs_db)
+    print(f"Workflow '{workflow_id}' and all active/pending steps cancelled.")
+    return 0
+
+
 def main(args_list: Optional[list] = None) -> None:
     """Entry point for controller command-line invocation."""
     parser = argparse.ArgumentParser(
@@ -531,6 +687,22 @@ def main(args_list: Optional[list] = None) -> None:
     p_onboard = subparsers.add_parser("onboard-code", help="Generate a short-lived single-use node onboarding code")
     p_onboard.add_argument("--ttl", type=int, default=DEFAULT_ONBOARDING_TTL_SEC, help="Time to live in seconds (default: 900 / 15m)")
 
+    # workflows command
+    subparsers.add_parser("workflows", help="List all DAG workflows")
+
+    # workflow command
+    p_wf = subparsers.add_parser("workflow", help="Inspect single workflow details and child jobs")
+    p_wf.add_argument("workflow_id", help="Workflow ID to inspect")
+
+    # submit-workflow command
+    p_sub_wf = subparsers.add_parser("submit-workflow", help="Submit a DAG workflow from JSON string or file path")
+    p_sub_wf.add_argument("spec", help="Path to workflow JSON file or JSON string")
+
+    # cancel-workflow command
+    p_canc_wf = subparsers.add_parser("cancel-workflow", help="Cancel an active DAG workflow")
+    p_canc_wf.add_argument("workflow_id", help="Workflow ID to cancel")
+    p_canc_wf.add_argument("--reason", default="Cancelled by operator", help="Cancellation reason")
+
     args = parser.parse_args(args_list)
 
     if not args.command or args.command == "start":
@@ -570,6 +742,14 @@ def main(args_list: Optional[list] = None) -> None:
         print(f"Onboarding code: {code}")
         print(f"Expires in:      {minutes} minutes")
         print("==========================================")
+    elif args.command == "workflows":
+        list_workflows()
+    elif args.command == "workflow":
+        sys.exit(show_workflow_details(args.workflow_id))
+    elif args.command == "submit-workflow":
+        sys.exit(submit_workflow_cmd(args.spec))
+    elif args.command == "cancel-workflow":
+        sys.exit(cancel_workflow_cmd(args.workflow_id, getattr(args, "reason", "Cancelled by operator")))
 
 
 __all__ = [
@@ -586,3 +766,7 @@ __all__ = [
     "remove_node",
     "main",
 ]
+
+if __name__ == "__main__":
+    main()
+
