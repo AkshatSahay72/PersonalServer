@@ -727,7 +727,7 @@ def get_service_states():
         if is_pid_alive(api_pid, "services/node-api/app.py"):
             try:
                 req = urllib.request.Request("http://127.0.0.1:8080/health", headers={"User-Agent": "NodeAgent/1.0"})
-                with urllib.request.urlopen(req, timeout=2) as resp:
+                with urllib.request.urlopen(req, timeout=6) as resp:
                     if resp.status == 200:
                         services["node_api"] = "running"
                     else:
@@ -1605,6 +1605,7 @@ def cmd_work(args):
     print("==========================================")
 
     try:
+        last_heartbeat_time = 0.0
         while True:
             # Refresh registration in case URL or token updated
             curr_reg = load_registration_state()
@@ -1612,6 +1613,15 @@ def cmd_work(args):
                 auth_token = curr_reg.get("auth_token", auth_token)
                 if not args.controller:
                     controller_url = (curr_reg.get("controller_url") or controller_url).rstrip("/")
+
+            # Send periodic heartbeat to keep node ONLINE with fresh capabilities
+            now = time.time()
+            if now - last_heartbeat_time >= 15.0:
+                try:
+                    cmd_heartbeat(None)
+                    last_heartbeat_time = now
+                except Exception:
+                    pass
 
             job_processed, success = _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon=True)
 
