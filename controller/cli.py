@@ -12,7 +12,14 @@ import os
 import secrets
 import sys
 from http.server import HTTPServer
+from socketserver import ThreadingMixIn
 from typing import Any, Optional
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
 
 from common.time_utils import get_current_iso_timestamp
 from config.platform_config import get_controller_paths, get_controller_runtime_config
@@ -110,7 +117,7 @@ def start_server(host: Optional[str] = None, port: Optional[int] = None, timeout
     print(f"Jobs database:         {JOBS_FILE}")
     print("==========================================")
 
-    server = HTTPServer((host, port), handler_class)
+    server = ThreadedHTTPServer((host, port), handler_class)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

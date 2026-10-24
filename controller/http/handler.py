@@ -61,7 +61,9 @@ class ControllerHandler(BaseHandler):
             path = path[4:]
         query = urllib.parse.parse_qs(parsed.query)
         token = self.parse_auth_token()
-        body = self.read_json_body()
+        # For raw streaming artifact uploads, preserve rfile for stream consumption
+        body = None if path == "/artifacts/upload/raw" else self.read_json_body()
+
 
         # 1. HA Routes (executed before leader write guard to allow leader election / heartbeats)
         if handle_ha_post(self, path, body, token):
