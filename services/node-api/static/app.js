@@ -701,9 +701,14 @@ function renderHAHeader(ha) {
   if (bannerTerm) bannerTerm.textContent = ha.term !== undefined ? ha.term : "-";
 
   const bannerDesc = document.getElementById("ha-banner-status-desc");
+  const cnt = ha.standbys_count !== undefined ? ha.standbys_count : (ha.standbys ? ha.standbys.length : 0);
   if (bannerDesc) {
     if (info.isVerified) {
-      bannerDesc.textContent = "Auto-failover ready";
+      if (cnt > 0) {
+        bannerDesc.textContent = `${cnt} standby controller${cnt === 1 ? '' : 's'} synced`;
+      } else {
+        bannerDesc.textContent = "Active leader authoritative (no standbys registered)";
+      }
     } else if (ha.role === "fenced") {
       bannerDesc.textContent = "Controller fenced";
     } else if (ha.lease_valid === false) {
@@ -719,8 +724,7 @@ function renderHAHeader(ha) {
 
   const bannerStandbys = document.getElementById("ha-banner-standbys");
   if (bannerStandbys) {
-    const cnt = ha.standbys_count !== undefined ? ha.standbys_count : (ha.standbys ? ha.standbys.length : 0);
-    bannerStandbys.textContent = `${cnt} Standby${cnt === 1 ? '' : 's'} Synced`;
+    bannerStandbys.textContent = cnt > 0 ? `${cnt} Standby${cnt === 1 ? '' : 's'} Synced` : "0 Standbys";
   }
 
   // Update Summary Card in Dashboard
