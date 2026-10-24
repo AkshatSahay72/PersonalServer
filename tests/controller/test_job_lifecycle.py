@@ -598,6 +598,210 @@ class TestReliableJobLifecycle(unittest.TestCase):
         result_stdout = job_check["job"]["result"]["stdout"]
         self.assertLessEqual(len(result_stdout), 65536)
 
+    # --------------------------------------------------------------------------
+    # 12. Zombie Worker Result Rejected After Lease Expiry Failure (V1.2)
+    # --------------------------------------------------------------------------
+    def test_12_zombie_worker_result_rejected_after_lease_expiry_failure(self):
+        """Verify expired worker cannot resurrect a job that reached terminal FAILED due to lease expiry."""
+        worker = SimulatedWorker(
+            "zombie-worker-12",
+            controller_url=self.controller_url,
+            enrollment_token=self.enrollment_token
+        )
+        worker.register()
+        worker.send_heartbeat()
+
+        _, sub = self._api_post(
+            "/jobs",
+            {"type": "echo", "target": worker.node_id, "max_attempts": 1, "timeout": 5},
+            token=self.enrollment_token
+        )
+        job_id = sub["job_id"]
+        worker.poll_and_claim_job()
+
+        # Simulate worker disconnection & lease expiry
+        jobs_db = load_jobs_db()
+        nodes_db = load_nodes_db()
+        jobs_db["jobs"][job_id]["lease_expires_at"] = time.time() - 10
+        nodes_db["nodes"][worker.node_id]["last_seen"] = "2020-01-01T00:00:00Z"
+        sweep_expired_leases(jobs_db, nodes_db, timeout_seconds=5)
+        save_jobs_db(jobs_db)
+        save_nodes_db(nodes_db)
+
+        # Job must be in terminal FAILED
+        _, check1 = self._api_get(f"/jobs/{job_id}", token=self.enrollment_token)
+        self.assertEqual(check1["job"]["status"], JOB_STATE_FAILED)
+
+        # Zombie worker reconnects and attempts to report SUCCEEDED
+        url = f"{self.controller_url}/jobs/{job_id}/result"
+        payload = {
+            "status": JOB_STATE_SUCCEEDED,
+            "attempt": 1,
+            "lease_generation": 1,
+            "stdout": "Zombie late success"
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {worker.auth_token}"},
+            method="POST"
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 409)
+
+        # Terminal FAILED status must remain intact
+        _, check2 = self._api_get(f"/jobs/{job_id}", token=self.enrollment_token)
+        self.assertEqual(check2["job"]["status"], JOB_STATE_FAILED)
+        self.assertNotEqual(check2["job"]["status"], JOB_STATE_SUCCEEDED)
+
+    # --------------------------------------------------------------------------
+    # 13. Unversioned Stale Result Rejected on Multi-Attempt Job (V1.2)
+    # --------------------------------------------------------------------------
+    def test_13_unversioned_stale_result_rejected_on_recovered_job(self):
+        """Verify unversioned result (omitting attempt number) is fenced when current_attempt > 1."""
+        worker = SimulatedWorker(
+            "unversioned-worker-13",
+            controller_url=self.controller_url,
+            enrollment_token=self.enrollment_token
+        )
+        worker.register()
+        worker.send_heartbeat()
+
+        _, sub = self._api_post(
+            "/jobs",
+            {"type": "echo", "target": worker.node_id, "max_attempts": 3, "timeout": 5},
+            token=self.enrollment_token
+        )
+        job_id = sub["job_id"]
+        worker.poll_and_claim_job()
+
+        # Job lease expires and advances to attempt 2
+        jobs_db = load_jobs_db()
+        jobs_db["jobs"][job_id]["attempt"] = 2
+        jobs_db["jobs"][job_id]["status"] = JOB_STATE_RUNNING
+        save_jobs_db(jobs_db)
+
+        # Worker submits result WITHOUT attempt key
+        url = f"{self.controller_url}/jobs/{job_id}/result"
+        payload = {
+            "status": JOB_STATE_SUCCEEDED,
+            "stdout": "Unversioned late result"
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {worker.auth_token}"},
+            method="POST"
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 409)
+
+    # --------------------------------------------------------------------------
+    # 14. Worker Result Rejected While Job in RECOVERING (V1.2)
+    # --------------------------------------------------------------------------
+    def test_14_worker_result_rejected_while_job_in_recovering(self):
+        """Verify result submission is rejected when active lease was revoked and job is in RECOVERING."""
+        worker = SimulatedWorker(
+            "recovering-worker-14",
+            controller_url=self.controller_url,
+            enrollment_token=self.enrollment_token
+        )
+        worker.register()
+        worker.send_heartbeat()
+
+        _, sub = self._api_post(
+            "/jobs",
+            {"type": "echo", "target": worker.node_id, "max_attempts": 3, "timeout": 5},
+            token=self.enrollment_token
+        )
+        job_id = sub["job_id"]
+        worker.poll_and_claim_job()
+
+        # Move job to RECOVERING via lease expiry
+        jobs_db = load_jobs_db()
+        nodes_db = load_nodes_db()
+        jobs_db["jobs"][job_id]["lease_expires_at"] = time.time() - 10
+        sweep_expired_leases(jobs_db, nodes_db, timeout_seconds=5)
+        save_jobs_db(jobs_db)
+
+        # Attempt to submit result while in RECOVERING
+        url = f"{self.controller_url}/jobs/{job_id}/result"
+        payload = {
+            "status": JOB_STATE_SUCCEEDED,
+            "attempt": 2,
+            "stdout": "Result while in recovering"
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {worker.auth_token}"},
+            method="POST"
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 409)
+
+    # --------------------------------------------------------------------------
+    # 15. Auto Job Recovery Clears Target Node For Alternate Worker (V1.2)
+    # --------------------------------------------------------------------------
+    def test_15_auto_job_recovering_clears_target_allowing_alternate_worker(self):
+        """Verify auto-scheduled job clearing target_node on worker disconnect allows alternate worker claim."""
+        w1 = SimulatedWorker(
+            "auto-node-1",
+            controller_url=self.controller_url,
+            enrollment_token=self.enrollment_token
+        )
+        w1.register()
+        w1.send_heartbeat()
+
+        # Submit auto job targeting auto
+        _, sub = self._api_post(
+            "/jobs",
+            {"type": "echo", "target": "auto", "max_attempts": 3, "timeout": 5},
+            token=self.enrollment_token
+        )
+        job_id = sub["job_id"]
+
+        # Worker 1 claims it
+        claimed1 = w1.poll_and_claim_job()
+        self.assertIsNotNone(claimed1)
+
+        # Worker 1 crashes / goes offline with no other worker present
+        jobs_db = load_jobs_db()
+        nodes_db = load_nodes_db()
+        for nid in list(nodes_db.get("nodes", {}).keys()):
+            nodes_db["nodes"][nid]["status"] = "OFFLINE"
+            nodes_db["nodes"][nid]["last_seen"] = "2020-01-01T00:00:00Z"
+            if "last_heartbeat" in nodes_db["nodes"][nid]:
+                nodes_db["nodes"][nid]["last_heartbeat"]["timestamp"] = "2020-01-01T00:00:00Z"
+        jobs_db["jobs"][job_id]["lease_expires_at"] = time.time() - 10
+        sweep_expired_leases(jobs_db, nodes_db, timeout_seconds=5)
+        save_jobs_db(jobs_db)
+        save_nodes_db(nodes_db)
+
+        # Job is in RECOVERING, and target_node must be None (not stranded on w1)
+        _, check_rec = self._api_get(f"/jobs/{job_id}", token=self.enrollment_token)
+        self.assertEqual(check_rec["job"]["status"], JOB_STATE_RECOVERING)
+        self.assertIsNone(check_rec["job"].get("target_node"))
+
+        # Worker 2 registers and comes online
+        w2 = SimulatedWorker(
+            "auto-node-2",
+            controller_url=self.controller_url,
+            enrollment_token=self.enrollment_token
+        )
+        w2.register()
+        w2.send_heartbeat()
+
+        # Worker 2 polls: must be able to claim the recovering job!
+        claimed2 = w2.poll_and_claim_job()
+        self.assertIsNotNone(claimed2)
+        self.assertEqual(claimed2["job_id"], job_id)
+        self.assertEqual(claimed2["attempt"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+

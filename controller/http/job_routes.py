@@ -787,29 +787,91 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             handler.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
             return True
 
-        # Stale worker protection: check attempt number if provided
-        reported_attempt = body.get("attempt")
-        current_attempt = job.get("attempt", 1)
         corr_id = job.get("correlation_id") or getattr(handler, "current_correlation_id", None) or generate_correlation_id()
-        if reported_attempt is not None and int(reported_attempt) < current_attempt:
+        current_attempt = int(job.get("attempt", 1))
+        canon_curr_status = canonicalize_job_state(job.get("status"))
+
+        # 1. Idempotency / Terminal state protection
+        # If job is already in a terminal state, guard against overwriting terminal states or acknowledge duplicates.
+        if canon_curr_status in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED, JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_REJECTED):
+            reported_st = canonicalize_job_state(body.get("status"))
+            if canon_curr_status in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED):
+                handler.send_json(200, {
+                    "status": job.get("status"),
+                    "message": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Duplicate report ignored.",
+                    "job_id": job_id,
+                    "duplicate": True
+                })
+                return True
+            elif reported_st == JOB_STATE_SUCCEEDED:
+                controller_logger.warning(
+                    "worker.late_success_on_terminal",
+                    f"Rejected late result for terminal job '{job_id}': current state is '{job.get('status')}', reported status is '{body.get('status')}'",
+                    correlation_id=corr_id,
+                    job_id=job_id,
+                    node_id=target_node,
+                    current_status=job.get("status"),
+                    reported_status=body.get("status")
+                )
+                handler.send_json(409, {
+                    "error": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Late result rejected.",
+                    "job_id": job_id,
+                    "status": job.get("status"),
+                    "terminal": True
+                })
+                return True
+            elif canon_curr_status in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_REJECTED):
+                if reported_st == JOB_STATE_TIMED_OUT and canon_curr_status == JOB_STATE_FAILED:
+                    pass  # Allow worker's truthful timeout execution result to refine swept failure state
+                else:
+                    handler.send_json(200, {
+                        "status": job.get("status"),
+                        "message": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Duplicate failure report ignored.",
+                        "job_id": job_id,
+                        "duplicate": True
+                    })
+                    return True
+
+        # 2. In-flight lease protection: reject results if active lease was revoked or in retry wait
+        if canon_curr_status in (JOB_STATE_RETRY_WAIT, JOB_STATE_RECOVERING):
             controller_logger.warning(
-                "worker.stale_attempt",
-                f"Stale worker result for job '{job_id}': reported attempt {reported_attempt} < current attempt {current_attempt}",
+                "worker.recovering_lease_expired",
+                f"Rejected result for job '{job_id}' in '{job.get('status')}' state: active lease was revoked or worker disconnected",
                 correlation_id=corr_id,
                 job_id=job_id,
                 node_id=target_node,
-                reported_attempt=reported_attempt,
                 current_attempt=current_attempt
             )
             handler.send_json(409, {
-                "error": f"Stale worker result: reported attempt {reported_attempt} is older than current attempt {current_attempt}.",
+                "error": f"Cannot submit result for job '{job_id}' in '{job.get('status')}' state: active lease expired or worker disconnected.",
+                "job_id": job_id,
+                "current_attempt": current_attempt,
+                "lease_expired": True
+            })
+            return True
+
+        # 3. Stale worker protection: check attempt number if provided (or default to 1 for unversioned reports)
+        reported_attempt = body.get("attempt")
+        eff_reported_attempt = int(reported_attempt) if reported_attempt is not None else (1 if current_attempt > 1 else current_attempt)
+        if eff_reported_attempt < current_attempt:
+            controller_logger.warning(
+                "worker.stale_attempt",
+                f"Stale worker result for job '{job_id}': reported attempt {eff_reported_attempt} < current attempt {current_attempt}",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                reported_attempt=eff_reported_attempt,
+                current_attempt=current_attempt
+            )
+            handler.send_json(409, {
+                "error": f"Stale worker result: reported attempt {eff_reported_attempt} is older than current attempt {current_attempt}.",
                 "job_id": job_id,
                 "current_attempt": current_attempt,
                 "stale_attempt": True
             })
             return True
 
-        # Fencing token: reject superseded lease generations
+        # 4. Fencing token: reject superseded lease generations
         reported_gen = body.get("lease_generation")
         current_gen = int(job.get("lease_generation", 1))
         if reported_gen is not None and int(reported_gen) < current_gen:
@@ -827,16 +889,6 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 "job_id": job_id,
                 "current_generation": current_gen,
                 "superseded": True
-            })
-            return True
-
-        # Idempotency / Stale report protection: Ignore duplicate reports if job is already terminal
-        if job.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED) or (job.get("status") == JOB_STATE_FAILED and job.get("result") is not None and current_attempt >= job.get("max_attempts", 3)):
-            handler.send_json(200, {
-                "status": job.get("status"),
-                "message": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Duplicate report ignored.",
-                "job_id": job_id,
-                "duplicate": True
             })
             return True
 

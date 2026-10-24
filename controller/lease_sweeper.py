@@ -113,6 +113,8 @@ def sweep_expired_leases(
                     job["retry_reason"] = reason
                     job["claimed_at"] = None
                     job["lease_expires_at"] = None
+                    # Advance fencing token immediately so superseded attempts are rejected
+                    job["lease_generation"] = int(job.get("lease_generation", 0)) + 1
 
                     base_backoff = float(job.get("backoff_sec") if job.get("backoff_sec") is not None else default_backoff_sec)
                     backoff_sec = min(60.0, base_backoff * (2 ** (attempt - 1)))
@@ -133,6 +135,8 @@ def sweep_expired_leases(
                                 "reason": f"Recovered from {target_node} ({reason})"
                             }
                         else:
+                            job["target_node"] = None
+                            job["assigned_node"] = None
                             job["waiting_reason"] = f"Awaiting eligible worker for recovery retry: {decision.get('reason')}"
                     else:
                         job["target_node"] = target_mode
@@ -159,6 +163,13 @@ def sweep_expired_leases(
                     job["finished_at"] = now_iso
                     job["retry_reason"] = f"Max retries ({max_attempts}) exceeded after: {reason}" if attempt >= max_attempts else f"Non-retryable failure: {reason}"
                     job["lease_expires_at"] = None
+                    job["result"] = {
+                        "status": JOB_STATE_FAILED,
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": job["retry_reason"],
+                        "duration_ms": 0,
+                    }
                     controller_logger.error(
                         "job.recovery_exhausted",
                         f"Job {job_id} permanently marked FAILED ({job['retry_reason']}).",
@@ -171,8 +182,8 @@ def sweep_expired_leases(
 
                 changed = True
 
-        # B: Queued Auto Jobs (Evaluate newly eligible workers)
-        elif canon_status == JOB_STATE_QUEUED and not target_node and job.get("target", "auto") == "auto":
+        # B: Queued & Recovering Auto Jobs (Evaluate newly eligible workers)
+        elif canon_status in (JOB_STATE_QUEUED, JOB_STATE_RETRY_WAIT) and not target_node and job.get("target", "auto") == "auto":
             decision = ResourceScheduler.select_node(
                 job.get("requirements", {}),
                 nodes_db,
@@ -200,6 +211,14 @@ def sweep_expired_leases(
                         job["scheduler"]["reason"] = decision["reason"]
                         job["scheduler"]["rejected"] = decision.get("rejected", {})
                     changed = True
+
+        # B2: Recovering Auto Jobs with Offline Target (Reset target so another worker can claim)
+        elif canon_status == JOB_STATE_RETRY_WAIT and target_node and job.get("target", "auto") == "auto":
+            if node_live in (STATE_OFFLINE, STATE_REMOVED):
+                job["target_node"] = None
+                job["assigned_node"] = None
+                job["waiting_reason"] = f"Recovery worker '{target_node}' went {node_live}. Awaiting eligible worker."
+                changed = True
 
         # C: Queued Pinned Node Evaluation (Prevent infinite silent queueing)
         elif canon_status in (JOB_STATE_QUEUED, JOB_STATE_NEEDS_ATTENTION):
