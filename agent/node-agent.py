@@ -701,7 +701,14 @@ def is_pid_alive(pid_str, pattern=None):
     except OSError:
         return False
     if pattern:
-        args = run_cmd(f"ps -p {pid} -o args=")
+        cmdline_file = Path(f"/proc/{pid}/cmdline")
+        if cmdline_file.exists():
+            try:
+                cmd_raw = cmdline_file.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                return pattern in cmd_raw
+            except Exception:
+                pass
+        args = run_cmd(f"ps -p {pid} -o args= 2>/dev/null || ps -ef")
         return pattern in args
     return True
 
@@ -711,33 +718,65 @@ def get_service_states():
 
     if is_docker_available():
         services["docker"] = "running"
+    elif is_udocker_available():
+        services["container_runtime"] = "running"
 
-    if (BASE_DIR / "services" / "node-api" / "app.py").exists():
-        api_pid = ""
-        api_pid_file = RUNTIME_DIR / "node-api.pid"
-        if api_pid_file.exists():
-            try:
-                api_pid = api_pid_file.read_text().strip()
-            except Exception:
-                pass
+    # Track Node Worker daemon
+    worker_pid = ""
+    worker_pid_file = RUNTIME_DIR / "node-worker.pid"
+    if worker_pid_file.exists():
+        try:
+            worker_pid = worker_pid_file.read_text().strip()
+        except Exception:
+            pass
+    if not is_pid_alive(worker_pid, "node-agent.py work"):
+        worker_pid = run_cmd("pgrep -f 'agent/node-agent.py work' | head -n 1")
+    if not is_pid_alive(worker_pid, "node-agent.py work"):
+        worker_pid = run_cmd("pgrep -f 'node-agent.py work' | head -n 1")
 
-        if not is_pid_alive(api_pid, "services/node-api/app.py"):
-            api_pid = run_cmd("pgrep -f 'services/node-api/app.py' | head -n 1")
+    if is_pid_alive(worker_pid, "node-agent.py work") or is_pid_alive(worker_pid, "agent/node-agent.py work"):
+        services["node_worker"] = "running"
+    else:
+        # Also check local_worker
+        lw_pid = run_cmd("pgrep -f 'local_worker' | head -n 1")
+        if is_pid_alive(lw_pid, "local_worker"):
+            services["node_worker"] = "running"
 
-        if is_pid_alive(api_pid, "services/node-api/app.py"):
-            try:
-                req = urllib.request.Request("http://127.0.0.1:8080/health", headers={"User-Agent": "NodeAgent/1.0"})
-                with urllib.request.urlopen(req, timeout=6) as resp:
-                    if resp.status == 200:
-                        services["node_api"] = "running"
-                    else:
-                        services["node_api"] = "degraded"
-            except Exception:
-                services["node_api"] = "unresponsive"
-        elif (BASE_DIR / "scripts" / "start.sh").exists() or (BASE_DIR / "start.sh").exists():
-            services["node_api"] = "stopped"
+    # Track Node API and Cloudflare only for controller/gateway nodes
+    node_cfg = load_node_config() or {}
+    role = node_cfg.get("role", "")
+    token_file = SECRETS_DIR / "cloudflared.token"
+    is_gateway = (role in ("controller", "gateway"))
 
-    if (BASE_DIR / "scripts" / "start.sh").exists() or (BASE_DIR / "start.sh").exists():
+    if (BASE_DIR / "services" / "node-api" / "app.py").exists() and is_gateway:
+        is_healthy = False
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8080/health", headers={"User-Agent": "NodeAgent/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    services["node_api"] = "running"
+                    is_healthy = True
+        except Exception:
+            pass
+
+        if not is_healthy:
+            api_pid = ""
+            api_pid_file = RUNTIME_DIR / "node-api.pid"
+            if api_pid_file.exists():
+                try:
+                    api_pid = api_pid_file.read_text().strip()
+                except Exception:
+                    pass
+
+            if not is_pid_alive(api_pid, "services/node-api/app.py"):
+                api_pid = run_cmd("pgrep -f 'services/node-api/app.py' | tail -n 1")
+
+            if is_pid_alive(api_pid, "services/node-api/app.py"):
+                services["node_api"] = "degraded"
+            else:
+                services["node_api"] = "stopped"
+
+    if is_gateway and token_file.exists():
         cf_pid = ""
         cf_pid_file = RUNTIME_DIR / "cloudflared.pid"
         if cf_pid_file.exists():

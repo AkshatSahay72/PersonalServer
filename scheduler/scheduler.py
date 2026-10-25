@@ -128,8 +128,14 @@ def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
 
         last_hb = node.get("last_heartbeat", {})
         services = last_hb.get("services", {})
-        if services and any(v in ("unresponsive", "degraded", "stopped") for v in services.values()):
-            return STATE_UNHEALTHY
+        role = node.get("role", "compute")
+        if role == "compute":
+            # For compute workers, worker daemon availability is critical
+            if services and services.get("node_worker") in ("unresponsive", "degraded", "stopped"):
+                return STATE_UNHEALTHY
+        else:
+            if services and any(v in ("unresponsive", "degraded", "stopped") for v in services.values()):
+                return STATE_UNHEALTHY
 
         node_status = node.get("status")
         if node_status in (STATE_DRAINING, STATE_DEBOARDING):
