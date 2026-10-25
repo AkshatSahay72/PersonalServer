@@ -75,6 +75,7 @@ INTEGRATION_TEST_FILES = [
     "tests/ha/test_ha_failover.py",
     "tests/ha/test_ha_global_header.py",
     "tests/ha/test_ha_leader_identity_audit.py",
+    "tests/ha/test_cluster_inventory_v18.py",
     # Web UI domain
     "tests/ui/test_dashboard_js_syntax.py",
     "tests/ui/test_shell_layout_stability.py",
