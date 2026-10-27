@@ -1112,8 +1112,9 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             return True
 
         content_len = int(handler.headers.get("Content-Length", 0))
-        if content_len > 100 * 1024 * 1024:
-            handler.send_json(413, {"error": "Upload exceeds 100 MB limit"})
+        max_upload = int(os.environ.get("MAX_UPLOAD_BYTES")) if os.environ.get("MAX_UPLOAD_BYTES") else None
+        if max_upload is not None and content_len > max_upload:
+            handler.send_json(413, {"error": f"Upload exceeds {max_upload // (1024 * 1024)} MB limit"})
             return True
 
         content_type = handler.headers.get("Content-Type", "")

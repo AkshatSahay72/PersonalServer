@@ -608,6 +608,94 @@ a:hover {
   color: var(--text-muted);
 }
 
+/* Workload Control & Artifact Display */
+.detail-artifacts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.artifact-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.artifact-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.artifact-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.artifact-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-main);
+}
+.artifact-id-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  background: rgba(88, 166, 255, 0.15);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+  color: #58a6ff;
+  border-radius: 4px;
+}
+.artifact-sha {
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+.artifact-download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  text-decoration: none;
+  flex-shrink: 0;
+}
+.job-code-textarea {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  color: var(--text-main);
+  padding: 8px 10px;
+  resize: vertical;
+}
+.job-code-textarea:focus {
+  border-color: #58a6ff;
+  outline: none;
+}
+.job-auto-refresh-pill {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.job-auto-refresh-pill.active {
+  color: #3fb950;
+  border-color: rgba(63, 185, 80, 0.3);
+  background: rgba(63, 185, 80, 0.1);
+}
+
 /* Windows File Explorer Container & Layout */
 .explorer-frame {
   display: flex;
@@ -846,6 +934,10 @@ a:hover {
   background-color: var(--bg-active);
   color: var(--text-main);
   font-weight: 600;
+}
+
+.explorer-node-item.disabled-node {
+  opacity: 0.65;
 }
 
 .shortcut-glyph {

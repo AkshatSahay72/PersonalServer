@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PersonalServer - Server Console</title>
-  <link rel="stylesheet" href="/static/style.css?v=1.6.3">
+  <link rel="stylesheet" href="/static/style.css?v=1.7.1">
 </head>
 <body>
   <div class="app-layout">
@@ -318,6 +318,7 @@
           </div>
           <div class="jobs-header-actions">
             <button id="toggle-submit-job-btn" class="btn btn-sm btn-primary" onclick="toggleSubmitJobCard()">+ Submit Workload</button>
+            <span id="jobs-auto-refresh-badge" class="job-auto-refresh-pill" title="Live status updates active">● Live</span>
             <button class="btn btn-sm" onclick="loadJobs()" title="Refresh Jobs">⟳ Refresh</button>
           </div>
         </div>
@@ -334,21 +335,25 @@
                 <label for="job-template-select">Workload Template</label>
                 <select id="job-template-select" class="form-input" onchange="applyJobTemplate(this.value)">
                   <option value="">-- Choose Template --</option>
+                  <option value="python" selected>Python Script Execution</option>
                   <option value="ping">Ping Check (8.8.8.8)</option>
                   <option value="http">HTTP Health Check</option>
                   <option value="dns">DNS Resolution</option>
-                  <option value="python">Python Script Execution</option>
                   <option value="shell">Shell Script Execution</option>
                   <option value="sysinfo">System Info</option>
                 </select>
               </div>
               <div class="form-cell">
+                <label for="job-name">Job Name (optional)</label>
+                <input type="text" id="job-name" class="form-input" placeholder="e.g. data-aggregation">
+              </div>
+              <div class="form-cell">
                 <label for="job-type">Workload Type</label>
-                <select id="job-type" class="form-input" required>
+                <select id="job-type" class="form-input" onchange="onJobTypeChange(this.value)" required>
+                  <option value="python-script" selected>python-script</option>
                   <option value="ping-check">ping-check (ICMP)</option>
                   <option value="http-check">http-check (HTTP/S)</option>
                   <option value="dns-check">dns-check (DNS)</option>
-                  <option value="python-script">python-script</option>
                   <option value="shell-script">shell-script</option>
                   <option value="system-info">system-info</option>
                   <option value="health-check">health-check</option>
@@ -359,9 +364,11 @@
                 </select>
               </div>
               <div class="form-cell">
-                <label for="job-target">Target Node</label>
+                <label for="job-target">Target Node / Capability</label>
                 <select id="job-target" class="form-input mono">
                   <option value="auto">Auto (Resource Scheduler)</option>
+                  <option value="capability:python3">Capability: python3 (Verified)</option>
+                  <option value="capability:container_runtime:udocker">Capability: udocker</option>
                 </select>
               </div>
               <div class="form-cell">
@@ -376,15 +383,57 @@
                 <label for="job-timeout">Timeout (s)</label>
                 <input type="number" id="job-timeout" class="form-input mono" value="60" min="5" max="300">
               </div>
-              <div class="form-cell" style="grid-column: span 2;">
-                <label for="job-params">Parameters (JSON)</label>
+
+              <!-- Dedicated Python Code Editor -->
+              <div class="form-cell" style="grid-column: 1 / -1;" id="job-code-group">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                  <label for="job-python-code" style="margin: 0; font-weight: 600;">Python Script Code</label>
+                  <span class="cell-muted mono" style="font-size: 11px;">Runs in isolated sandbox on target worker</span>
+                </div>
+                <textarea id="job-python-code" class="job-code-textarea" rows="6" placeholder="# Enter Python code to execute on worker&#10;import sys, platform&#10;print(f'PersonalServer compute node: {platform.node()}')&#10;"></textarea>
+              </div>
+
+              <!-- Optional Workload Arguments -->
+              <div class="form-cell" id="job-args-group">
+                <label for="job-args">Script Arguments (optional)</label>
+                <input type="text" id="job-args" class="form-input mono" placeholder='["--sample", "5"] or --flag'>
+              </div>
+
+              <!-- Resource Requirements -->
+              <div class="form-cell" id="job-resources-group">
+                <label for="job-min-ram">Min RAM / Cores (optional)</label>
+                <div style="display: flex; gap: 6px;">
+                  <input type="number" id="job-min-ram" class="form-input mono" placeholder="RAM MB (64)" min="16" max="32768">
+                  <input type="number" id="job-min-cores" class="form-input mono" placeholder="Cores (1)" min="1" max="64">
+                </div>
+              </div>
+
+              <!-- Input Artifact IDs -->
+              <div class="form-cell" id="job-inputs-group">
+                <label for="job-inputs">Input Artifact IDs (optional)</label>
+                <input type="text" id="job-inputs" class="form-input mono" placeholder="art-xxxx, art-yyyy">
+              </div>
+
+              <!-- Expected Output Files -->
+              <div class="form-cell" id="job-outputs-group">
+                <label for="job-outputs">Expected Output Files (optional)</label>
+                <input type="text" id="job-outputs" class="form-input mono" placeholder="summary.json, output.csv">
+              </div>
+
+              <!-- Fallback / Advanced JSON Parameters -->
+              <div class="form-cell" style="grid-column: 1 / -1; display: none;" id="job-params-group">
+                <label for="job-params">Custom Parameters (JSON)</label>
                 <input type="text" id="job-params" class="form-input mono" placeholder='{"host": "8.8.8.8", "count": 4}'>
               </div>
-              <div class="form-cell form-btn-cell" style="display: flex; align-items: flex-end; gap: 8px;">
-                <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 8px; cursor: pointer;">
-                  <input type="checkbox" id="job-pinned" style="cursor: pointer;"> Pin to Node
+
+              <div class="form-cell form-btn-cell" style="grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+                <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;">
+                  <input type="checkbox" id="job-pinned" style="cursor: pointer;"> Pin to target node (prevent failover migration)
                 </label>
-                <button type="submit" class="btn btn-primary" style="margin-bottom: 4px;">Dispatch Job</button>
+                <div style="display: flex; gap: 8px;">
+                  <button type="button" class="btn btn-sm" onclick="toggleSubmitJobCard(false)">Cancel</button>
+                  <button type="submit" class="btn btn-primary">Dispatch Workload</button>
+                </div>
               </div>
             </div>
           </form>
@@ -450,9 +499,9 @@
             <table class="data-table">
               <thead>
                 <tr>
-                  <th style="width: 140px;">Job ID</th>
-                  <th>Workload</th>
-                  <th>Target Node</th>
+                  <th style="width: 130px;">Job ID</th>
+                  <th>Workload / Name</th>
+                  <th>Target / Worker</th>
                   <th style="width: 110px;">Status</th>
                   <th>Attempt</th>
                   <th>Duration</th>
@@ -503,13 +552,39 @@
             <div class="detail-grid mono" id="job-detail-summary">
               <!-- Dynamic -->
             </div>
-            <div style="margin-top: 12px;">
-              <div class="code-header mono">Workload Parameters:</div>
-              <pre id="job-detail-params" class="log-box mono" style="max-height: 120px;"></pre>
+
+            <!-- Published Output Artifacts -->
+            <div id="job-detail-artifacts-wrap" style="margin-top: 14px; display: none;">
+              <div class="code-header mono">Published Output Artifacts:</div>
+              <div id="job-detail-artifacts-list" class="detail-artifacts-list">
+                <!-- Dynamic artifacts with authorized download links -->
+              </div>
             </div>
-            <div style="margin-top: 12px;">
-              <div class="code-header mono">Execution Output:</div>
-              <pre id="job-detail-stdout" class="log-box mono" style="max-height: 280px;"></pre>
+
+            <!-- Consumed Input Artifacts -->
+            <div id="job-detail-inputs-wrap" style="margin-top: 14px; display: none;">
+              <div class="code-header mono">Consumed Input Artifacts:</div>
+              <div id="job-detail-inputs-list" class="detail-artifacts-list">
+                <!-- Dynamic input artifacts -->
+              </div>
+            </div>
+
+            <!-- Workload Parameters / Script Code -->
+            <div style="margin-top: 14px;">
+              <div class="code-header mono">Workload Code / Parameters:</div>
+              <pre id="job-detail-params" class="log-box mono" style="max-height: 160px;"></pre>
+            </div>
+
+            <!-- Standard Output -->
+            <div style="margin-top: 14px;" id="job-detail-stdout-wrap">
+              <div class="code-header mono">Standard Output (stdout):</div>
+              <pre id="job-detail-stdout" class="log-box mono" style="max-height: 260px;"></pre>
+            </div>
+
+            <!-- Standard Error -->
+            <div style="margin-top: 14px; display: none;" id="job-detail-stderr-wrap">
+              <div class="code-header mono" style="color: var(--status-red, #f85149);">Standard Error (stderr):</div>
+              <pre id="job-detail-stderr" class="log-box mono" style="max-height: 260px; border-color: rgba(248, 81, 73, 0.3);"></pre>
             </div>
           </div>
         </div>
@@ -1282,6 +1357,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=1.7.0"></script>
+  <script src="/static/app.js?v=1.7.2"></script>
 </body>
 </html>

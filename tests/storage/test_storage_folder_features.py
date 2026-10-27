@@ -371,19 +371,24 @@ class TestStorageFolderFeatures(unittest.TestCase):
         self.assertTrue(created.is_dir())
 
     def test_10_upload_exceeds_max_limit_rejected(self):
-        """Verify upload exceeding MAX_UPLOAD_BYTES is rejected with HTTP 413."""
-        url = f"{self.base_url}/storage/upload?path="
-        # 105 MB Content-Length header
-        headers = self._auth_headers({
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(105 * 1024 * 1024)
-        })
-        req = urllib.request.Request(url, data=b"", headers=headers, method="POST")
+        """Verify upload exceeding MAX_UPLOAD_BYTES is rejected with HTTP 413 when configured."""
+        orig_limit = node_api_mod.MAX_UPLOAD_BYTES
         try:
-            urllib.request.urlopen(req)
-            self.fail("Expected HTTP 413")
-        except urllib.error.HTTPError as e:
-            self.assertEqual(e.code, 413)
+            node_api_mod.MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+            url = f"{self.base_url}/storage/upload?path="
+            # 105 MB Content-Length header
+            headers = self._auth_headers({
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(105 * 1024 * 1024)
+            })
+            req = urllib.request.Request(url, data=b"", headers=headers, method="POST")
+            try:
+                urllib.request.urlopen(req)
+                self.fail("Expected HTTP 413")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 413)
+        finally:
+            node_api_mod.MAX_UPLOAD_BYTES = orig_limit
 
 
 if __name__ == "__main__":
