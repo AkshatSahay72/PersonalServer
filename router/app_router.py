@@ -379,6 +379,18 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response(404, {"error": "Application route not found", "status": 404})
             return
 
+        # Direct application/route redirect support (e.g. root domain portfolio redirect)
+        redirect_target = app.get("redirect") or (app.get("route", {}) if isinstance(app.get("route"), dict) else {}).get("redirect")
+        if redirect_target:
+            target_url = f"{str(redirect_target).rstrip('/')}{path}"
+            if query_str:
+                target_url += f"?{query_str}"
+            self.send_response(307)
+            self.send_header("Location", target_url)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         # Upstream resolution
         status_code, target_res, extra_hdrs = ApplicationRouter.resolve_target_upstream(app, nodes_db)
         if status_code != 200:
