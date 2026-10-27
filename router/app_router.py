@@ -195,7 +195,11 @@ class ApplicationRouter:
 
                 return app, reg_path_clean, remainder, False, None
 
-        # 2. Root application fallback (longest-prefix: serves '/' and all unreserved top-level paths)
+        # 2. Application namespace boundary: requests under /apps/ must not fall through to root
+        if path_only_lower == "/apps" or path_only_lower.startswith("/apps/"):
+            return None, None, None, False, None
+
+        # 3. Root application fallback (longest-prefix: serves '/' and all unreserved top-level paths)
         for app in apps_db.get("apps", {}).values():
             if app.get("status") in ("DELETED", "deleted"):
                 continue
