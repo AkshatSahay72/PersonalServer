@@ -103,7 +103,8 @@ class DeploymentManager:
             "public_path": clean_path,
             "status": existing_rec.get("status", "CREATED"),
             "runtime": manifest_data.get("runtime", "python"),
-            "port": int(manifest_data.get("port") or manifest_data.get("container_port") or 8090),
+            "port": int(manifest_data.get("port") or manifest_data.get("container_port") or manifest_data.get("host_port") or 8090),
+            "host_port": int(manifest_data.get("port") or manifest_data.get("container_port") or manifest_data.get("host_port") or 8090),
             "components": manifest_data.get("components", {}),
             "health_check": manifest_data.get("health_check", {
                 "path": "/health",
@@ -215,7 +216,7 @@ class DeploymentManager:
         if artifact_path and artifact_sha256:
             DeploymentManager.verify_artifact_checksum(artifact_path, artifact_sha256)
 
-        port = port_override or int(app.get("port") or 8090)
+        port = port_override or int(app.get("port") or app.get("host_port") or 8090)
 
         # 2. Port Conflict Check (Pre-flight)
         if not SafeProcessLifecycleManager.check_port_available(port):
@@ -392,6 +393,7 @@ class DeploymentManager:
             "status": "SUCCESS",
             "node": selected_node,
             "port": port,
+            "host_port": port,
             "pid": record.pid,
             "release_dir": str(release_dir),
             "artifact_sha256": artifact_sha256,
@@ -402,6 +404,7 @@ class DeploymentManager:
         app["status"] = "RUNNING"
         app["selected_node"] = selected_node
         app["port"] = port
+        app["host_port"] = port
         app["active_deployment_id"] = dep_id
         app["failure_reason"] = None
         app["updated_at"] = get_current_iso_timestamp()
@@ -451,7 +454,7 @@ class DeploymentManager:
         SafeProcessLifecycleManager.stop_process(app_id)
 
         target_dep_id = target_dep["deployment_id"]
-        target_port = target_dep.get("port") or app.get("port", 8090)
+        target_port = target_dep.get("host_port") or target_dep.get("port") or app.get("host_port") or app.get("port", 8090)
 
         # Restore and run prior deployment
         app_sandbox = STORAGE_APPS_DIR / app_id
@@ -500,6 +503,7 @@ class DeploymentManager:
         app["status"] = "RUNNING"
         app["active_deployment_id"] = target_dep_id
         app["port"] = target_port
+        app["host_port"] = target_port
         app["updated_at"] = get_current_iso_timestamp()
         save_apps_db(db)
 
@@ -548,7 +552,7 @@ class DeploymentManager:
         record = SafeProcessLifecycleManager.read_record(app_id)
         is_running = SafeProcessLifecycleManager.is_pid_active(record.pid) if record else False
 
-        port = record.port if record else app.get("port")
+        port = record.port if record else (app.get("port") or app.get("host_port"))
 
         return {
             "app_id": app_id,
@@ -557,6 +561,7 @@ class DeploymentManager:
             "active_deployment_id": app.get("active_deployment_id"),
             "selected_node": app.get("selected_node"),
             "port": port,
+            "host_port": port,
             "pid": record.pid if record else None,
             "address": f"http://127.0.0.1:{port}" if port else None,
             "deployments_count": len(app.get("deployments", [])),
