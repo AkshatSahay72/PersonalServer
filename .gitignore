@@ -4,6 +4,7 @@ config/node.conf
 config/controller.json
 config/network.json
 config/services.json
+config/node_worker.json
 
 # Environment variables & secrets
 .env
@@ -19,8 +20,7 @@ config/secrets/*
 
 # Scratch & temporary development scripts
 scratch/*
-!scratch/README.md
-!scratch/*.py
+!scratch/demo_dag_workflow.py
 
 # Runtime & Persistence
 logs/
@@ -32,7 +32,10 @@ backups/
 *.tar
 *.zip
 *.pid
-*.bak
+*.bak*
+*.old*
+storage/system/
+vivo_probe.py
 
 # Testing & quality artifacts
 .pytest_cache/
