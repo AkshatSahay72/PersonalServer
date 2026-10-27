@@ -77,6 +77,17 @@ def handle_app_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         })
         return True
 
+    # GET /apps/<app_id>/status
+    if path.startswith("/apps/") and path.endswith("/status"):
+        app_id = path[6:-7].strip()
+        try:
+            from controller.deployment_manager import DeploymentManager
+            status_data = DeploymentManager.get_application_status(app_id)
+            handler.send_json(200, status_data)
+        except Exception as e:
+            handler.send_json(404, {"error": str(e)})
+        return True
+
     # GET /apps/<app_id>/deployments
     if path.startswith("/apps/") and path.endswith("/deployments"):
         app_id = path[6:-12].strip()
@@ -287,11 +298,26 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             handler.send_json(400, {"error": f"Inspection failed: {e}"})
         return True
 
-    # POST /apps - Create Application
+    # POST /apps - Create Application or Register Manifest
     if path == "/apps":
         if not body:
             handler.send_json(400, {"error": "Missing JSON request body"})
             return True
+
+        if "components" in body or "public_path" in body or "manifest" in body or body.get("runtime") in ("python", "python3", "self-hosted"):
+            try:
+                from controller.deployment_manager import DeploymentManager
+                manifest_payload = body.get("manifest") if "manifest" in body and isinstance(body.get("manifest"), dict) else body
+                app_record = DeploymentManager.register_manifest(manifest_payload)
+                handler.send_json(201, {
+                    "status": "created",
+                    "app_id": app_record["app_id"],
+                    "app": mask_app_record(app_record)
+                })
+                return True
+            except Exception as e:
+                handler.send_json(400, {"error": str(e)})
+                return True
 
         name = (body.get("name") or "").strip()
         source = body.get("source") or {"type": "manual"}
@@ -589,6 +615,34 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 handler.send_json(404, {"error": f"Application '{app_id}' not found"})
                 return True
 
+            if app.get("runtime") in ("python", "python3", "self-hosted") or app.get("components"):
+                try:
+                    from controller.deployment_manager import DeploymentManager
+                    artifact_file = None
+                    artifact_sha = None
+                    if body:
+                        if body.get("artifact_id"):
+                            from common.artifact_manager import get_artifact_file_path
+                            try:
+                                artifact_file = get_artifact_file_path(body["artifact_id"])
+                            except Exception:
+                                pass
+                        elif body.get("artifact_path"):
+                            artifact_file = Path(body["artifact_path"])
+                        artifact_sha = body.get("artifact_sha256")
+
+                    res = DeploymentManager.deploy_application(
+                        app_id=app_id,
+                        artifact_path=artifact_file,
+                        artifact_sha256=artifact_sha,
+                        port_override=body.get("port") if body else None
+                    )
+                    handler.send_json(200, res)
+                    return True
+                except Exception as e:
+                    handler.send_json(400, {"error": str(e), "app_id": app_id, "status": "FAILED"})
+                    return True
+
             source = app.get("source") or {"type": "manual"}
             source_type = source.get("type", "manual")
             now_iso = get_current_iso_timestamp()
@@ -815,6 +869,12 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 handler.send_json(404, {"error": f"Application '{app_id}' not found"})
                 return True
 
+            if app.get("runtime") in ("python", "python3", "self-hosted") or app.get("components"):
+                from controller.deployment_manager import DeploymentManager
+                res = DeploymentManager.stop_application(app_id)
+                handler.send_json(200, res)
+                return True
+
             target_node = app.get("selected_node")
             if not target_node:
                 app["status"] = APP_STATE_STOPPED
@@ -863,6 +923,15 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 handler.send_json(404, {"error": f"Application '{app_id}' not found"})
                 return True
 
+            if app.get("runtime") in ("python", "python3", "self-hosted") or app.get("components"):
+                from controller.deployment_manager import DeploymentManager
+                try:
+                    res = DeploymentManager.restart_application(app_id)
+                    handler.send_json(200, res)
+                except Exception as e:
+                    handler.send_json(400, {"error": str(e), "app_id": app_id})
+                return True
+
             target_node = app.get("selected_node")
             if not target_node:
                 handler.send_json(400, {"error": "Application is not deployed on any node."})
@@ -906,6 +975,16 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             app = apps_db.get("apps", {}).get(app_id)
             if not app or app.get("status") == "DELETED":
                 handler.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return True
+
+            if app.get("runtime") in ("python", "python3", "self-hosted") or app.get("components"):
+                from controller.deployment_manager import DeploymentManager
+                target_dep_id = (body.get("deployment_id") or body.get("target_deployment_id")) if body else None
+                try:
+                    res = DeploymentManager.rollback_application(app_id, target_dep_id)
+                    handler.send_json(200, res)
+                except Exception as e:
+                    handler.send_json(400, {"error": str(e), "app_id": app_id})
                 return True
 
             deployments = app.get("deployments", [])
