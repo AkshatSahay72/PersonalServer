@@ -416,6 +416,48 @@ class TestMultiApplicationPathRouting(unittest.TestCase):
         rf_entry = self.registry.get_by_name("RecallFlow")
         self.assertEqual(rf_entry.display_name, "RecallFlow AI")
 
+    # --------------------------------------------------------------------------
+    # Check 9: Multi-Segment Sub-Application Routing (/apps/ExamBuddy)
+    # --------------------------------------------------------------------------
+    def test_09_multi_segment_subapp_routing(self):
+        """Multi-segment public paths like /apps/ExamBuddy match correctly with longest-prefix."""
+        eb_srv, eb_port, _ = make_mock_server("frontend", "ExamBuddy")
+        try:
+            self.mock_apps_db["apps"]["app-exambuddy"] = {
+                "name": "ExamBuddy",
+                "public_path": "/apps/ExamBuddy",
+                "status": "active",
+                "components": {
+                    "frontend": {
+                        "type": "frontend",
+                        "provider": "self-hosted",
+                        "destination": f"http://127.0.0.1:{eb_port}",
+                        "routing": {
+                            "path_prefix": "/",
+                            "strip_mode": "strip_app"
+                        }
+                    }
+                }
+            }
+            # Test trailing slash normalization
+            status, headers, _ = self._get("/apps/ExamBuddy")
+            self.assertEqual(status, 308)
+            self.assertEqual(headers.get("Location"), "/apps/ExamBuddy/")
+
+            # Test route resolution
+            status_eb, headers_eb, body_eb = self._get("/apps/ExamBuddy/")
+            self.assertEqual(status_eb, 200)
+            self.assertIn("ExamBuddy Frontend", body_eb.decode("utf-8"))
+
+            # Test subpath
+            status_sub, _, body_sub = self._get("/apps/ExamBuddy/exam")
+            self.assertEqual(status_sub, 200)
+            self.assertIn("Path: /exam", body_sub.decode("utf-8"))
+        finally:
+            self.mock_apps_db["apps"].pop("app-exambuddy", None)
+            eb_srv.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -140,70 +140,60 @@ class ApplicationRouter:
         path_only = parsed.path
         parts = [p for p in path_only.split("/") if p]
 
-        # 1. Match sub-applications by first path segment prefix
-        if parts:
-            prefix = f"/{parts[0].lower()}"
-            for app in apps_db.get("apps", {}).values():
-                if app.get("status") in ("DELETED", "deleted"):
-                    continue
+        # 1. Match sub-applications by longest matching prefix
+        sub_apps = []
+        for app in apps_db.get("apps", {}).values():
+            if app.get("status") in ("DELETED", "deleted"):
+                continue
+            reg_path = str(app.get("public_path") or app.get("route", {}).get("path") or f"/{app.get('name', '')}").strip()
+            if reg_path and reg_path != "/":
+                if not reg_path.startswith("/"):
+                    reg_path = "/" + reg_path
+                sub_apps.append((reg_path.rstrip("/"), app))
 
-                # Multi-component application (V2.4 Manifest schema)
+        # Sort by length of registered path descending for longest-prefix match
+        sub_apps.sort(key=lambda x: len(x[0]), reverse=True)
+
+        path_only_lower = path_only.lower()
+        for reg_path_clean, app in sub_apps:
+            reg_lower = reg_path_clean.lower()
+            if path_only_lower == reg_lower or path_only_lower.startswith(reg_lower + "/"):
+                if path_only_lower == reg_lower:
+                    # Missing trailing slash -> redirect to /reg_path/
+                    return app, reg_path_clean, "/", True, None
+
+                remainder = path_only[len(reg_path_clean):]
+                if not remainder.startswith("/"):
+                    remainder = "/" + remainder
+
+                # Check component routing if present
                 components = app.get("components")
                 if components and isinstance(components, dict):
-                    reg_path = str(app.get("public_path") or f"/{app.get('name', '')}").strip()
-                    if reg_path == "/":
-                        continue  # Evaluated in root fallback step
-                    if not reg_path.startswith("/"):
-                        reg_path = "/" + reg_path
-                    if reg_path.lower() == prefix:
-                        if path_only.lower() == reg_path.lower():
-                            return app, reg_path, "/", True, None
-
-                        remainder = path_only[len(reg_path):]
-                        if not remainder.startswith("/"):
-                            remainder = "/" + remainder
-
-                        # 1. API route precedence: check backend components first
-                        for comp_name, comp in components.items():
-                            c_type = str(comp.get("type", "")).lower()
-                            c_routing = comp.get("routing", {})
-                            if c_type == "backend" and c_routing.get("api_priority", True):
-                                api_prefix = str(c_routing.get("path_prefix", "/api")).strip().lower()
-                                if not api_prefix.startswith("/"):
-                                    api_prefix = "/" + api_prefix
-                                rem_lower = remainder.lower()
-                                if rem_lower == api_prefix or rem_lower.startswith(api_prefix + "/"):
-                                    matched_app = dict(app)
-                                    matched_app["_active_component"] = comp
-                                    matched_app["_is_api"] = True
-                                    return matched_app, reg_path, remainder, False, None
-
-                        # 2. Frontend route evaluation
-                        for comp_name, comp in components.items():
-                            c_type = str(comp.get("type", "")).lower()
-                            if c_type == "frontend":
+                    # 1. API route precedence: check backend components first
+                    for comp_name, comp in components.items():
+                        c_type = str(comp.get("type", "")).lower()
+                        c_routing = comp.get("routing", {})
+                        if c_type == "backend" and c_routing.get("api_priority", True):
+                            api_prefix = str(c_routing.get("path_prefix", "/api")).strip().lower()
+                            if not api_prefix.startswith("/"):
+                                api_prefix = "/" + api_prefix
+                            rem_lower = remainder.lower()
+                            if rem_lower == api_prefix or rem_lower.startswith(api_prefix + "/"):
                                 matched_app = dict(app)
                                 matched_app["_active_component"] = comp
-                                matched_app["_is_api"] = False
-                                return matched_app, reg_path, remainder, False, None
+                                matched_app["_is_api"] = True
+                                return matched_app, reg_path_clean, remainder, False, None
 
-                # Legacy single-container application route
-                route = app.get("route")
-                if not route or not isinstance(route, dict) or not route.get("enabled", True):
-                    continue
+                    # 2. Frontend route evaluation
+                    for comp_name, comp in components.items():
+                        c_type = str(comp.get("type", "")).lower()
+                        if c_type == "frontend":
+                            matched_app = dict(app)
+                            matched_app["_active_component"] = comp
+                            matched_app["_is_api"] = False
+                            return matched_app, reg_path_clean, remainder, False, None
 
-                registered_path = str(route.get("path", "")).strip()
-                if registered_path == "/":
-                    continue
-                if registered_path.lower() == prefix:
-                    if path_only.lower() == registered_path.lower():
-                        return app, registered_path, "/", True, None
-
-                    remainder = path_only[len(registered_path):]
-                    if not remainder.startswith("/"):
-                        remainder = "/" + remainder
-
-                    return app, registered_path, remainder, False, None
+                return app, reg_path_clean, remainder, False, None
 
         # 2. Root application fallback (longest-prefix: serves '/' and all unreserved top-level paths)
         for app in apps_db.get("apps", {}).values():

@@ -330,6 +330,31 @@ class TestDeploymentPortAlignment(unittest.TestCase):
         self.assertEqual(status_code, 200)
         self.assertEqual(target_url, f"http://127.0.0.1:{port1}")
 
+    def test_09_multi_segment_path_remote_node_resolution(self):
+        """Single-container app with multi-segment public_path resolves to remote node IP and port."""
+        app_record = {
+            "name": "ExamBuddy",
+            "public_path": "/apps/ExamBuddy",
+            "status": "RUNNING",
+            "selected_node": "node-remote",
+            "port": 8096,
+            "host_port": 8096,
+            "route": {"enabled": True, "path": "/apps/ExamBuddy"}
+        }
+        # 1. Match route
+        db = {"apps": {"exambuddy": app_record}}
+        matched, prefix, remainder, is_redirect, err = ApplicationRouter.match_route("/apps/ExamBuddy/health", db)
+        self.assertIsNotNone(matched)
+        self.assertEqual(prefix, "/apps/ExamBuddy")
+        self.assertEqual(remainder, "/health")
+        self.assertFalse(is_redirect)
+
+        # 2. Resolve upstream
+        status_code, target_url, _ = ApplicationRouter.resolve_target_upstream(matched, self.mock_nodes)
+        self.assertEqual(status_code, 200)
+        self.assertEqual(target_url, "http://100.73.52.72:8096")
+
 
 if __name__ == "__main__":
     unittest.main()
+
