@@ -105,6 +105,8 @@ class DeploymentManager:
             "runtime": manifest_data.get("runtime", "python"),
             "port": int(manifest_data.get("port") or manifest_data.get("container_port") or manifest_data.get("host_port") or 8090),
             "host_port": int(manifest_data.get("port") or manifest_data.get("container_port") or manifest_data.get("host_port") or 8090),
+            "source": manifest_data.get("source", existing_rec.get("source", {"type": "manual"})),
+            "webhook": manifest_data.get("webhook", existing_rec.get("webhook", {})),
             "components": manifest_data.get("components", {}),
             "health_check": manifest_data.get("health_check", {
                 "path": "/health",
@@ -152,17 +154,49 @@ class DeploymentManager:
         return selected_node
 
     @staticmethod
+    def read_bounded_log_tail(log_path: Path, max_lines: int = 100, max_bytes: int = 64 * 1024) -> str:
+        """
+        Reads a bounded, sanitized tail of an application log file.
+        Limits memory consumption to max_bytes and bounds output to max_lines.
+        """
+        if not log_path or not log_path.exists() or not log_path.is_file():
+            return ""
+        try:
+            file_size = log_path.stat().st_size
+            if file_size == 0:
+                return ""
+            read_bytes = min(file_size, max_bytes)
+            with open(log_path, "rb") as f:
+                if file_size > max_bytes:
+                    f.seek(file_size - max_bytes)
+                raw = f.read(read_bytes)
+            decoded = raw.decode("utf-8", errors="replace")
+            lines = decoded.splitlines()
+            if file_size > max_bytes and len(lines) > 1:
+                # Discard possible leading partial line
+                lines = lines[1:]
+            tail = "\n".join(lines[-max_lines:]).strip()
+            from config.structured_logger import redact_sensitive_text
+            return redact_sensitive_text(tail)
+        except Exception as e:
+            return f"[Error reading log tail: {e}]"
+
+    @staticmethod
     def probe_http_health(
         port: int,
         health_path: str = "/health",
         timeout_sec: float = 5.0,
         interval_sec: float = 0.5,
         expected_status: int = 200,
-        host: str = "127.0.0.1"
+        host: str = "127.0.0.1",
+        pid: Optional[int] = None,
+        log_path: Optional[Path] = None
     ) -> Tuple[bool, str]:
         """
         Polls the HTTP health endpoint until HTTP 200 or timeout.
-        Returns (True, 'Healthy') or (False, error_details).
+        If a PID is provided, continuously checks that the child process is still alive.
+        If the process exits before becoming healthy, aborts polling immediately.
+        Returns (True, 'Healthy') or (False, error_details_with_log_tail).
         """
         clean_path = health_path if health_path.startswith("/") else f"/{health_path}"
         target_url = f"http://{host}:{port}{clean_path}"
@@ -171,6 +205,12 @@ class DeploymentManager:
         last_error = ""
 
         while time.time() - t0 < timeout_sec:
+            # Check if child process terminated prematurely
+            if pid is not None and pid > 0:
+                if not SafeProcessLifecycleManager.is_pid_active(pid):
+                    last_error = f"Process (PID {pid}) exited unexpectedly before becoming healthy"
+                    break
+
             try:
                 req = urllib.request.Request(
                     target_url,
@@ -187,7 +227,15 @@ class DeploymentManager:
 
             time.sleep(interval_sec)
 
-        return False, f"Health check failed on {target_url} after {timeout_sec}s: {last_error}"
+        elapsed = round(time.time() - t0, 2)
+        diag = f"Health check failed on {target_url} after {elapsed}s: {last_error}"
+
+        if log_path:
+            tail = DeploymentManager.read_bounded_log_tail(log_path, max_lines=20, max_bytes=16 * 1024)
+            if tail:
+                diag += f"\n--- Process Log Tail (last 20 lines) ---\n{tail}"
+
+        return False, diag
 
     @staticmethod
     def deploy_application(
@@ -196,16 +244,21 @@ class DeploymentManager:
         artifact_sha256: Optional[str] = None,
         port_override: Optional[int] = None,
         start_cmd_override: Optional[List[str]] = None,
-        auto_rollback_on_failure: bool = True
+        auto_rollback_on_failure: bool = True,
+        node_override: Optional[str] = None,
+        commit: Optional[str] = None,
+        branch: Optional[str] = None,
+        trigger: str = "manual"
     ) -> Dict[str, Any]:
         """
         Executes a controlled deployment of an application:
         - Verifies artifact integrity if artifact is provided
         - Pre-flight port availability check
-        - Capability-based node scheduling
+        - Capability-based node scheduling (or explicit node policy override)
         - Isolated execution sandbox
         - Strict health probe verification
         - Automatic graceful rollback to prior working release upon startup or health failure
+        - Provenance tracking (commit SHA, branch, trigger)
         """
         db = load_apps_db()
         app = db.get("apps", {}).get(app_id)
@@ -225,12 +278,19 @@ class DeploymentManager:
             if not rec or not SafeProcessLifecycleManager.is_pid_active(rec.pid):
                 raise DeploymentError(f"Port conflict: Port {port} is already in use by an external process.")
 
-        # 3. Capability-based Node Selection
-        runtime = app.get("runtime", "python")
-        reqs = {
-            "capabilities": ["python3"] if runtime in ("python", "python3", "self-hosted") else ["container_runtime"]
-        }
-        selected_node = DeploymentManager.select_deployment_node(reqs)
+        # 3. Capability-based Node Selection or Explicit Override
+        if node_override:
+            nodes_db = load_nodes_db()
+            if node_override in nodes_db.get("nodes", {}):
+                selected_node = node_override
+            else:
+                raise DeploymentError(f"Selected node '{node_override}' is not registered in the cluster.")
+        else:
+            runtime = app.get("runtime", "python")
+            reqs = {
+                "capabilities": ["python3"] if runtime in ("python", "python3", "self-hosted") else ["container_runtime"]
+            }
+            selected_node = DeploymentManager.select_deployment_node(reqs)
 
         # Record deployment ID
         dep_id = f"dep-{secrets.token_hex(4)}"
@@ -276,13 +336,15 @@ class DeploymentManager:
         # 5. Determine Command Line & Environment
         exec_dir = release_dir if any(release_dir.iterdir()) else app_sandbox
         if start_cmd_override:
-            cmd = start_cmd_override
+            cmd = list(start_cmd_override)
+            if cmd and os.path.basename(cmd[0]).lower().startswith("python") and "-u" not in cmd:
+                cmd.insert(1, "-u")
         elif (exec_dir / "app.py").exists():
-            cmd = [sys.executable, str(exec_dir / "app.py")]
+            cmd = [sys.executable, "-u", str(exec_dir / "app.py")]
         elif (exec_dir / "main.py").exists():
-            cmd = [sys.executable, str(exec_dir / "main.py")]
+            cmd = [sys.executable, "-u", str(exec_dir / "main.py")]
         elif (app_sandbox / "app.py").exists():
-            cmd = [sys.executable, str(app_sandbox / "app.py")]
+            cmd = [sys.executable, "-u", str(app_sandbox / "app.py")]
         else:
             fallback_script = exec_dir / "_server.py"
             if not fallback_script.exists():
@@ -300,12 +362,13 @@ class DeploymentManager:
                     f"http.server.HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()\n",
                     encoding="utf-8"
                 )
-            cmd = [sys.executable, str(fallback_script)]
+            cmd = [sys.executable, "-u", str(fallback_script)]
 
         env = os.environ.copy()
         env["PORT"] = str(port)
         env["HOST"] = "127.0.0.1"
         env["APPLICATION_ID"] = app_id
+        env["PYTHONUNBUFFERED"] = "1"
         for k, v in app.get("env", {}).items():
             env[str(k)] = str(v)
 
@@ -336,12 +399,15 @@ class DeploymentManager:
         hc_interval = float(hc.get("interval_seconds", 0.5))
         expected_status = int(hc.get("expected_status", 200))
 
+        target_log = Path(record.log_file) if record and record.log_file else (BASE_DIR / "logs" / f"app_{app_id}.log")
         healthy, hc_msg = DeploymentManager.probe_http_health(
             port=port,
             health_path=hc_path,
             timeout_sec=hc_timeout,
             interval_sec=hc_interval,
-            expected_status=expected_status
+            expected_status=expected_status,
+            pid=record.pid,
+            log_path=target_log
         )
 
         if not healthy:
@@ -351,6 +417,9 @@ class DeploymentManager:
             dep_record = {
                 "deployment_id": dep_id,
                 "number": dep_number,
+                "commit": commit or "latest",
+                "branch": branch or "main",
+                "trigger": trigger,
                 "status": "FAILED",
                 "error": hc_msg,
                 "node": selected_node,
@@ -390,6 +459,9 @@ class DeploymentManager:
         dep_record = {
             "deployment_id": dep_id,
             "number": dep_number,
+            "commit": commit or "latest",
+            "branch": branch or "main",
+            "trigger": trigger,
             "status": "SUCCESS",
             "node": selected_node,
             "port": port,
@@ -417,6 +489,10 @@ class DeploymentManager:
             "node": selected_node,
             "port": port,
             "pid": record.pid,
+            "commit": commit or "latest",
+            "branch": branch or "main",
+            "trigger": trigger,
+            "artifact_sha256": artifact_sha256,
             "health_probe": hc_msg,
             "address": f"http://127.0.0.1:{port}"
         }
@@ -462,18 +538,19 @@ class DeploymentManager:
         exec_dir = target_release_dir if target_release_dir.exists() and any(target_release_dir.iterdir()) else app_sandbox
 
         if (exec_dir / "app.py").exists():
-            cmd = [sys.executable, str(exec_dir / "app.py")]
+            cmd = [sys.executable, "-u", str(exec_dir / "app.py")]
         elif (exec_dir / "main.py").exists():
-            cmd = [sys.executable, str(exec_dir / "main.py")]
+            cmd = [sys.executable, "-u", str(exec_dir / "main.py")]
         elif (app_sandbox / "app.py").exists():
-            cmd = [sys.executable, str(app_sandbox / "app.py")]
+            cmd = [sys.executable, "-u", str(app_sandbox / "app.py")]
         else:
-            cmd = [sys.executable, str(exec_dir / "_server.py")]
+            cmd = [sys.executable, "-u", str(exec_dir / "_server.py")]
 
         env = os.environ.copy()
         env["PORT"] = str(target_port)
         env["HOST"] = "127.0.0.1"
         env["APPLICATION_ID"] = app_id
+        env["PYTHONUNBUFFERED"] = "1"
         for k, v in app.get("env", {}).items():
             env[str(k)] = str(v)
 
@@ -488,10 +565,13 @@ class DeploymentManager:
 
         # Verify restored health
         hc = app.get("health_check", {})
+        target_log = Path(record.log_file) if record and record.log_file else (BASE_DIR / "logs" / f"app_{app_id}.log")
         healthy, hc_msg = DeploymentManager.probe_http_health(
             port=target_port,
             health_path=hc.get("path", "/health"),
-            timeout_sec=hc.get("timeout_seconds", 5.0)
+            timeout_sec=hc.get("timeout_seconds", 5.0),
+            pid=record.pid,
+            log_path=target_log
         )
         if not healthy:
             SafeProcessLifecycleManager.stop_process(app_id)
@@ -550,7 +630,13 @@ class DeploymentManager:
             raise DeploymentError(f"Application '{app_id}' not found.")
 
         record = SafeProcessLifecycleManager.read_record(app_id)
-        is_running = SafeProcessLifecycleManager.is_pid_active(record.pid) if record else False
+        is_running = False
+        if record and SafeProcessLifecycleManager.is_pid_active(record.pid):
+            if record.start_time is not None:
+                curr_start = SafeProcessLifecycleManager.get_process_start_time(record.pid)
+                is_running = (curr_start is not None and str(curr_start) == str(record.start_time))
+            else:
+                is_running = True
 
         port = record.port if record else (app.get("port") or app.get("host_port"))
 

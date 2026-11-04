@@ -63,6 +63,35 @@ def handle_app_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
     if not (path == "/apps" or path.startswith("/apps/")):
         return False
 
+    # -------------------------------------------------------------------------
+    # Public Webhook Route Collision Guard: GET /apps/github/webhook
+    # GitHub Webhooks require HTTP POST. Return 405 Method Not Allowed with Allow: POST.
+    # If app_id query is provided, validate application existence.
+    # -------------------------------------------------------------------------
+    if path == "/apps/github/webhook":
+        target_app_id = query.get("app_id", [""])[0].strip() if query else ""
+        if target_app_id:
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(target_app_id)
+            if not app or app.get("status") in ("DELETED", "deleted"):
+                handler.send_json(404, {"error": f"Application '{target_app_id}' not found"})
+                return True
+
+        resp_data: Dict[str, Any] = {
+            "status": "method_not_allowed",
+            "service": "GitHub Webhook Receiver",
+            "allowed_method": "POST",
+            "message": "GitHub Webhooks must be delivered via HTTP POST with X-Hub-Signature-256."
+        }
+        if target_app_id:
+            resp_data["app_id"] = target_app_id
+
+        if hasattr(handler, "send_header"):
+            handler.send_json(405, resp_data, headers={"Allow": "POST"})
+        else:
+            handler.send_json(405, resp_data)
+        return True
+
     if not handler.is_authenticated_admin_or_node():
         handler.send_json(401, {"error": "Unauthorized: Authentication required"})
         return True
@@ -125,25 +154,56 @@ def handle_app_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         app_id = path[6:-5].strip()
         apps_db = load_apps_db()
         app = apps_db.get("apps", {}).get(app_id)
-        if not app:
+        if not app or app.get("status") in ("DELETED", "deleted"):
             handler.send_json(404, {"error": f"Application '{app_id}' not found"})
             return True
 
-        jobs_db = load_jobs_db()
-        container_id = app.get("container_id") or f"ps-{app.get('name')}"
+        # Sanitize app_id to prevent path traversal
+        clean_app_id = "".join(c for c in app_id if c.isalnum() or c in ("-", "_"))
 
-        # Look up recent job output for this app
-        app_jobs = [
-            j for j in jobs_db.get("jobs", {}).values()
-            if j.get("parameters", {}).get("app_id") == app_id or j.get("parameters", {}).get("container_name") == container_id
-        ]
-        app_jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+        log_output = None
 
-        log_output = "No logs recorded yet."
-        if app_jobs:
-            latest_job = app_jobs[0]
-            res = latest_job.get("result", {})
-            log_output = res.get("stdout") or res.get("stderr") or f"Job {latest_job.get('job_id')} status: {latest_job.get('status')}"
+        # 1. First check if a dedicated application log file exists on disk
+        from common.process_manager import SafeProcessLifecycleManager, LOGS_DIR
+        record = SafeProcessLifecycleManager.read_record(app_id)
+        candidate_log = None
+        if record and record.log_file:
+            candidate_log = Path(record.log_file)
+        if not candidate_log or not candidate_log.exists():
+            candidate_log = LOGS_DIR / f"app_{clean_app_id}.log"
+
+        if candidate_log and candidate_log.exists() and candidate_log.is_file():
+            try:
+                from controller.deployment_manager import DeploymentManager
+                log_output = DeploymentManager.read_bounded_log_tail(
+                    candidate_log,
+                    max_lines=100,
+                    max_bytes=64 * 1024
+                )
+                if not log_output:
+                    log_output = "No log output recorded yet."
+            except Exception as e:
+                log_output = f"Error reading log file: {e}"
+
+        # 2. If no app log file exists, fallback to jobs database (for containerized/job-based apps)
+        if log_output is None:
+            jobs_db = load_jobs_db()
+            container_id = app.get("container_id") or f"ps-{app.get('name')}"
+
+            app_jobs = [
+                j for j in jobs_db.get("jobs", {}).values()
+                if j.get("parameters", {}).get("app_id") == app_id or j.get("parameters", {}).get("container_name") == container_id
+            ]
+            app_jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+
+            if app_jobs:
+                latest_job = app_jobs[0]
+                res = latest_job.get("result", {})
+                raw_job_log = res.get("stdout") or res.get("stderr") or f"Job {latest_job.get('job_id')} status: {latest_job.get('status')}"
+                from config.structured_logger import redact_sensitive_text
+                log_output = redact_sensitive_text(raw_job_log)
+            else:
+                log_output = "No logs recorded yet."
 
         handler.send_json(200, {
             "app_id": app_id,
@@ -235,6 +295,29 @@ def handle_app_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         })
         return True
 
+    # GET /apps/<app_id>/webhook
+    if path.startswith("/apps/") and path.endswith("/webhook") and path != "/apps/github/webhook":
+        app_id = path[6:-8].strip()
+        apps_db = load_apps_db()
+        app = apps_db.get("apps", {}).get(app_id)
+        if not app or app.get("status") in ("DELETED", "deleted"):
+            handler.send_json(404, {"error": f"Application '{app_id}' not found"})
+            return True
+        from config.platform_config import get_platform_config
+        wh_cfg = dict(app.get("webhook", {}))
+        masked_cfg = dict(wh_cfg)
+        if "secret" in masked_cfg:
+            masked_cfg["secret"] = "••••••••"
+        platform_cfg = get_platform_config()
+        base_url = (getattr(platform_cfg, "admin_url", "") or "http://127.0.0.1:8000").rstrip("/")
+        webhook_url = f"{base_url}/api/apps/github/webhook?app_id={app_id}"
+        handler.send_json(200, {
+            "app_id": app_id,
+            "webhook_url": webhook_url,
+            "webhook": masked_cfg
+        })
+        return True
+
     # GET /apps/<app_id>
     if path.startswith("/apps/"):
         app_id = path[6:].strip()
@@ -259,6 +342,143 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
     """
     if not (path == "/apps" or path.startswith("/apps/")):
         return False
+
+    # -------------------------------------------------------------------------
+    # Public Webhook Endpoint: POST /apps/github/webhook
+    # Authenticated via X-Hub-Signature-256 HMAC-SHA256 with zero secret exposure
+    # -------------------------------------------------------------------------
+    if path == "/apps/github/webhook":
+        from controller.webhook_manager import WebhookManager, WEBHOOK_POLICY_AUTOMATIC
+        gh_event = handler.headers.get("X-GitHub-Event", "push").strip().lower()
+
+        if gh_event == "ping":
+            handler.send_json(200, {
+                "status": "pong",
+                "zen": "Approachable is better than simple.",
+                "hook_id": handler.headers.get("X-GitHub-Hook-ID")
+            })
+            return True
+
+        delivery_id = handler.headers.get("X-GitHub-Delivery", "").strip()
+        if not delivery_id:
+            handler.send_json(400, {"error": "Missing required X-GitHub-Delivery header."})
+            return True
+
+        if WebhookManager.is_duplicate_delivery(delivery_id):
+            handler.send_json(200, {
+                "status": "deduplicated",
+                "delivery_id": delivery_id,
+                "message": "Delivery already processed."
+            })
+            return True
+
+        if not body or not isinstance(body, dict):
+            handler.send_json(400, {"error": "Invalid or empty JSON webhook payload."})
+            return True
+
+        raw_repo = body.get("repository", {})
+        repo_name = (raw_repo.get("full_name") or raw_repo.get("name") or "").strip().lower()
+        ref = (body.get("ref") or "").strip()
+        pushed_branch = ref.replace("refs/heads/", "").strip() if ref.startswith("refs/heads/") else ref
+
+        apps_db = load_apps_db()
+        target_app = None
+        target_app_id = query.get("app_id", [""])[0].strip()
+
+        if target_app_id:
+            candidate = apps_db.get("apps", {}).get(target_app_id)
+            if candidate and candidate.get("status") not in ("DELETED", "deleted"):
+                cand_source = candidate.get("source") or {}
+                cand_repo = (cand_source.get("repository") or "").strip().lower()
+                if cand_repo and repo_name and not (cand_repo == repo_name or cand_repo.endswith("/" + repo_name)):
+                    handler.send_json(400, {
+                        "error": f"Repository mismatch: application '{target_app_id}' is configured for '{cand_repo}', but push is for '{repo_name}'."
+                    })
+                    return True
+                target_app = candidate
+        else:
+            for cand in apps_db.get("apps", {}).values():
+                if cand.get("status") in ("DELETED", "deleted"):
+                    continue
+                cand_source = cand.get("source") or {}
+                cand_repo = cand_source.get("repository", "").strip().lower()
+                if cand_repo and (cand_repo == repo_name or cand_repo.endswith("/" + repo_name)):
+                    wh_cfg = cand.get("webhook", {})
+                    if wh_cfg.get("enabled", True):
+                        target_app = cand
+                        break
+
+        if not target_app:
+            if target_app_id:
+                handler.send_json(404, {"error": f"Application '{target_app_id}' not found."})
+            else:
+                handler.send_json(404, {"error": f"No active application configured for repository '{repo_name}'."})
+            return True
+
+        app_id = target_app["app_id"]
+        wh_cfg = target_app.get("webhook", {})
+        wh_secret = wh_cfg.get("secret", "")
+        if not wh_secret:
+            handler.send_json(403, {"error": "Webhook secret not configured for this application."})
+            return True
+
+        sig_header = handler.headers.get("X-Hub-Signature-256", "")
+        raw_bytes = getattr(handler, "raw_request_body", b"")
+        if not WebhookManager.verify_signature(raw_bytes, wh_secret, sig_header):
+            handler.send_json(401, {"error": "Invalid GitHub webhook signature (X-Hub-Signature-256)."})
+            return True
+
+        # Validate configured branch
+        cand_source = target_app.get("source") or {}
+        expected_branch = wh_cfg.get("branch") or cand_source.get("branch", "main")
+        if pushed_branch and pushed_branch != expected_branch:
+            handler.send_json(200, {
+                "status": "ignored",
+                "app_id": app_id,
+                "reason": f"Push on branch '{pushed_branch}' does not match configured '{expected_branch}'."
+            })
+            return True
+
+        commit_sha = body.get("after") or body.get("head_commit", {}).get("id") or "latest"
+        commit_ts = body.get("head_commit", {}).get("timestamp")
+
+        # Stale commit overwrite protection
+        is_stale, stale_reason = WebhookManager.check_is_stale_commit(target_app, commit_sha, commit_ts)
+        if is_stale:
+            handler.send_json(200, {
+                "status": "ignored",
+                "app_id": app_id,
+                "commit": commit_sha,
+                "reason": stale_reason
+            })
+            return True
+
+        policy = wh_cfg.get("auto_deploy_policy", WEBHOOK_POLICY_AUTOMATIC)
+        target_node = wh_cfg.get("target_node")
+        if target_node == "auto":
+            target_node = None
+
+        # Asynchronously dispatch deployment (prompt return)
+        WebhookManager.dispatch_webhook_deploy_async(
+            app_id=app_id,
+            commit_sha=commit_sha,
+            branch=expected_branch,
+            policy=policy,
+            target_node=target_node,
+            delivery_id=delivery_id,
+            payload_repository=raw_repo.get("full_name") or repo_name
+        )
+
+        handler.send_json(202, {
+            "status": "queued",
+            "app_id": app_id,
+            "delivery_id": delivery_id,
+            "commit": commit_sha[:8],
+            "branch": expected_branch,
+            "policy": policy,
+            "message": f"Push detected. Action queued under policy '{policy}'."
+        })
+        return True
 
     if not handler.is_authenticated_admin_or_node():
         handler.send_json(401, {"error": "Unauthorized: Authentication required"})
@@ -575,6 +795,86 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         })
         return True
 
+    # POST /apps/<app_id>/webhook/config
+    if path.startswith("/apps/") and path.endswith("/webhook/config"):
+        app_id = path[6:-15].strip()
+        with APPS_LOCK:
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app or app.get("status") in ("DELETED", "deleted"):
+                handler.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return True
+
+            from controller.webhook_manager import WebhookManager, VALID_POLICIES
+            wh = app.setdefault("webhook", {})
+            if body:
+                if "enabled" in body:
+                    wh["enabled"] = bool(body["enabled"])
+                if "auto_deploy_policy" in body:
+                    policy = str(body["auto_deploy_policy"]).strip().lower()
+                    if policy in VALID_POLICIES:
+                        wh["auto_deploy_policy"] = policy
+                if "branch" in body and body["branch"]:
+                    wh["branch"] = str(body["branch"]).strip()
+                if "target_node" in body:
+                    wh["target_node"] = str(body["target_node"]).strip()
+                if "secret" in body and body["secret"]:
+                    wh["secret"] = str(body["secret"]).strip()
+
+            if not wh.get("secret") and wh.get("enabled", False):
+                wh["secret"] = WebhookManager.generate_webhook_secret()
+
+            app["updated_at"] = get_current_iso_timestamp()
+            save_apps_db(apps_db)
+
+        masked = mask_app_record(app)
+        handler.send_json(200, {
+            "status": "updated",
+            "app_id": app_id,
+            "webhook": masked.get("webhook", {})
+        })
+        return True
+
+    # POST /apps/<app_id>/webhook/generate-secret
+    if path.startswith("/apps/") and path.endswith("/webhook/generate-secret"):
+        app_id = path[6:-24].strip()
+        with APPS_LOCK:
+            apps_db = load_apps_db()
+            app = apps_db.get("apps", {}).get(app_id)
+            if not app or app.get("status") in ("DELETED", "deleted"):
+                handler.send_json(404, {"error": f"Application '{app_id}' not found"})
+                return True
+
+            from controller.webhook_manager import WebhookManager
+            new_secret = WebhookManager.generate_webhook_secret()
+            wh = app.setdefault("webhook", {})
+            wh["secret"] = new_secret
+            wh["enabled"] = True
+            app["updated_at"] = get_current_iso_timestamp()
+            save_apps_db(apps_db)
+
+        handler.send_json(200, {
+            "status": "generated",
+            "app_id": app_id,
+            "secret": new_secret
+        })
+        return True
+
+    # POST /apps/<app_id>/webhook/reveal-secret
+    if path.startswith("/apps/") and path.endswith("/webhook/reveal-secret"):
+        app_id = path[6:-22].strip()
+        apps_db = load_apps_db()
+        app = apps_db.get("apps", {}).get(app_id)
+        if not app or app.get("status") in ("DELETED", "deleted"):
+            handler.send_json(404, {"error": f"Application '{app_id}' not found"})
+            return True
+        secret = app.get("webhook", {}).get("secret", "")
+        handler.send_json(200, {
+            "app_id": app_id,
+            "secret": secret
+        })
+        return True
+
     # POST /apps/<app_id>/route
     if path.startswith("/apps/") and path.endswith("/route"):
         app_id = path[6:-6].strip()
@@ -615,6 +915,46 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 handler.send_json(404, {"error": f"Application '{app_id}' not found"})
                 return True
 
+            source = app.get("source") or {"type": "manual"}
+            source_type = source.get("type", "manual")
+            branch = (body.get("branch") if body else None) or source.get("branch", "main")
+            commit_sha = (body.get("commit") or body.get("commit_sha") if body else None) or "latest"
+            target_node = (body.get("target_node") or body.get("node") if body else None)
+            trigger = (body.get("trigger") if body else None) or ("redeploy" if is_redeploy else "manual")
+            now_iso = get_current_iso_timestamp()
+
+            # If GitHub source app, fetch requested branch or commit source
+            if source_type == "github":
+                app["status"] = APP_STATE_FETCHING_SOURCE
+                save_apps_db(apps_db)
+                repo = source.get("repository")
+                root_dir = source.get("root_directory", ".")
+                try:
+                    fetch_res = fetch_github_source(
+                        app_id=app_id,
+                        repository=repo,
+                        branch=branch,
+                        root_directory=root_dir,
+                        commit_sha=(commit_sha if commit_sha != "latest" else None)
+                    )
+                    if fetch_res.get("blueprint"):
+                        app["blueprint"] = fetch_res["blueprint"]
+                    commit_sha = fetch_res.get("commit_full") or fetch_res.get("commit", commit_sha)
+                    app["status"] = APP_STATE_CONFIGURING
+                    save_apps_db(apps_db)
+                except Exception as e:
+                    app["status"] = APP_STATE_FAILED
+                    app["failure_reason"] = f"Failed to fetch GitHub source: {e}"
+                    app["error"] = app["failure_reason"]
+                    app["updated_at"] = now_iso
+                    save_apps_db(apps_db)
+                    handler.send_json(400, {
+                        "error": app["failure_reason"],
+                        "status": APP_STATE_FAILED,
+                        "app": mask_app_record(app)
+                    })
+                    return True
+
             if app.get("runtime") in ("python", "python3", "self-hosted") or app.get("components"):
                 try:
                     from controller.deployment_manager import DeploymentManager
@@ -631,48 +971,35 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                             artifact_file = Path(body["artifact_path"])
                         artifact_sha = body.get("artifact_sha256")
 
+                    if source_type == "github" and not artifact_file:
+                        # Package fetched source into an isolated release zip artifact
+                        import zipfile
+                        from common.artifact_manager import compute_file_sha256
+                        src_context, _ = resolve_safe_app_storage_path(app_id, f"source/{source.get('root_directory', '.')}".rstrip("/."))
+                        if src_context.exists():
+                            art_dir = APP_STORAGE_ROOT / app_id / "artifacts"
+                            art_dir.mkdir(parents=True, exist_ok=True)
+                            artifact_file = art_dir / f"{app_id}-{commit_sha[:8]}.zip"
+                            with zipfile.ZipFile(artifact_file, "w", zipfile.ZIP_DEFLATED) as zf:
+                                for f_p in src_context.rglob("*"):
+                                    if f_p.is_file():
+                                        zf.write(f_p, arcname=str(f_p.relative_to(src_context)))
+                            artifact_sha, _ = compute_file_sha256(artifact_file)
+
                     res = DeploymentManager.deploy_application(
                         app_id=app_id,
                         artifact_path=artifact_file,
                         artifact_sha256=artifact_sha,
-                        port_override=body.get("port") if body else None
+                        port_override=body.get("port") if body else None,
+                        node_override=target_node,
+                        commit=commit_sha,
+                        branch=branch,
+                        trigger=trigger
                     )
                     handler.send_json(200, res)
                     return True
                 except Exception as e:
                     handler.send_json(400, {"error": str(e), "app_id": app_id, "status": "FAILED"})
-                    return True
-
-            source = app.get("source") or {"type": "manual"}
-            source_type = source.get("type", "manual")
-            now_iso = get_current_iso_timestamp()
-            commit_sha = "latest"
-
-            # If GitHub source app, fetch latest source
-            if source_type == "github":
-                app["status"] = APP_STATE_FETCHING_SOURCE
-                save_apps_db(apps_db)
-                repo = source.get("repository")
-                branch = source.get("branch", "main")
-                root_dir = source.get("root_directory", ".")
-                try:
-                    fetch_res = fetch_github_source(app_id, repo, branch, root_dir)
-                    if fetch_res.get("blueprint"):
-                        app["blueprint"] = fetch_res["blueprint"]
-                    commit_sha = fetch_res.get("commit", "latest")
-                    app["status"] = APP_STATE_CONFIGURING
-                    save_apps_db(apps_db)
-                except Exception as e:
-                    app["status"] = APP_STATE_FAILED
-                    app["failure_reason"] = f"Failed to fetch GitHub source: {e}"
-                    app["error"] = app["failure_reason"]
-                    app["updated_at"] = now_iso
-                    save_apps_db(apps_db)
-                    handler.send_json(400, {
-                        "error": app["failure_reason"],
-                        "status": APP_STATE_FAILED,
-                        "app": mask_app_record(app)
-                    })
                     return True
 
             # Schedule onto container-capable node (Docker or udocker) with architecture matching
@@ -687,7 +1014,11 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 if supp_archs:
                     reqs["supported_architectures"] = supp_archs
 
-            decision = ResourceScheduler.select_node(reqs, nodes_db, handler.heartbeat_timeout)
+            if target_node and target_node in nodes_db.get("nodes", {}):
+                selected_node = target_node
+                decision = {"selected_node": target_node, "score": 100, "reason": "Operator policy node override"}
+            else:
+                decision = ResourceScheduler.select_node(reqs, nodes_db, handler.heartbeat_timeout)
             sched_ms = int((time.time() - t_sched_start) * 1000)
 
             if not decision.get("selected_node"):
@@ -723,8 +1054,8 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 "deployment_id": dep_id,
                 "number": dep_num,
                 "commit": commit_sha,
-                "branch": source.get("branch", "main") if source_type == "github" else "manual",
-                "trigger": "redeploy" if is_redeploy else (source_type),
+                "branch": branch if source_type == "github" else "manual",
+                "trigger": trigger,
                 "status": "BUILDING" if source_type == "github" else "DEPLOYING",
                 "started_at": now_iso,
                 "finished_at": None,

@@ -30,7 +30,7 @@ class BaseHandler(BaseHTTPRequestHandler):
     heartbeat_timeout = DEFAULT_HEARTBEAT_TIMEOUT
     default_backoff_sec = 0.0
 
-    def send_json(self, status_code: int, data: Any) -> None:
+    def send_json(self, status_code: int, data: Any, headers: Optional[Dict[str, str]] = None) -> None:
         """Sends a JSON formatted HTTP response with CORS and correlation headers."""
         corr_id = getattr(self, "current_correlation_id", None)
         if corr_id and isinstance(data, dict) and "correlation_id" not in data:
@@ -39,6 +39,9 @@ class BaseHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if headers:
+            for k, v in headers.items():
+                self.send_header(k, v)
         if corr_id:
             self.send_header("X-Correlation-ID", corr_id)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -149,14 +152,18 @@ class BaseHandler(BaseHTTPRequestHandler):
         return True
 
     def read_json_body(self) -> Optional[Dict[str, Any]]:
-        """Safely parses JSON request body with Content-Length limits."""
+        """Safely parses JSON request body with Content-Length limits and retains raw bytes."""
         try:
             content_len = int(self.headers.get("Content-Length", 0))
             if content_len == 0:
+                self.raw_request_body = b""
                 return None
-            raw = self.rfile.read(content_len).decode("utf-8")
+            raw_bytes = self.rfile.read(content_len)
+            self.raw_request_body = raw_bytes
+            raw = raw_bytes.decode("utf-8")
             return json.loads(raw)
         except Exception:
+            self.raw_request_body = b""
             return None
 
     def log_message(self, format: str, *args: Any) -> None:
