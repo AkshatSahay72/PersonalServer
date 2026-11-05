@@ -167,6 +167,12 @@ class WebhookManager:
                 save_apps_db(db)
 
             try:
+                try:
+                    from common.dns_utils import enable_dns_fallback
+                    enable_dns_fallback()
+                except Exception:
+                    pass
+
                 source = app.get("source") or {}
                 repo = source.get("repository") or payload_repository
                 root_dir = source.get("root_directory", ".")
