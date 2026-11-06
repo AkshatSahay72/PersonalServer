@@ -224,6 +224,99 @@ class TestAcceptancePayloads(unittest.TestCase):
             self.assertTrue(pid_file.exists())
 
 
+class TestLocalWorkerManualLifecycle(unittest.TestCase):
+    """Verifies manual CLI lifecycle commands (status, stop, drain) for LocalWorker."""
+
+    def setUp(self):
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.test_dir.name)
+        self.runtime_dir = self.base_dir / "runtime"
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.pid_file = self.runtime_dir / "node-worker.pid"
+        self.control_file = self.runtime_dir / "node-worker.control"
+        self.state_file = self.runtime_dir / "node-worker.state"
+
+    def tearDown(self):
+        try:
+            self.test_dir.cleanup()
+        except Exception:
+            pass
+
+    def test_local_worker_status_reports_off_when_idle(self):
+        """status command prints OFF when no worker is running."""
+        from agent.local_worker import LocalWorker
+        worker = LocalWorker()
+        worker.pid_file = self.pid_file
+        # Ensure pid_file doesn't exist
+        self.assertFalse(worker.pid_file.exists())
+
+    def test_local_worker_stop_when_idle(self):
+        """stop command reports idle and clean exit when pid_file missing."""
+        from agent.local_worker import LocalWorker
+        from unittest.mock import patch
+        import io
+
+        worker = LocalWorker()
+        worker.pid_file = self.pid_file
+        captured = io.StringIO()
+        with patch("sys.stdout", captured), patch("sys.argv", ["local_worker.py", "stop"]):
+            from agent.local_worker import main as worker_main
+            with patch("agent.local_worker.LocalWorker", return_value=worker):
+                ret = worker_main()
+                self.assertEqual(ret, 0)
+                self.assertIn("not running", captured.getvalue().lower())
+
+    def test_local_worker_stop_cleans_stale_pid(self):
+        """stop command cleans up stale pid file without error."""
+        from agent.local_worker import LocalWorker
+        from unittest.mock import patch
+        import io
+
+        self.pid_file.write_text("999999\n", encoding="utf-8")
+        worker = LocalWorker()
+        worker.pid_file = self.pid_file
+        captured = io.StringIO()
+        with patch("sys.stdout", captured), \
+             patch("sys.argv", ["local_worker.py", "stop"]), \
+             patch("scripts.doctor.check_process_alive", return_value=False):
+            from agent.local_worker import main as worker_main
+            with patch("agent.local_worker.LocalWorker", return_value=worker):
+                ret = worker_main()
+                self.assertEqual(ret, 0)
+                self.assertFalse(self.pid_file.exists())
+
+    def test_local_worker_stop_writes_drain_signal(self):
+        """stop command writes drain IPC signal to control file for active worker."""
+        from agent.local_worker import LocalWorker
+        from unittest.mock import patch
+        import io
+
+        self.pid_file.write_text("12345\n", encoding="utf-8")
+        worker = LocalWorker()
+        worker.pid_file = self.pid_file
+        worker.control_file = self.control_file
+        captured = io.StringIO()
+
+        # Simulate check_process_alive returning True first (alive), then False after drain
+        alive_states = [True, False]
+        def mock_alive(pid, pattern=None):
+            return alive_states.pop(0) if alive_states else False
+
+        with patch("sys.stdout", captured), \
+             patch("sys.argv", ["local_worker.py", "stop"]), \
+             patch("scripts.doctor.check_process_alive", side_effect=mock_alive):
+            from agent.local_worker import main as worker_main
+            with patch("agent.local_worker.LocalWorker", return_value=worker):
+                ret = worker_main()
+                self.assertEqual(ret, 0)
+                self.assertIn("stopped cleanly", captured.getvalue())
+                # Verify control signal was written
+                self.assertTrue(self.control_file.exists())
+                data = json.loads(self.control_file.read_text(encoding="utf-8"))
+                self.assertEqual(data.get("action"), "drain")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

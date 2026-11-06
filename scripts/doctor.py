@@ -93,13 +93,17 @@ RECOVERY_WINDOW_SECONDS = 600
 def run_cmd_safe(cmd: List[str], timeout: float = 3.0) -> str:
     """Run command safely with strict timeout and no shell interpretation."""
     try:
+        extra_kwargs = {}
+        if sys.platform == "win32":
+            extra_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         res = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
-            check=False
+            check=False,
+            **extra_kwargs
         )
         return res.stdout.strip()
     except Exception:

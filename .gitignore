@@ -71,3 +71,6 @@ storage/artifacts/
 node_modules/
 .DS_Store
 Thumbs.db
+
+# Internal private documentation (strictly git-ignored)
+/docs-internal/

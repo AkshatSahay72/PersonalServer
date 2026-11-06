@@ -18,7 +18,7 @@ STATE_UNHEALTHY = "UNHEALTHY"
 STATE_UNKNOWN = "UNKNOWN"
 STATE_REMOVED = "REMOVED"
 
-VALID_ROLES = ["compute", "storage", "gateway", "controller", "hybrid"]
+VALID_ROLES = ["compute", "storage", "gateway", "controller", "hybrid", "build", "build-worker"]
 
 # Centralized Job States (V2.0 Extended Lifecycle)
 JOB_STATE_QUEUED = "QUEUED"
@@ -136,7 +136,10 @@ ALLOWLISTED_WORKLOADS = {
     "docker-stop": "Stop running containerized application",
     "docker-restart": "Restart containerized application",
     "docker-remove": "Remove containerized application",
-    "docker-logs": "Fetch bounded container logs"
+    "docker-logs": "Fetch bounded container logs",
+    "build-package": "Compile and package application code or assets into an artifact bundle",
+    "build-test": "Run build verification and automated tests on application code",
+    "deploy-prepare": "Run deployment validation, generate manifests and release bundles"
 }
 
 __all__ = [

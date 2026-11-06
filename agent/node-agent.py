@@ -30,9 +30,9 @@ sys.path.insert(0, str(BASE_DIR))
 
 # Import local JobExecutor & Artifact helpers
 try:
-    from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
-except ImportError:
     from agent.job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+except ImportError:
+    from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
 
 from common.artifact_manager import (
     validate_artifact_path,
@@ -178,8 +178,12 @@ def discover_hardware(base_dir=BASE_DIR):
     capabilities = {
         "compute": True,
         "storage": True,
-        "network": True
+        "network": True,
+        "static": True
     }
+    if shutil.which("node") or shutil.which("nodejs"):
+        capabilities["nodejs"] = True
+        capabilities["node"] = True
     if is_docker_available():
         capabilities["container_runtime:docker"] = True
     if is_udocker_available():
@@ -1191,6 +1195,18 @@ def cmd_heartbeat(args=None):
         try:
             err_data = json.loads(e.read().decode("utf-8"))
             err_msg = err_data.get("error", "")
+            new_leader = err_data.get("leader_url")
+            if e.code == 503 and new_leader and new_leader.rstrip("/") != controller_url.rstrip("/"):
+                print(f"[HA REDIRECT] Standby controller redirected to active leader at {new_leader}. Retrying heartbeat...", flush=True)
+                retry_endpoint = f"{new_leader.rstrip('/')}/heartbeat"
+                retry_req = urllib.request.Request(retry_endpoint, data=payload, headers=req.headers, method="POST")
+                with urllib.request.urlopen(retry_req, timeout=5) as retry_resp:
+                    res_data = json.loads(retry_resp.read().decode("utf-8"))
+                    reg_state["last_heartbeat"] = now
+                    reg_state["controller_url"] = new_leader.rstrip("/")
+                    save_registration_state(reg_state)
+                    print(f"Heartbeat acknowledged by active leader at {res_data.get('timestamp', now)}.")
+                    return 0
         except Exception:
             pass
         print(f"Heartbeat Error (HTTP {e.code}): {err_msg or e.reason}", file=sys.stderr)
@@ -1589,11 +1605,14 @@ def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon
                 exit_code=result.get("exit_code")
             )
             print(f"-> Execution completed with status: {result.get('status')} (Exit: {result.get('exit_code')})")
+            if result.get("stderr"):
+                print(f"-> Execution stderr: {result.get('stderr')}", file=sys.stderr)
 
-            # Upload declared outputs (if execution succeeded and outputs declared)
-            if result.get("status") == "SUCCEEDED" and result.get("declared_outputs"):
-                print(f"-> Uploading {len(result['declared_outputs'])} output artifact(s)...")
-                up_ok, uploaded_arts, up_err = _upload_output_artifacts(controller_url, auth_token, result["declared_outputs"], job)
+            # Upload declared outputs (if execution succeeded and outputs declared as a list of artifacts)
+            decl_outputs = result.get("declared_outputs")
+            if result.get("status") == "SUCCEEDED" and isinstance(decl_outputs, list) and decl_outputs:
+                print(f"-> Uploading {len(decl_outputs)} output artifact(s)...")
+                up_ok, uploaded_arts, up_err = _upload_output_artifacts(controller_url, auth_token, decl_outputs, job)
                 if not up_ok:
                     print(f"-> Failed to upload output artifacts: {up_err}", file=sys.stderr)
                     result["status"] = "FAILED"
