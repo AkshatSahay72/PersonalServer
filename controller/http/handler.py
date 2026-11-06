@@ -11,10 +11,14 @@ from typing import Any, Dict, Optional
 
 from config.structured_logger import extract_correlation_id
 from controller.http.app_routes import handle_app_delete, handle_app_get, handle_app_post
+from controller.http.artifact_routes import handle_artifact_get, handle_artifact_post
 from controller.http.base_handler import BaseHandler, DEFAULT_HEARTBEAT_TIMEOUT
 from controller.http.ha_routes import handle_ha_get, handle_ha_post
+from controller.http.job_query_routes import handle_job_query_get
 from controller.http.job_routes import handle_job_delete, handle_job_get, handle_job_post
+from controller.http.job_submission_routes import handle_job_submission_post
 from controller.http.node_routes import handle_node_delete, handle_node_get, handle_node_post
+from controller.http.workflow_routes import handle_workflow_get, handle_workflow_post
 
 
 class ControllerHandler(BaseHandler):
@@ -42,11 +46,23 @@ class ControllerHandler(BaseHandler):
         if handle_node_get(self, path, query):
             return
 
-        # 3. Job & Lease Routes
+        # 3. Workflow Routes
+        if handle_workflow_get(self, path, query):
+            return
+
+        # 4. Artifact Routes
+        if handle_artifact_get(self, path, query):
+            return
+
+        # 5. Job Query Routes (Read-Only)
+        if handle_job_query_get(self, path, query):
+            return
+
+        # 6. Job & Lease Routes
         if handle_job_get(self, path, query):
             return
 
-        # 4. Application Routes
+        # 7. Application Routes
         if handle_app_get(self, path, query):
             return
 
@@ -77,11 +93,23 @@ class ControllerHandler(BaseHandler):
         if handle_node_post(self, path, body, token):
             return
 
-        # 4. Job Submission & Result Routes
+        # 4. Workflow Routes
+        if handle_workflow_post(self, path, body, token, query):
+            return
+
+        # 5. Artifact Routes
+        if handle_artifact_post(self, path, body, token, query):
+            return
+
+        # 6. Job Submission Routes
+        if handle_job_submission_post(self, path, body, token, query):
+            return
+
+        # 7. Job Result & Lifecycle Routes
         if handle_job_post(self, path, body, token, query):
             return
 
-        # 5. Application Management Routes
+        # 7. Application Management Routes
         if handle_app_post(self, path, body, token, query):
             return
 

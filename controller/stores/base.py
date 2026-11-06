@@ -17,7 +17,7 @@ DB_LOCK = threading.RLock()
 
 # Specialized subsystem locks
 ONBOARDING_LOCK = threading.Lock()
-APPS_LOCK = threading.Lock()
+APPS_LOCK = threading.RLock()
 
 # Optional callback hook for HA state version bumping
 _state_version_bumper: Optional[Callable[[], None]] = None
@@ -57,5 +57,7 @@ def atomic_save_json(target_file: Path, backup_file: Path, data: dict, lock: thr
                 pass
 
         temp_file.replace(target_file)
-        if bump_ha:
-            bump_state_version()
+
+    # State-version bump must occur strictly AFTER DB_LOCK is released to prevent AB-BA deadlock
+    if bump_ha:
+        bump_state_version()

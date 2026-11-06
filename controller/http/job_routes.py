@@ -23,6 +23,10 @@ from common.artifact_manager import (
     store_artifact_stream,
     verify_artifact_integrity,
 )
+from controller.http.workflow_routes import handle_workflow_get, handle_workflow_post
+from controller.http.artifact_routes import handle_artifact_get, handle_artifact_post
+from controller.http.job_query_routes import handle_job_query_get
+from controller.http.job_submission_routes import handle_job_submission_post
 from common.crypto_utils import constant_time_compare
 from common.time_utils import get_current_iso_timestamp
 from config.platform_config import get_controller_paths, get_controller_runtime_config
@@ -90,232 +94,21 @@ from scheduler.scheduler import (
 
 def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
     """
-    Handles GET requests for job querying, metrics, workflows, artifacts,
-    and worker job lease claims.
+    Handles GET requests for worker job lease claims, and delegates read-only
+    job queries, workflows, and artifacts.
     Returns True if handled, False otherwise.
     """
-    # GET /jobs/metrics - Distributed scheduler and queue observability
-    if path == "/jobs/metrics":
-        jobs_db = load_jobs_db()
-        nodes_db = load_nodes_db()
-        workflows_db = load_workflows_db()
-        artifacts_db = load_artifacts_db()
-        sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
-
-        all_jobs = list(jobs_db.get("jobs", {}).values())
-        status_counts: Dict[str, int] = {}
-        total_duration_ms = 0
-        dur_count = 0
-        active_leases = 0
-        now_ts = time.time()
-
-        for j in all_jobs:
-            st = j.get("status", "UNKNOWN")
-            status_counts[st] = status_counts.get(st, 0) + 1
-            if j.get("lease_expires_at") and j.get("lease_expires_at") > now_ts and st in (JOB_STATE_CLAIMED, JOB_STATE_RUNNING):
-                active_leases += 1
-            dur = (j.get("result") or {}).get("duration_ms")
-            if dur is not None and isinstance(dur, (int, float)) and dur > 0:
-                total_duration_ms += dur
-                dur_count += 1
-
-        avg_duration_ms = round(total_duration_ms / dur_count, 1) if dur_count > 0 else 0
-        queue_depth = sum(
-            status_counts.get(s, 0)
-            for s in (
-                JOB_STATE_QUEUED,
-                JOB_STATE_ASSIGNED,
-                JOB_STATE_RETRY_WAIT,
-                JOB_STATE_WAITING_FOR_DEPENDENCY,
-                JOB_STATE_RECOVERING,
-                JOB_STATE_NEEDS_ATTENTION,
-            )
-        )
-
-        handler.send_json(200, {
-            "queue_depth": queue_depth,
-            "total_jobs": len(all_jobs),
-            "status_counts": status_counts,
-            "active_leases": active_leases,
-            "avg_duration_ms": avg_duration_ms,
-            "total_workflows": len(workflows_db.get("workflows", {})),
-            "total_artifacts": len(artifacts_db.get("artifacts", {})),
-            "heartbeat_timeout_sec": handler.heartbeat_timeout,
-        })
+    # Delegated Read-Only Job Queries (metrics, job list, filtering, pagination, detail)
+    if handle_job_query_get(handler, path, query):
         return True
 
-    # GET /workflows - List DAG workflows
-    if path == "/workflows":
-        workflows_db = load_workflows_db()
-        jobs_db = load_jobs_db()
-        if progress_workflows(workflows_db, jobs_db):
-            save_workflows_db(workflows_db)
-            save_jobs_db(jobs_db)
-        wfs = list(workflows_db.get("workflows", {}).values())
-        handler.send_json(200, {
-            "workflows": wfs,
-            "count": len(wfs)
-        })
-        return True
+    # Delegated Workflow Routes
+    if path == "/workflows" or path.startswith("/workflows/"):
+        return handle_workflow_get(handler, path, query)
 
-    # GET /workflows/<workflow_id> - Workflow details & progress
-    if path.startswith("/workflows/"):
-        wf_id = path[11:].strip()
-        workflows_db = load_workflows_db()
-        jobs_db = load_jobs_db()
-        if progress_workflows(workflows_db, jobs_db):
-            save_workflows_db(workflows_db)
-            save_jobs_db(jobs_db)
-        wf = workflows_db.get("workflows", {}).get(wf_id)
-        if not wf:
-            handler.send_json(404, {"error": f"Workflow '{wf_id}' not found"})
-            return True
-        wf_jobs = {}
-        for step_id, step in wf.get("steps", {}).items():
-            jid = step.get("job_id")
-            if jid and jid in jobs_db.get("jobs", {}):
-                wf_jobs[step_id] = jobs_db["jobs"][jid]
-        handler.send_json(200, {
-            "workflow": wf,
-            "jobs": wf_jobs,
-            "jobs_list": list(wf_jobs.values())
-        })
-        return True
-
-    # GET /artifacts - List cluster artifacts
-    if path == "/artifacts":
-        token = handler.parse_auth_token()
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to list artifacts"})
-            return True
-        artifacts_db = load_artifacts_db()
-        arts = list(artifacts_db.get("artifacts", {}).values())
-        handler.send_json(200, {
-            "artifacts": arts,
-            "count": len(arts)
-        })
-        return True
-
-    # GET /artifacts/<artifact_id>/metadata - Artifact metadata & checksum status
-    if path.startswith("/artifacts/") and path.endswith("/metadata"):
-        token = handler.parse_auth_token()
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to access artifact metadata"})
-            return True
-        art_id = path[11:-9].strip()
-        artifacts_db = load_artifacts_db()
-        art = artifacts_db.get("artifacts", {}).get(art_id)
-        if not art:
-            handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
-            return True
-
-        is_admin = False
-        if hasattr(handler, "is_authenticated_admin"):
-            admin_val = handler.is_authenticated_admin()
-            if isinstance(admin_val, bool):
-                is_admin = admin_val
-        if not is_admin:
-            is_admin = constant_time_compare(token, enrollment_token)
-
-        if not is_admin:
-            caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
-            if not caller_node_id:
-                handler.send_json(401, {"error": "Unauthorized: Node credentials invalid"})
-                return True
-            art_wf_id = art.get("workflow_id")
-            authorized_nodes = art.get("authorized_nodes", [])
-            producing_node = art.get("producing_node")
-            if not producing_node and art.get("job_id"):
-                jobs_db = load_jobs_db()
-                j = jobs_db.get("jobs", {}).get(art["job_id"], {})
-                producing_node = j.get("assigned_node") or j.get("target_node")
-
-            if art_wf_id:
-                jobs_db = load_jobs_db()
-                wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == art_wf_id]
-                node_in_wf = any(j.get("assigned_node") == caller_node_id or j.get("target_node") == caller_node_id for j in wf_jobs)
-                if not node_in_wf and caller_node_id not in authorized_nodes and producing_node != caller_node_id:
-                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifacts for workflow '{art_wf_id}'"})
-                    return True
-            else:
-                # Ad-hoc artifact without workflow: restrict to producing node or explicitly authorized nodes
-                if caller_node_id != producing_node and caller_node_id not in authorized_nodes:
-                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifact '{art_id}' (not producer or authorized node)"})
-                    return True
-
-        is_valid = verify_artifact_integrity(art)
-        handler.send_json(200, {"artifact": art, "integrity_verified": is_valid})
-        return True
-
-    # GET /artifacts/<artifact_id>/download or GET /artifacts/<artifact_id>
-    if path.startswith("/artifacts/"):
-        token = handler.parse_auth_token()
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to download artifacts"})
-            return True
-        art_id = path[11:].rstrip("/")
-        if art_id.endswith("/download"):
-            art_id = art_id[:-9]
-        artifacts_db = load_artifacts_db()
-        art = artifacts_db.get("artifacts", {}).get(art_id)
-        if not art:
-            handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
-            return True
-
-        is_admin = False
-        if hasattr(handler, "is_authenticated_admin"):
-            admin_val = handler.is_authenticated_admin()
-            if isinstance(admin_val, bool):
-                is_admin = admin_val
-        if not is_admin:
-            is_admin = constant_time_compare(token, enrollment_token)
-
-        if not is_admin:
-            caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
-            if not caller_node_id:
-                handler.send_json(401, {"error": "Unauthorized: Node credentials invalid"})
-                return True
-            art_wf_id = art.get("workflow_id")
-            authorized_nodes = art.get("authorized_nodes", [])
-            producing_node = art.get("producing_node")
-            if not producing_node and art.get("job_id"):
-                jobs_db = load_jobs_db()
-                j = jobs_db.get("jobs", {}).get(art["job_id"], {})
-                producing_node = j.get("assigned_node") or j.get("target_node")
-
-            if art_wf_id:
-                jobs_db = load_jobs_db()
-                wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == art_wf_id]
-                node_in_wf = any(j.get("assigned_node") == caller_node_id or j.get("target_node") == caller_node_id for j in wf_jobs)
-                if not node_in_wf and caller_node_id not in authorized_nodes and producing_node != caller_node_id:
-                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifacts for workflow '{art_wf_id}'"})
-                    return True
-            else:
-                # Ad-hoc artifact without workflow: restrict to producing node or explicitly authorized nodes
-                if caller_node_id != producing_node and caller_node_id not in authorized_nodes:
-                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not authorized to access artifact '{art_id}' (not producer or authorized node)"})
-                    return True
-
-
-        file_path = art.get("path")
-        if not file_path or not os.path.exists(file_path):
-            handler.send_json(404, {"error": f"Artifact file on disk missing for '{art_id}'"})
-            return True
-        file_size = os.path.getsize(file_path)
-        handler.send_response(200)
-        handler.send_header("Content-Type", art.get("content_type", "application/octet-stream"))
-        handler.send_header("Content-Length", str(file_size))
-        handler.send_header("X-Artifact-Sha256", art.get("sha256", ""))
-        handler.send_header("Content-Disposition", f'attachment; filename="{art.get("filename", art_id)}"')
-        handler.send_header("Access-Control-Allow-Origin", "*")
-        handler.end_headers()
-        with open(file_path, "rb") as f:
-            while chunk := f.read(65536):
-                handler.wfile.write(chunk)
-        return True
+    # Delegated Artifact Routes
+    if path == "/artifacts" or path.startswith("/artifacts/"):
+        return handle_artifact_get(handler, path, query)
 
     # GET /nodes/<node_id>/jobs/next (Node Agent fetching its assigned job with Lease)
     if path.startswith("/nodes/") and path.endswith("/jobs/next"):
@@ -412,123 +205,9 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         handler.send_json(200, {"job": next_job})
         return True
 
-    # GET /jobs/<job_id>/artifacts
+    # Delegated Artifact Routes
     if path.startswith("/jobs/") and path.endswith("/artifacts"):
-        token = handler.parse_auth_token()
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to access job artifacts"})
-            return True
-        job_id = path[6:-10].strip()
-        artifacts_db = load_artifacts_db()
-        matching = [
-            a for a in artifacts_db.get("artifacts", {}).values()
-            if a.get("job_id") == job_id
-        ]
-        handler.send_json(200, {
-            "job_id": job_id,
-            "artifacts": matching,
-            "count": len(matching)
-        })
-        return True
-
-    # GET /jobs
-    if path == "/jobs":
-        jobs_db = load_jobs_db()
-        nodes_db = load_nodes_db()
-        sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
-
-        all_jobs = list(jobs_db.get("jobs", {}).values())
-        filter_node = query.get("node", [None])[0]
-        filter_status = query.get("status", [None])[0]
-        filter_type = query.get("type", [None])[0]
-        search_q = query.get("search", query.get("q", [None]))[0]
-        sort_by = query.get("sort", ["recent"])[0]
-
-        if filter_node and filter_node != "all":
-            all_jobs = [j for j in all_jobs if j.get("target_node") == filter_node or j.get("assigned_node") == filter_node]
-        if filter_status and filter_status != "all":
-            all_jobs = [j for j in all_jobs if j.get("status") == filter_status.upper()]
-        if filter_type and filter_type != "all":
-            all_jobs = [j for j in all_jobs if j.get("type") == filter_type]
-        if search_q:
-            q_lower = search_q.strip().lower()
-            all_jobs = [
-                j for j in all_jobs
-                if q_lower in (j.get("job_id") or "").lower()
-                or q_lower in (j.get("type") or "").lower()
-                or q_lower in (j.get("target_node") or "").lower()
-                or q_lower in (j.get("assigned_node") or "").lower()
-            ]
-
-        # Sorting: default recent first
-        if sort_by == "oldest":
-            all_jobs.sort(key=lambda j: j.get("created_at") or j.get("submitted_at") or "")
-        elif sort_by == "duration":
-            all_jobs.sort(key=lambda j: (j.get("result", {}) or {}).get("duration_ms") or j.get("execution_duration_sec") or 0, reverse=True)
-        else:
-            all_jobs.sort(key=lambda j: j.get("created_at") or j.get("submitted_at") or "", reverse=True)
-
-        total_count = len(all_jobs)
-
-        # Optional server-side pagination: limit, page, offset
-        limit_str = query.get("limit", query.get("page_size", [None]))[0]
-        page_str = query.get("page", [None])[0]
-        offset_str = query.get("offset", [None])[0]
-
-        if limit_str is not None or page_str is not None or offset_str is not None:
-            limit = max(1, min(100, int(limit_str) if limit_str else 25))
-            if offset_str is not None:
-                offset = max(0, int(offset_str))
-                page = (offset // limit) + 1
-            elif page_str is not None:
-                page = max(1, int(page_str))
-                offset = (page - 1) * limit
-            else:
-                offset = 0
-                page = 1
-
-            paginated_jobs = all_jobs[offset : offset + limit]
-            total_pages = max(1, math.ceil(total_count / limit)) if total_count > 0 else 1
-
-            handler.send_json(200, {
-                "jobs": paginated_jobs,
-                "count": len(paginated_jobs),
-                "total_count": total_count,
-                "page": page,
-                "page_size": limit,
-                "total_pages": total_pages
-            })
-            return True
-
-        handler.send_json(200, {
-            "jobs": all_jobs,
-            "count": len(all_jobs),
-            "total_count": total_count
-        })
-        return True
-
-    # GET /jobs/<job_id>
-    if path.startswith("/jobs/"):
-        job_id = path[6:].strip()
-        jobs_db = load_jobs_db()
-        nodes_db = load_nodes_db()
-        sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
-
-        job = jobs_db.get("jobs", {}).get(job_id)
-        if not job:
-            handler.send_json(404, {"error": f"Job '{job_id}' not found"})
-            return True
-        diagnostics = {
-            "attempts_total": len(job.get("attempts_history", [])),
-            "current_attempt": job.get("attempt", 1),
-            "is_active": job.get("status") in (JOB_STATE_QUEUED, JOB_STATE_CLAIMED, JOB_STATE_RUNNING, JOB_STATE_RECOVERING),
-            "last_failure_reason": job.get("retry_reason"),
-            "correlation_id": job.get("correlation_id"),
-            "lease_active": bool(job.get("lease_expires_at") and time.time() < job.get("lease_expires_at")),
-        }
-        handler.send_json(200, {"job": job, "diagnostics": diagnostics})
-        return True
+        return handle_artifact_get(handler, path, query)
 
     return False
 
@@ -539,249 +218,8 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
     and cancellation.
     Returns True if handled, False otherwise.
     """
-    # POST /jobs - Job Submission
-    if path == "/jobs":
-        if not body:
-            handler.send_json(400, {"error": "Missing JSON request body"})
-            return True
-
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to submit jobs"})
-            return True
-
-        target = body.get("target") or body.get("target_node") or "auto"
-        target_str = str(target).strip()
-        is_cap_target = False
-        target_lower = target_str.lower()
-
-        job_type = body.get("type")
-        job_name = body.get("name", job_type or "job")
-        timeout_sec = int(body.get("timeout", 60))
-        max_attempts = int(body.get("max_attempts", 3))
-        parameters = body.get("parameters") or body.get("params") or {}
-        requirements = body.get("requirements", {}) or {}
-
-        if target_lower.startswith(("capability:", "cap:")):
-            is_cap_target = True
-            cap_names = [c.strip() for c in target_str.split(":", 1)[1].split(",") if c.strip()]
-            for cap_name in cap_names:
-                req_caps = requirements.setdefault("capabilities", [])
-                if isinstance(req_caps, list):
-                    if cap_name not in req_caps:
-                        req_caps.append(cap_name)
-                elif isinstance(req_caps, str):
-                    requirements["capabilities"] = [req_caps, cap_name] if req_caps != cap_name else [cap_name]
-        elif target_lower.startswith("role:"):
-            is_cap_target = True
-            role_name = target_str.split(":", 1)[1].strip()
-            if role_name:
-                requirements["role"] = role_name
-
-        # Privileged capability check: allow_internal and privileged requirements require admin credentials
-        is_admin = constant_time_compare(token, enrollment_token)
-        if parameters.get("allow_internal") and not is_admin:
-            handler.send_json(403, {
-                "error": "Forbidden: 'allow_internal' parameter requires administrator credentials.",
-                "status": JOB_STATE_REJECTED
-            })
-            return True
-
-        if requirements.get("privileged") and not is_admin:
-            handler.send_json(403, {
-                "error": "Forbidden: Privileged workloads require administrator credentials.",
-                "status": JOB_STATE_REJECTED
-            })
-            return True
-
-        # Validation: Safe allowlisted workload type rejection
-        if job_type not in ALLOWLISTED_WORKLOADS:
-            handler.send_json(400, {
-                "error": f"Job type '{job_type}' is not in the safe allowlist. Allowed: {list(ALLOWLISTED_WORKLOADS.keys())}",
-                "status": JOB_STATE_REJECTED
-            })
-            return True
-
-        nodes_db = load_nodes_db()
-        target_node = None
-        scheduler_info = None
-
-        # Path A: Automatic / Capability-Based Resource-Aware Scheduling
-        jobs_db = load_jobs_db()
-        waiting_reason = None
-        initial_status = JOB_STATE_QUEUED
-
-        if target_lower == "auto" or is_cap_target:
-            decision = ResourceScheduler.select_node(
-                requirements,
-                nodes_db,
-                handler.heartbeat_timeout,
-                cluster_jobs=jobs_db.get("jobs", {})
-            )
-            mode_prefix = "capability-aware" if is_cap_target else "resource-aware"
-            if not decision["selected_node"]:
-                if body.get("fail_if_no_nodes", False):
-                    handler.send_json(400, {
-                        "error": f"Scheduling Failed: {decision['reason']}",
-                        "status": JOB_STATE_REJECTED,
-                        "scheduler": decision
-                    })
-                    return True
-                target_node = None
-                scheduler_info = {
-                    "mode": f"{mode_prefix}-pending",
-                    "selected_node": None,
-                    "score": 0,
-                    "reason": decision["reason"],
-                    "rejected": decision.get("rejected", {}),
-                    "candidates_count": len(decision.get("candidates", []))
-                }
-                waiting_reason = f"Awaiting eligible worker: {decision['reason']}"
-            else:
-                target_node = decision["selected_node"]
-                scheduler_info = {
-                    "mode": mode_prefix,
-                    "selected_node": target_node,
-                    "score": decision["score"],
-                    "reason": decision["reason"],
-                    "candidates_count": len(decision["candidates"])
-                }
-                print(f"[CONTROLLER-SCHEDULER] {mode_prefix.capitalize()}-selected node '{target_node}': {decision['reason']}")
-
-        # Path B: Explicit Target Node (Preserves explicit target policy)
-        else:
-            is_pinned = bool(body.get("pinned", False) or body.get("pin_node"))
-            target_node = target
-            node_entry = nodes_db.get("nodes", {}).get(target_node)
-
-            if not node_entry:
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' does not exist in cluster.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
-
-            if node_entry.get("status") == STATE_REMOVED:
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' was removed from the cluster.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
-
-            live_status = compute_node_liveness(node_entry, handler.heartbeat_timeout)
-            if live_status == STATE_OFFLINE:
-                if is_pinned or body.get("wait_if_offline", False):
-                    waiting_reason = f"Pinned node '{target_node}' is currently OFFLINE; awaiting reconnection."
-                    initial_status = JOB_STATE_NEEDS_ATTENTION
-                    scheduler_info = {
-                        "mode": "explicit-pinned",
-                        "target_node": target_node,
-                        "reason": waiting_reason
-                    }
-                else:
-                    handler.send_json(400, {
-                        "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
-                        "status": JOB_STATE_REJECTED
-                    })
-                    return True
-
-            if live_status in (STATE_DRAINING, STATE_DEBOARDING) or node_entry.get("status") in (STATE_DRAINING, STATE_DEBOARDING):
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' is currently {live_status or node_entry.get('status')} (no new workloads accepted). Cannot submit job.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
-
-            if requirements and live_status not in (STATE_OFFLINE, STATE_DRAINING, STATE_DEBOARDING):
-                is_eligible, ineligibility_reason = ResourceScheduler.is_node_eligible(
-                    node_entry, requirements, handler.heartbeat_timeout
-                )
-                if not is_eligible:
-                    if is_pinned or body.get("wait_if_insufficient", False):
-                        waiting_reason = f"Pinned node '{target_node}' does not satisfy requirements: {ineligibility_reason}"
-                        initial_status = JOB_STATE_NEEDS_ATTENTION
-                        scheduler_info = {
-                            "mode": "explicit-pinned",
-                            "target_node": target_node,
-                            "reason": waiting_reason
-                        }
-                    else:
-                        handler.send_json(400, {
-                            "error": f"Target node '{target_node}' does not satisfy job requirements: {ineligibility_reason}",
-                            "status": JOB_STATE_REJECTED
-                        })
-                        return True
-
-            if not scheduler_info:
-                scheduler_info = {
-                    "mode": "explicit-pinned" if is_pinned else "explicit",
-                    "target_node": target_node,
-                    "reason": "Pinned node specified by client" if is_pinned else "Explicit node specified by client"
-                }
-
-        timeout_sec = max(5, min(timeout_sec, 300))
-        job_id = f"job-{secrets.token_hex(6)}"
-        now = get_current_iso_timestamp()
-
-        corr_id = getattr(handler, "current_correlation_id", None) or generate_correlation_id()
-        job_record = {
-            "id": job_id,
-            "job_id": job_id,
-            "correlation_id": corr_id,
-            "name": job_name,
-            "type": job_type,
-            "parameters": parameters,
-            "requirements": requirements,
-            "target": target,
-            "target_node": target_node,
-            "assigned_node": target_node,
-            "pinned": bool(body.get("pinned", False) or body.get("pin_node")),
-            "priority": body.get("priority", "normal"),
-            "waiting_reason": waiting_reason,
-            "inputs": body.get("inputs", []),
-            "expected_outputs": body.get("expected_outputs", []),
-            "scheduler": scheduler_info,
-            "timeout": timeout_sec,
-            "max_attempts": max_attempts,
-            "attempt": 1,
-            "lease_generation": 0,
-            "claimed_at": None,
-            "lease_expires_at": None,
-            "created_at": now,
-            "started_at": None,
-            "finished_at": None,
-            "status": initial_status,
-            "state": initial_status,
-            "retryable": bool(body.get("retryable", True)),
-            "backoff_sec": body.get("backoff_sec"),
-            "retry_reason": None,
-            "attempts_history": [],
-            "result": None
-        }
-
-        jobs_db.setdefault("jobs", {})[job_id] = job_record
-        save_jobs_db(jobs_db)
-
-        controller_logger.info(
-            "job.scheduled",
-            f"Queued job {job_id} ({job_type}) for target node {target_node} [mode={scheduler_info['mode']}]",
-            correlation_id=corr_id,
-            job_id=job_id,
-            node_id=target_node,
-            job_type=job_type,
-            mode=scheduler_info["mode"],
-            score=scheduler_info.get("score"),
-            reason=scheduler_info.get("reason")
-        )
-        handler.send_json(200, {
-            "status": initial_status,
-            "job_id": job_id,
-            "id": job_id,
-            "target_node": target_node,
-            "waiting_reason": waiting_reason,
-            "scheduler": scheduler_info,
-            "job": job_record
-        })
+    # Delegated Job Submission Route (POST /jobs)
+    if handle_job_submission_post(handler, path, body, token, query):
         return True
 
     # POST /jobs/<job_id>/result - Job Result Submission & Retry Handling
@@ -871,8 +309,10 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             })
             return True
 
-        # 3. Fencing token: reject superseded lease generations
+        # 3. Fencing token: reject superseded lease generations (J1/J3 mandatory HTTP 412)
         reported_gen = body.get("lease_generation")
+        if reported_gen is None and body.get("fencing_token") is not None:
+            reported_gen = body.get("fencing_token")
         current_gen = int(job.get("lease_generation", 1))
         if reported_gen is not None and int(reported_gen) < current_gen:
             controller_logger.warning(
@@ -884,10 +324,11 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 reported_generation=reported_gen,
                 current_generation=current_gen
             )
-            handler.send_json(409, {
-                "error": f"Superseded lease generation: reported generation {reported_gen} is older than current generation {current_gen}.",
+            handler.send_json(412, {
+                "error": f"Precondition Failed: Superseded lease generation {reported_gen} is older than current generation {current_gen}.",
                 "job_id": job_id,
                 "current_generation": current_gen,
+                "fencing_token": current_gen,
                 "superseded": True
             })
             return True
@@ -976,6 +417,13 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             job["retry_reason"] = f"Attempt {attempt} completed with status: {job_status}"
             job["claimed_at"] = None
             job["lease_expires_at"] = None
+            # Advance fencing token on retry (J1/J3)
+            job["lease_generation"] = int(job.get("lease_generation", 0)) + 1
+            try:
+                from controller.stores.reservations import release_reservation
+                release_reservation(jobs_db, job_id, attempt=attempt, force=True)
+            except Exception:
+                pass
 
             # Compute backoff
             base_backoff = float(job.get("backoff_sec") if job.get("backoff_sec") is not None else getattr(handler, "default_backoff_sec", 0.0))
@@ -1025,6 +473,11 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             job["state"] = job_status
             job["finished_at"] = now_iso
             job["lease_expires_at"] = None
+            try:
+                from controller.stores.reservations import release_reservation
+                release_reservation(jobs_db, job_id, attempt=attempt, force=True)
+            except Exception:
+                pass
             if not is_retryable and job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
                 job["retry_reason"] = f"Non-retryable failure on attempt {attempt}: {body.get('stderr') or job_status}"
             job["result"] = {
@@ -1033,6 +486,8 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 "stdout": stdout_bounded,
                 "stderr": stderr_bounded,
                 "duration_ms": body.get("duration_ms", 0),
+                "declared_outputs": body.get("declared_outputs"),
+                "outputs": body.get("outputs") or body.get("declared_outputs"),
             }
             if job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
                 controller_logger.error(
@@ -1193,6 +648,81 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                             app["previous_working_deployment"] = prev_working["deployment_id"]
                             print(f"[CONTROLLER-ROLLBACK] Preserving previous working deployment '{prev_working['deployment_id']}' for app '{app_id}'")
 
+                elif job.get("type") == "app-deploy":
+                    dep_id = job.get("deployment_id") or job.get("parameters", {}).get("deployment_id")
+                    from controller.deployment_state_machine import DeploymentStateMachine, DEP_STATE_STARTING, DEP_STATE_HEALTH_CHECK, DEP_STATE_ACTIVATING, DEP_STATE_SUCCEEDED, DEP_STATE_FAILED
+                    if job_status == JOB_STATE_SUCCEEDED:
+                        out_meta = body.get("declared_outputs") or body.get("outputs") or {}
+                        port = out_meta.get("port") or job.get("parameters", {}).get("port") or app.get("port", 8090)
+                        assigned_node = job.get("assigned_node") or job.get("target_node")
+
+                        try:
+                            curr_dep = DeploymentStateMachine.get_deployment(app_id, dep_id, paths=handler.paths)
+                            if curr_dep and curr_dep.get("status") == DEP_STATE_STARTING:
+                                DeploymentStateMachine.transition(
+                                    app_id=app_id,
+                                    deployment_id=dep_id,
+                                    next_state=DEP_STATE_HEALTH_CHECK,
+                                    reason="Worker health verification succeeded",
+                                    metadata={"pid": out_meta.get("pid"), "port": port},
+                                    paths=handler.paths
+                                )
+                            DeploymentStateMachine.transition(
+                                app_id=app_id,
+                                deployment_id=dep_id,
+                                next_state=DEP_STATE_ACTIVATING,
+                                reason="Health verification succeeded",
+                                paths=handler.paths
+                            )
+                            DeploymentStateMachine.transition(
+                                app_id=app_id,
+                                deployment_id=dep_id,
+                                next_state=DEP_STATE_SUCCEEDED,
+                                reason="Release activated",
+                                metadata={
+                                    "node": assigned_node,
+                                    "port": port,
+                                    "address": f"http://{assigned_node}:{port}",
+                                    "pid": out_meta.get("pid")
+                                },
+                                paths=handler.paths
+                            )
+                        except Exception as tr_err:
+                            print(f"[CONTROLLER-DEPLOY] State transition error: {tr_err}", flush=True)
+
+                        app["status"] = APP_STATE_RUNNING
+                        app["selected_node"] = assigned_node
+                        app["node"] = assigned_node
+                        app["assigned_node"] = assigned_node
+                        app["port"] = port
+                        app["host_port"] = port
+                        app["active_deployment_id"] = dep_id
+                        app["error"] = None
+                        app["failure_reason"] = None
+                        app["updated_at"] = now_iso
+                    else:
+                        err_text = body.get("stderr") or body.get("diagnostics", {}).get("failure_reason") or "Application deployment failed"
+                        try:
+                            DeploymentStateMachine.transition(
+                                app_id=app_id,
+                                deployment_id=dep_id,
+                                next_state=DEP_STATE_FAILED,
+                                error=err_text,
+                                reason="Worker execution or health check failed",
+                                paths=handler.paths
+                            )
+                        except Exception:
+                            pass
+
+                        if app.get("active_deployment_id") and app.get("active_deployment_id") != dep_id:
+                            app["status"] = APP_STATE_RUNNING
+                            app["error"] = f"Deployment {dep_id} failed: {err_text}"
+                        else:
+                            app["status"] = APP_STATE_FAILED
+                            app["error"] = err_text
+                            app["failure_reason"] = err_text
+                        app["updated_at"] = now_iso
+
                 elif job.get("type") == "docker-stop" and job_status == JOB_STATE_SUCCEEDED:
                     app["status"] = APP_STATE_STOPPED
                     app["updated_at"] = now_iso
@@ -1340,11 +870,14 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             return True
 
         req_gen = body.get("lease_generation") if body else None
+        if req_gen is None and body and body.get("fencing_token") is not None:
+            req_gen = body.get("fencing_token")
         curr_gen = int(job.get("lease_generation", 1))
         if req_gen is not None and int(req_gen) < curr_gen:
-            handler.send_json(409, {
-                "error": f"Cannot renew superseded lease generation {req_gen} (current is {curr_gen})",
-                "lease_generation": curr_gen
+            handler.send_json(412, {
+                "error": f"Precondition Failed: Cannot renew superseded lease generation {req_gen} (current is {curr_gen})",
+                "lease_generation": curr_gen,
+                "fencing_token": curr_gen
             })
             return True
 
@@ -1400,11 +933,14 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             return True
 
         req_gen = body.get("lease_generation") if body else None
+        if req_gen is None and body and body.get("fencing_token") is not None:
+            req_gen = body.get("fencing_token")
         curr_gen = int(job.get("lease_generation", 1))
         if req_gen is not None and int(req_gen) < curr_gen:
-            handler.send_json(409, {
-                "error": f"Superseded lease generation {req_gen} (current is {curr_gen})",
-                "lease_generation": curr_gen
+            handler.send_json(412, {
+                "error": f"Precondition Failed: Superseded lease generation {req_gen} (current is {curr_gen})",
+                "lease_generation": curr_gen,
+                "fencing_token": curr_gen
             })
             return True
 
@@ -1433,6 +969,18 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         job["state"] = new_status
         if new_status == JOB_STATE_RUNNING and not job.get("started_at"):
             job["started_at"] = now_iso
+            # Activate reservation in authoritative ledger (J3.3)
+            try:
+                from controller.stores.reservations import activate_reservation
+                activate_reservation(jobs_db, job_id, int(job.get("attempt", 1)), curr_gen)
+            except Exception:
+                pass
+        elif new_status in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
+            try:
+                from controller.stores.reservations import release_reservation
+                release_reservation(jobs_db, job_id, int(job.get("attempt", 1)), curr_gen)
+            except Exception:
+                pass
         save_jobs_db(jobs_db)
 
         handler.send_json(200, {
@@ -1442,310 +990,13 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         })
         return True
 
-    # POST /workflows - Create and instantiate multi-step DAG workflow
-    if path == "/workflows":
-        if not body:
-            handler.send_json(400, {"error": "Missing JSON request body"})
-            return True
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to create workflows"})
-            return True
+    # Delegated Workflow Routes
+    if path == "/workflows" or path.startswith("/workflows/"):
+        return handle_workflow_post(handler, path, body, token, query)
 
-        jobs_db = load_jobs_db()
-        workflows_db = load_workflows_db()
-        try:
-            workflow_record, created_jobs = instantiate_workflow(body, jobs_db)
-        except WorkflowValidationError as e:
-            handler.send_json(400, {"error": f"Invalid workflow specification: {e}"})
-            return True
-        except Exception as e:
-            handler.send_json(400, {"error": f"Failed to instantiate workflow: {e}"})
-            return True
-
-        wf_id = workflow_record["workflow_id"]
-        workflows_db.setdefault("workflows", {})[wf_id] = workflow_record
-        save_workflows_db(workflows_db)
-        save_jobs_db(jobs_db)
-
-        corr_id = getattr(handler, "current_correlation_id", None) or generate_correlation_id()
-        controller_logger.info(
-            "workflow.created",
-            f"Created workflow '{wf_id}' ({workflow_record['name']}) with {len(created_jobs)} steps",
-            correlation_id=corr_id,
-            workflow_id=wf_id,
-            total_steps=len(created_jobs)
-        )
-        handler.send_json(201, {
-            "status": "CREATED",
-            "workflow": workflow_record,
-            "jobs_count": len(created_jobs)
-        })
-        return True
-
-    # POST /workflows/<workflow_id>/cancel - Cancel DAG workflow
-    if path.startswith("/workflows/") and path.endswith("/cancel"):
-        wf_id = path[11:-7].strip()
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to cancel workflow"})
-            return True
-
-        workflows_db = load_workflows_db()
-        jobs_db = load_jobs_db()
-        reason = (body.get("reason") if body else "") or "Cancelled by operator"
-        cancelled_wf = cancel_workflow(wf_id, workflows_db, jobs_db, reason=reason)
-        if not cancelled_wf:
-            handler.send_json(404, {"error": f"Workflow '{wf_id}' not found"})
-            return True
-
-        save_workflows_db(workflows_db)
-        save_jobs_db(jobs_db)
-        handler.send_json(200, {
-            "status": "CANCELLED",
-            "workflow_id": wf_id,
-            "workflow": cancelled_wf,
-            "message": f"Workflow '{wf_id}' and all pending/active steps cancelled."
-        })
-        return True
-
-    # POST /artifacts/upload - Secure atomic artifact upload with SHA-256
-    if path == "/artifacts/upload":
-        if not body:
-            handler.send_json(400, {"error": "Missing JSON request body"})
-            return True
-        enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to upload artifacts"})
-            return True
-
-        filename = body.get("filename") or body.get("name")
-        content_b64 = body.get("content_base64")
-        if not filename or content_b64 is None:
-            handler.send_json(400, {"error": "Missing required 'filename' or 'content_base64'"})
-            return True
-
-        # Bound request payload memory size: 64 MB base64 limit
-        if len(content_b64) > 64 * 1024 * 1024:
-            handler.send_json(413, {"error": "Payload Too Large: Base64 artifact exceeds 64MB limit. Use streaming upload."})
-            return True
-
-        try:
-            content_bytes = base64.b64decode(content_b64)
-        except Exception as e:
-            handler.send_json(400, {"error": f"Invalid base64 encoding: {e}"})
-            return True
-
-        expected_sha256 = body.get("sha256")
-        job_id = body.get("job_id")
-        workflow_id = body.get("workflow_id")
-        content_type = body.get("content_type", "application/octet-stream")
-        metadata = body.get("metadata", {})
-
-        storage_root = get_controller_paths().artifacts_dir
-        art_id = generate_artifact_id()
-
-        try:
-            art_record = store_artifact_bytes(
-                storage_root=storage_root,
-                artifact_id=art_id,
-                filename=filename,
-                content_bytes=content_bytes,
-                expected_sha256=expected_sha256,
-                job_id=job_id,
-                workflow_id=workflow_id,
-                content_type=content_type,
-                metadata=metadata
-            )
-        except ValueError as e:
-            handler.send_json(400, {"error": str(e)})
-            return True
-        except Exception as e:
-            handler.send_json(500, {"error": f"Failed to store artifact: {e}"})
-            return True
-
-        caller_node_id = handler.get_authenticated_node_id() if hasattr(handler, "get_authenticated_node_id") else None
-        if isinstance(caller_node_id, str):
-            art_record["producing_node"] = caller_node_id
-        elif job_id:
-            jobs_db = load_jobs_db()
-            j = jobs_db.get("jobs", {}).get(job_id, {})
-            if j.get("assigned_node"):
-                art_record["producing_node"] = j.get("assigned_node")
-
-        auth_nodes = body.get("authorized_nodes") or metadata.get("authorized_nodes")
-        if auth_nodes and isinstance(auth_nodes, list):
-            art_record["authorized_nodes"] = [str(n) for n in auth_nodes]
-
-        artifacts_db = load_artifacts_db()
-        artifacts_db.setdefault("artifacts", {})[art_id] = art_record
-        save_artifacts_db(artifacts_db)
-
-        if job_id:
-            try:
-                jobs_db = load_jobs_db()
-                if job_id in jobs_db.get("jobs", {}):
-                    job_arts = jobs_db["jobs"][job_id].setdefault("artifacts", [])
-                    if not any(a.get("artifact_id") == art_id for a in job_arts):
-                        job_arts.append(art_record)
-                        save_jobs_db(jobs_db)
-            except Exception as e:
-                print(f"[CONTROLLER-ARTIFACTS] Error linking artifact to job {job_id}: {e}", file=sys.stderr)
-
-        handler.send_json(201, {
-            "status": "UPLOADED",
-            "artifact": art_record
-        })
-        return True
-
-    # POST /artifacts/upload/raw - Streaming raw binary artifact upload
-    if path == "/artifacts/upload/raw":
-        enrollment_token = get_or_create_enrollment_token()
-        is_admin = False
-        if hasattr(handler, "is_authenticated_admin"):
-            admin_val = handler.is_authenticated_admin()
-            if isinstance(admin_val, bool):
-                is_admin = admin_val
-        if not is_admin:
-            is_admin = constant_time_compare(token, enrollment_token)
-
-        caller_node_id = None
-        if hasattr(handler, "get_authenticated_node_id"):
-            raw_node_id = handler.get_authenticated_node_id()
-            if isinstance(raw_node_id, str):
-                caller_node_id = raw_node_id
-
-        if not is_admin and not caller_node_id and not handler.is_authenticated_admin_or_node():
-            handler.send_json(401, {"error": "Unauthorized: Authentication required to upload artifacts"})
-            return True
-
-        filename = query.get("filename", [None])[0] or handler.headers.get("X-Artifact-Filename")
-        if not filename:
-            handler.send_json(400, {"error": "Missing 'filename' query parameter or X-Artifact-Filename header"})
-            return True
-
-        try:
-            content_length = int(handler.headers.get("Content-Length", 0))
-        except (ValueError, TypeError):
-            content_length = 0
-
-        # Maximum artifact limit: 64 MB
-        MAX_ARTIFACT_LIMIT = 64 * 1024 * 1024
-        if content_length > MAX_ARTIFACT_LIMIT:
-            handler.send_json(413, {"error": f"Payload Too Large: Artifact exceeds {MAX_ARTIFACT_LIMIT // (1024*1024)}MB limit."})
-            return True
-
-        expected_sha256 = query.get("sha256", [None])[0] or handler.headers.get("X-Artifact-Sha256")
-        job_id = query.get("job_id", [None])[0] or handler.headers.get("X-Job-Id")
-        workflow_id = query.get("workflow_id", [None])[0] or handler.headers.get("X-Workflow-Id")
-        name = query.get("name", [None])[0] or handler.headers.get("X-Artifact-Name") or filename
-        step_id = query.get("step_id", [None])[0] or handler.headers.get("X-Workflow-Step-Id")
-        content_type = handler.headers.get("Content-Type", "application/octet-stream")
-
-        # Worker assignment authorization
-        if job_id:
-            jobs_db = load_jobs_db()
-            job = jobs_db.get("jobs", {}).get(job_id)
-            if job:
-                if not is_admin and caller_node_id and job.get("assigned_node") and job.get("assigned_node") != caller_node_id:
-                    handler.send_json(403, {"error": f"Forbidden: Node '{caller_node_id}' is not assigned to job '{job_id}'"})
-                    return True
-                if not workflow_id and job.get("workflow_id"):
-                    workflow_id = job.get("workflow_id")
-                if not step_id and job.get("workflow_step_id"):
-                    step_id = job.get("workflow_step_id")
-
-        # Check for existing artifact on retry (idempotent duplicate avoidance)
-        artifacts_db = load_artifacts_db()
-        existing_art = next(
-            (a for a in artifacts_db.get("artifacts", {}).values()
-             if a.get("job_id") == job_id and (a.get("filename") == filename or a.get("name") == name)),
-            None
-        )
-        if existing_art and expected_sha256 and existing_art.get("sha256", "").lower() == expected_sha256.lower():
-            if content_length > 0:
-                # Drain stream cleanly
-                try:
-                    _ = handler.rfile.read(content_length)
-                except Exception:
-                    pass
-            if verify_artifact_integrity(existing_art):
-                handler.send_json(200, {
-                    "status": "EXISTS",
-                    "artifact": existing_art,
-                    "message": "Artifact already exists with identical checksum."
-                })
-                return True
-
-        storage_root = get_controller_paths().artifacts_dir
-        art_id = generate_artifact_id()
-
-        try:
-            art_record = store_artifact_stream(
-                storage_root=storage_root,
-                artifact_id=art_id,
-                filename=filename,
-                stream=handler.rfile,
-                total_bytes_expected=content_length,
-                expected_sha256=expected_sha256,
-                job_id=job_id,
-                workflow_id=workflow_id,
-                content_type=content_type,
-                max_bytes=MAX_ARTIFACT_LIMIT
-            )
-            art_record["name"] = name
-            art_record["workflow_step_id"] = step_id
-            art_record["producing_node"] = caller_node_id if isinstance(caller_node_id, str) else None
-            if workflow_id:
-                jobs_db = load_jobs_db()
-                wf_jobs = [j for j in jobs_db.get("jobs", {}).values() if j.get("workflow_id") == workflow_id]
-                auth_nodes = [j.get("assigned_node") for j in wf_jobs if isinstance(j.get("assigned_node"), str)]
-                if isinstance(caller_node_id, str):
-                    auth_nodes.append(caller_node_id)
-                art_record["authorized_nodes"] = list(set(auth_nodes))
-        except ValueError as e:
-            handler.send_json(400, {"error": str(e)})
-            return True
-        except Exception as e:
-            handler.send_json(500, {"error": f"Failed to store streaming artifact: {e}"})
-            return True
-
-        artifacts_db = load_artifacts_db()
-        artifacts_db.setdefault("artifacts", {})[art_id] = art_record
-        save_artifacts_db(artifacts_db)
-
-        if job_id:
-            try:
-                jobs_db = load_jobs_db()
-                if job_id in jobs_db.get("jobs", {}):
-                    job_arts = jobs_db["jobs"][job_id].setdefault("artifacts", [])
-                    if not any(a.get("artifact_id") == art_id for a in job_arts):
-                        job_arts.append(art_record)
-                        save_jobs_db(jobs_db)
-            except Exception as e:
-                print(f"[CONTROLLER-ARTIFACTS] Error linking streaming artifact to job {job_id}: {e}", file=sys.stderr)
-
-        handler.send_json(201, {
-            "status": "UPLOADED",
-            "artifact": art_record
-        })
-        return True
-
-    # POST /artifacts/<artifact_id>/verify - Verify integrity of artifact on disk
-    if path.startswith("/artifacts/") and path.endswith("/verify"):
-        art_id = path[11:-7].strip()
-        artifacts_db = load_artifacts_db()
-        art = artifacts_db.get("artifacts", {}).get(art_id)
-        if not art:
-            handler.send_json(404, {"error": f"Artifact '{art_id}' not found"})
-            return True
-        is_valid = verify_artifact_integrity(art)
-        handler.send_json(200, {
-            "artifact_id": art_id,
-            "integrity_verified": is_valid,
-            "artifact": art
-        })
-        return True
+    # Delegated Artifact Routes
+    if path == "/artifacts/upload" or path == "/artifacts/upload/raw" or (path.startswith("/artifacts/") and path.endswith("/verify")):
+        return handle_artifact_post(handler, path, body, token, query)
 
     return False
 
@@ -1821,6 +1072,7 @@ def handle_job_delete(handler: Any, path: str, token: str) -> bool:
 
 __all__ = [
     "handle_job_get",
+    "handle_job_query_get",
     "handle_job_post",
     "handle_job_delete",
 ]

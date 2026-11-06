@@ -38,7 +38,7 @@ from controller.constants import (
 from controller.ha_helper import get_ha_manager
 from controller.notifications import notify_job_failure
 from controller.stores import load_jobs_db, load_nodes_db, save_jobs_db, load_workflows_db, save_workflows_db
-from controller.workflow_engine import evaluate_workflow_progress
+from controller.stores.reservations import sweep_reservation_ledger, release_reservation, create_or_update_reservation, ReservationState
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness
 
 RUNTIME_CFG = get_controller_runtime_config()
@@ -125,6 +125,11 @@ def sweep_expired_leases(
                         job["lease_expires_at"] = None
                         # Advance fencing token immediately so superseded attempts are rejected
                         job["lease_generation"] = int(job.get("lease_generation", 0)) + 1
+                        # Release prior reservation belonging to the expired attempt safely
+                        try:
+                            release_reservation(jobs_db, job_id, attempt=attempt, force=True)
+                        except Exception:
+                            pass
 
                         base_backoff = float(job.get("backoff_sec") if job.get("backoff_sec") is not None else default_backoff_sec)
                         backoff_sec = min(60.0, base_backoff * (2 ** (attempt - 1)))
@@ -175,6 +180,10 @@ def sweep_expired_leases(
                         job["finished_at"] = now_iso
                         job["retry_reason"] = f"Max retries ({max_attempts}) exceeded after: {reason}" if attempt >= max_attempts else f"Non-retryable failure: {reason}"
                         job["lease_expires_at"] = None
+                        try:
+                            release_reservation(jobs_db, job_id, attempt=attempt, force=True)
+                        except Exception:
+                            pass
                         job["result"] = {
                             "status": JOB_STATE_FAILED,
                             "exit_code": -1,
@@ -291,6 +300,21 @@ def sweep_expired_leases(
         if not pass_changed:
             break
 
+    try:
+        from controller.deployment_manager import DeploymentManager
+        dep_rec = DeploymentManager.reconcile_in_flight_deployments(paths=paths)
+        if dep_rec.get("recovered_failed", 0) > 0 or dep_rec.get("stale_locks_cleared", 0) > 0:
+            overall_changed = True
+    except Exception:
+        pass
+
+    # Sweep and reconcile authoritative resource reservation ledger (J3.3)
+    try:
+        if sweep_reservation_ledger(jobs_db, timeout_seconds=timeout_seconds):
+            overall_changed = True
+    except Exception as e:
+        controller_logger.warning("lease_sweeper.reservation_sweep_error", f"Error sweeping reservation ledger: {e}")
+
     if overall_changed:
         save_jobs_db(jobs_db, paths=paths)
 
@@ -373,6 +397,56 @@ def reconcile_startup_recovery(
 
     steps_unblocked = max(0, init_waiting_steps - post_waiting_steps)
 
+    # Reconcile in-flight application deployments following controller restart
+    dep_reconciled = {}
+    try:
+        from controller.deployment_manager import DeploymentManager
+        dep_reconciled = DeploymentManager.reconcile_in_flight_deployments(paths=paths)
+    except Exception as e:
+        controller_logger.warning("controller.startup_recovery", f"In-flight deployment reconciliation error: {e}")
+
+    # Reconstruct/reconcile reservations from jobs on startup recovery (J3.3 §8.4)
+    try:
+        now_epoch = time.time()
+        for job_id, j in jobs_db.get("jobs", {}).items():
+            st = canonicalize_job_state(j.get("status"))
+            nid = j.get("assigned_node") or j.get("target_node")
+            att = int(j.get("attempt", 1))
+            gen = int(j.get("lease_generation", 1))
+            reqs = j.get("requirements", {}) or {}
+            res_payload = {
+                "memory_mb": float(reqs.get("min_memory_mb", reqs.get("memory_mb", 0.0))),
+                "storage_gb": float(reqs.get("min_storage_gb", reqs.get("storage_gb", 0.0))),
+                "cpu_cores": int(reqs.get("min_cpu_cores", reqs.get("cpu_cores", 0))),
+                "exclusive_devices": list(reqs.get("exclusive_devices", []))
+            }
+            if st == JOB_STATE_ASSIGNED and nid:
+                create_or_update_reservation(
+                    jobs_db, job_id, nid, att, gen, res_payload,
+                    state=ReservationState.COMMITTED, ttl_sec=30.0
+                )
+                changed = True
+            elif st == JOB_STATE_RUNNING and nid:
+                create_or_update_reservation(
+                    jobs_db, job_id, nid, att, gen, res_payload,
+                    state=ReservationState.ACTIVE, ttl_sec=0.0
+                )
+                changed = True
+    except Exception as e:
+        controller_logger.warning("controller.startup_recovery", f"Error reconciling reservations on startup: {e}")
+
+    # Reconcile unrecorded CAS artifacts on startup recovery (J5)
+    reconciled_arts = 0
+    try:
+        from controller.result_manager import ResultManager
+        artifacts_dir = paths.artifacts_dir if paths else None
+        if artifacts_dir and hasattr(artifacts_dir, "exists") and artifacts_dir.exists():
+            reconciled_arts = ResultManager.reconcile_promoted_artifacts(artifacts_dir)
+            if reconciled_arts > 0:
+                changed = True
+    except Exception as e:
+        controller_logger.warning("controller.startup_recovery", f"Error reconciling CAS artifacts on startup: {e}")
+
     summary = {
         "active_leases_preserved": active_preserved,
         "expired_leases_swept": expired_count,
@@ -380,6 +454,7 @@ def reconcile_startup_recovery(
         "steps_unblocked": steps_unblocked,
         "workflows_succeeded": wf_succeeded,
         "workflows_failed": wf_failed,
+        "deployments_reconciled": dep_reconciled,
         "changed": changed
     }
 
@@ -390,6 +465,13 @@ def reconcile_startup_recovery(
         f"{steps_unblocked} workflow step(s) unblocked, {wf_succeeded} workflow(s) in SUCCEEDED state.",
         **summary
     )
+
+    # Ensure any interrupted crash-window state version increment is monotonically advanced upon startup recovery
+    try:
+        from controller.stores.base import bump_state_version
+        bump_state_version()
+    except Exception:
+        pass
 
     return summary
 

@@ -26,6 +26,15 @@ from controller.stores.shares_store import (
     create_share,
     revoke_share,
 )
+from controller.stores.reservations import (
+    ReservationState,
+    atomic_reservation_update,
+    calculate_node_reserved_resources,
+    create_or_update_reservation,
+    activate_reservation,
+    release_reservation,
+    sweep_reservation_ledger,
+)
 
 __all__ = [
     "DB_LOCK",
@@ -52,4 +61,11 @@ __all__ = [
     "find_active_share",
     "create_share",
     "revoke_share",
+    "ReservationState",
+    "atomic_reservation_update",
+    "calculate_node_reserved_resources",
+    "create_or_update_reservation",
+    "activate_reservation",
+    "release_reservation",
+    "sweep_reservation_ledger",
 ]
