@@ -233,20 +233,27 @@ function getFileIcon(filename, isDir) {
   return "📄";
 }
 
-function renderStatusPill(state) {
+function renderStatusPill(state, waitingReason = null) {
   const s = (state || "").toUpperCase();
+  const titleAttr = waitingReason ? ` title="${escapeHtml(waitingReason)}"` : "";
   if (s === "ONLINE" || s === "SUCCEEDED" || s === "RUNNING") {
-    return `<span class="node-status-badge status-online"><span class="status-dot"></span>${s}</span>`;
+    return `<span class="node-status-badge status-online"${titleAttr}><span class="status-dot"></span>${s}</span>`;
+  } else if (s === "NEEDS_ATTENTION") {
+    return `<span class="node-status-badge status-warning"${titleAttr}><span class="status-dot"></span>NEEDS ATTENTION</span>`;
+  } else if (s === "WAITING_FOR_DEPENDENCY" || s === "WAITING") {
+    return `<span class="node-status-badge status-waiting"${titleAttr}><span class="status-dot"></span>WAITING DEP</span>`;
   } else if (s === "DRAINING" || s === "DEBOARDING") {
-    return `<span class="node-status-badge status-draining"><span class="status-dot"></span>${s}</span>`;
-  } else if (s === "QUEUED" || s === "CLAIMED" || s === "RECOVERING" || s === "DEPLOYING" || s === "REMOVING") {
-    return `<span class="node-status-badge status-draining"><span class="status-dot"></span>${s}</span>`;
+    return `<span class="node-status-badge status-draining"${titleAttr}><span class="status-dot"></span>${s}</span>`;
+  } else if (s === "QUEUED" || s === "CLAIMED" || s === "ASSIGNED" || s === "RECOVERING" || s === "RETRY_WAIT" || s === "DEPLOYING" || s === "REMOVING") {
+    return `<span class="node-status-badge status-draining"${titleAttr}><span class="status-dot"></span>${s}</span>`;
+  } else if (s === "CANCELLED") {
+    return `<span class="node-status-badge status-cancelled"${titleAttr}><span class="status-dot"></span>CANCELLED</span>`;
   } else if (s === "STOPPED" || s === "CREATED" || s === "REMOVED") {
-    return `<span class="cell-muted mono">${s}</span>`;
-  } else if (s === "FAILED" || s === "TIMEOUT" || s === "REJECTED" || s === "OFFLINE") {
-    return `<span class="node-status-badge status-offline"><span class="status-dot"></span>${s}</span>`;
+    return `<span class="cell-muted mono"${titleAttr}>${s}</span>`;
+  } else if (s === "FAILED" || s === "TIMEOUT" || s === "TIMED_OUT" || s === "REJECTED" || s === "OFFLINE") {
+    return `<span class="node-status-badge status-offline"${titleAttr}><span class="status-dot"></span>${s}</span>`;
   }
-  return `<span class="cell-muted mono">${s || "UNKNOWN"}</span>`;
+  return `<span class="cell-muted mono"${titleAttr}>${s || "UNKNOWN"}</span>`;
 }
 
 function updateLastRefreshed() {
@@ -334,7 +341,7 @@ async function loadDashboard() {
     let nodes = [];
     if (clusterData.status === "fulfilled") {
       const c = clusterData.value;
-      nodes = (c.nodes || []).filter(n => n.status !== "REMOVED");
+      nodes = (c.nodes || []).filter(n => n && n.node_id && n.status !== "REMOVED");
       cachedNodes = nodes;
 
       const onlineCount = nodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
@@ -544,14 +551,14 @@ function resolveLeaderInfo(ha) {
   if (regNode) {
     isRegistered = true;
     leaderName = regNode.name || regNode.hostname || regNode.node_id;
-    isOnline = (regNode.status || "").toUpperCase() === "ONLINE";
+    isOnline = (regNode.status || "").toUpperCase() === "ONLINE" || ha.leader_online === true || (ha.role === "leader" && ha.lease_valid !== false);
   } else if (backendName && backendName !== rawLeaderId) {
     leaderName = backendName;
     isRegistered = ha.leader_registered !== false;
-    isOnline = ha.leader_online === true;
+    isOnline = ha.leader_online === true || (ha.role === "leader" && ha.lease_valid !== false);
   } else if (ha.leader_registered === true) {
     isRegistered = true;
-    isOnline = ha.leader_online === true;
+    isOnline = ha.leader_online === true || (ha.role === "leader" && ha.lease_valid !== false);
     if (ha.leader_name) leaderName = ha.leader_name;
   }
 
@@ -694,9 +701,14 @@ function renderHAHeader(ha) {
   if (bannerTerm) bannerTerm.textContent = ha.term !== undefined ? ha.term : "-";
 
   const bannerDesc = document.getElementById("ha-banner-status-desc");
+  const cnt = ha.standbys_count !== undefined ? ha.standbys_count : (ha.standbys ? ha.standbys.length : 0);
   if (bannerDesc) {
     if (info.isVerified) {
-      bannerDesc.textContent = "Auto-failover ready";
+      if (cnt > 0) {
+        bannerDesc.textContent = `${cnt} standby controller${cnt === 1 ? '' : 's'} synced`;
+      } else {
+        bannerDesc.textContent = "Active leader authoritative (no standbys registered)";
+      }
     } else if (ha.role === "fenced") {
       bannerDesc.textContent = "Controller fenced";
     } else if (ha.lease_valid === false) {
@@ -712,8 +724,7 @@ function renderHAHeader(ha) {
 
   const bannerStandbys = document.getElementById("ha-banner-standbys");
   if (bannerStandbys) {
-    const cnt = ha.standbys_count !== undefined ? ha.standbys_count : (ha.standbys ? ha.standbys.length : 0);
-    bannerStandbys.textContent = `${cnt} Standby${cnt === 1 ? '' : 's'} Synced`;
+    bannerStandbys.textContent = cnt > 0 ? `${cnt} Standby${cnt === 1 ? '' : 's'} Synced` : "0 Standbys";
   }
 
   // Update Summary Card in Dashboard
@@ -1084,17 +1095,21 @@ async function loadNodes() {
     const data = clusterRes.value || { nodes: [] };
     cachedUtilMap = (utilRes.status === "fulfilled" && utilRes.value?.nodes) ? utilRes.value.nodes : {};
 
-    cachedNodes = (data.nodes || []).filter(n => n.status !== "REMOVED");
+    cachedNodes = (data.nodes || []).filter(n => n && n.node_id && n.status !== "REMOVED");
 
     const onlineCount = cachedNodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
     const countHdr = document.getElementById("nodes-count-header");
     if (countHdr) countHdr.textContent = `${onlineCount} online · ${cachedNodes.length} total`;
+    const topbarStatus = document.getElementById("topbar-cluster-status");
+    if (topbarStatus) topbarStatus.textContent = `${onlineCount} online`;
+    const sideStatus = document.getElementById("side-cluster-online");
+    if (sideStatus) sideStatus.textContent = `${onlineCount} online`;
     if (cachedHAStatus) renderHAHeader(cachedHAStatus);
 
     if (targetSelect) {
       const cur = targetSelect.value;
       targetSelect.innerHTML = `<option value="auto">Auto (Scheduler)</option>` +
-        cachedNodes.map(n => `<option value="${n.node_id}">${n.name || n.node_id} (${n.node_id.slice(0, 8)})</option>`).join("");
+        cachedNodes.map(n => `<option value="${n.node_id}">${n.name || n.node_id} (${(n.node_id || '').slice(0, 8)})</option>`).join("");
       targetSelect.value = cur;
     }
 
@@ -1775,15 +1790,26 @@ async function populateJobNodeDropdowns() {
 
     if (targetSelect) {
       const currVal = targetSelect.value;
-      targetSelect.innerHTML = `<option value="auto">Auto (Scheduler)</option>` +
-        nodes.map(n => `<option value="${escapeHtml(n.node_id)}">${escapeHtml(n.hostname || n.node_id)} (${escapeHtml(n.status)})</option>`).join("");
+      const opts = [
+        '<option value="auto">Auto (Resource Scheduler)</option>',
+        '<option value="capability:python3">Capability: python3 (Verified Worker)</option>',
+        '<option value="capability:container_runtime:udocker">Capability: udocker (Container Worker)</option>'
+      ];
+      nodes.forEach(n => {
+        if (n.status === "REMOVED") return;
+        const nid = n.node_id || "";
+        const name = n.hostname || n.name || nid;
+        const st = n.status || "UNKNOWN";
+        opts.push(`<option value="${escapeHtml(nid)}">Node: ${escapeHtml(name)} (${escapeHtml(st)})</option>`);
+      });
+      targetSelect.innerHTML = opts.join("");
       if (currVal) targetSelect.value = currVal;
     }
 
     if (filterNodeSelect) {
       const currFilter = filterNodeSelect.value;
       filterNodeSelect.innerHTML = `<option value="all">All Nodes</option>` +
-        nodes.map(n => `<option value="${escapeHtml(n.node_id)}">${escapeHtml(n.hostname || n.node_id)}</option>`).join("");
+        nodes.filter(n => n.status !== "REMOVED").map(n => `<option value="${escapeHtml(n.node_id)}">${escapeHtml(n.hostname || n.name || n.node_id)}</option>`).join("");
       if (currFilter) filterNodeSelect.value = currFilter;
     }
   } catch (err) {
@@ -1791,7 +1817,33 @@ async function populateJobNodeDropdowns() {
   }
 }
 
+window.onJobTypeChange = function(type) {
+  const codeGroup = document.getElementById("job-code-group");
+  const argsGroup = document.getElementById("job-args-group");
+  const inputsGroup = document.getElementById("job-inputs-group");
+  const outputsGroup = document.getElementById("job-outputs-group");
+  const resourcesGroup = document.getElementById("job-resources-group");
+  const paramsGroup = document.getElementById("job-params-group");
+
+  if (type === "python-script") {
+    if (codeGroup) codeGroup.style.display = "block";
+    if (argsGroup) argsGroup.style.display = "block";
+    if (inputsGroup) inputsGroup.style.display = "block";
+    if (outputsGroup) outputsGroup.style.display = "block";
+    if (resourcesGroup) resourcesGroup.style.display = "block";
+    if (paramsGroup) paramsGroup.style.display = "none";
+  } else {
+    if (codeGroup) codeGroup.style.display = "none";
+    if (argsGroup) argsGroup.style.display = "none";
+    if (inputsGroup) inputsGroup.style.display = "none";
+    if (outputsGroup) outputsGroup.style.display = "none";
+    if (resourcesGroup) resourcesGroup.style.display = "none";
+    if (paramsGroup) paramsGroup.style.display = "block";
+  }
+};
+
 async function loadJobs() {
+  const isSilent = arguments.length > 0 && arguments[0] === true;
   updateLastRefreshed();
   const tbody = document.getElementById("jobs-tbody");
   if (!tbody) return;
@@ -1815,7 +1867,9 @@ async function loadJobs() {
   if (node !== "all") params.set("node", node);
   if (search) params.set("search", search);
 
-  tbody.innerHTML = `<tr><td colspan="8" class="cell-muted" style="text-align: center; padding: 24px;">Loading execution history...</td></tr>`;
+  if (!isSilent && (!cachedJobs || cachedJobs.length === 0)) {
+    tbody.innerHTML = `<tr><td colspan="8" class="cell-muted" style="text-align: center; padding: 24px;">Loading execution history...</td></tr>`;
+  }
 
   try {
     const data = await apiFetch(`/api/jobs?${params.toString()}`);
@@ -1847,6 +1901,15 @@ async function loadJobs() {
     const nextBtn = document.getElementById("jobs-next-btn");
     if (nextBtn) nextBtn.disabled = jobCurrentPage >= jobTotalPages;
 
+    // Check active jobs for live refresh indicator
+    const activeStates = ["QUEUED", "CLAIMED", "ASSIGNED", "RUNNING", "RECOVERING", "RETRY_WAIT", "WAITING_FOR_DEPENDENCY", "NEEDS_ATTENTION"];
+    const hasActiveJob = cachedJobs.some(j => activeStates.includes((j.status || j.state || "").toUpperCase()));
+    const refreshBadge = document.getElementById("jobs-auto-refresh-badge");
+    if (refreshBadge) {
+      refreshBadge.classList.toggle("active", hasActiveJob);
+      refreshBadge.textContent = hasActiveJob ? "● Live (polling)" : "● Live";
+    }
+
     if (cachedJobs.length === 0) {
       const hasActiveFilters = search || status !== "all" || type !== "all" || node !== "all";
       tbody.innerHTML = `
@@ -1874,20 +1937,29 @@ async function loadJobs() {
 
     tbody.innerHTML = cachedJobs.map(j => {
       const jobId = j.job_id || j.id || "";
+      const jobName = j.name || "";
       const target = j.assigned_node || j.target_node || j.target || "auto";
       const res = j.result || {};
       const duration = res.duration_ms !== undefined ? `${res.duration_ms}ms` : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
       const createdStr = j.created_at || j.submitted_at ? formatDateIST(j.created_at || j.submitted_at) : "-";
       const attemptStr = `${j.attempt || 1}/${j.max_attempts || 3}`;
       const st = (j.status || j.state || "").toUpperCase();
-      const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING");
+      const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING" || st === "ASSIGNED" || st === "RETRY_WAIT" || st === "WAITING_FOR_DEPENDENCY" || st === "NEEDS_ATTENTION");
+      const waitingNotice = j.waiting_reason ? `<div style="font-size: 10px; color: #d29922; margin-top: 2px;" title="${escapeHtml(j.waiting_reason)}">⏳ ${escapeHtml(j.waiting_reason.slice(0, 32))}${j.waiting_reason.length > 32 ? "..." : ""}</div>` : "";
+
+      const nameDisplay = jobName
+        ? `<div style="font-weight: 600; font-size: 13px; color: var(--text-main); margin-bottom: 2px;">${escapeHtml(jobName)}</div><span class="mono" style="font-size: 10px; color: var(--text-muted);">${escapeHtml(j.type || "-")}</span>`
+        : `<span class="mono" style="font-size: 11px; padding: 2px 6px; background: var(--bg-hover); border-radius: 4px; border: 1px solid var(--border-color);">${escapeHtml(j.type || "-")}</span>`;
 
       return `
         <tr>
           <td class="mono"><strong>${escapeHtml(jobId)}</strong></td>
-          <td><span class="mono" style="font-size: 11px; padding: 2px 6px; background: var(--bg-hover); border-radius: 4px; border: 1px solid var(--border-color);">${escapeHtml(j.type || "-")}</span></td>
+          <td>${nameDisplay}</td>
           <td class="mono cell-muted">${escapeHtml(target)}</td>
-          <td>${renderStatusPill(st)}</td>
+          <td>
+            ${renderStatusPill(st, j.waiting_reason || (j.scheduler && j.scheduler.reason))}
+            ${waitingNotice}
+          </td>
           <td class="mono cell-muted">${attemptStr}</td>
           <td class="mono cell-muted">${duration}</td>
           <td class="mono cell-muted" style="white-space: nowrap;">${createdStr}</td>
@@ -1922,8 +1994,8 @@ async function loadJobs() {
 
 window.confirmCancelJob = async function(jobId) {
   const job = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
-  const jobType = job ? job.type : "workload";
-  const node = job ? (job.target_node || job.assigned_node || "assigned worker") : "assigned worker";
+  const jobType = job ? (job.name ? `${job.name} (${job.type})` : job.type) : "workload";
+  const node = job ? (job.assigned_node || job.target_node || "assigned worker") : "assigned worker";
 
   const confirmed = await showCustomConfirm({
     title: "Confirm Job Cancellation",
@@ -1939,7 +2011,7 @@ window.confirmCancelJob = async function(jobId) {
 
 window.cancelJob = async function(jobId) {
   try {
-    await apiFetch(`/api/jobs/${jobId}/cancel`, {
+    await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ reason: "Cancelled by operator via dashboard", idempotent: true })
@@ -1959,7 +2031,7 @@ window.cancelJob = async function(jobId) {
     }
 
     // Refresh jobs list
-    loadJobs();
+    loadJobs(true);
   } catch (err) {
     showCustomAlert({
       title: "Cancellation Failed",
@@ -1990,10 +2062,19 @@ window.confirmDeleteJob = async function(jobId) {
   const targetJob = cachedJobs.find(j => (j.job_id === jobId || j.id === jobId));
   if (targetJob) {
     const st = (targetJob.status || targetJob.state || "").toUpperCase();
-    if (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING") {
+    const activeStates = ["QUEUED", "CLAIMED", "ASSIGNED", "RUNNING", "RECOVERING", "RETRY_WAIT", "WAITING_FOR_DEPENDENCY", "NEEDS_ATTENTION"];
+    if (activeStates.includes(st)) {
       showCustomAlert({
         title: "Cannot Delete Active Job",
         message: `Job "${jobId}" is currently in ${st} state.\n\nActive workloads cannot be deleted directly to maintain cluster reliability. Please cancel the job first.`,
+        isError: true
+      });
+      return;
+    }
+    if (targetJob.workflow_id) {
+      showCustomAlert({
+        title: "Cannot Delete Workflow Job",
+        message: `Job "${jobId}" belongs to DAG workflow "${targetJob.workflow_id}".\n\nDeleting individual steps compromises workflow integrity. Please cancel or delete the parent workflow instead.`,
         isError: true
       });
       return;
@@ -2020,7 +2101,7 @@ window.confirmDeleteJob = async function(jobId) {
       closeJobDetail();
     }
     cachedJobs = cachedJobs.filter(j => (j.job_id !== jobId && j.id !== jobId));
-    loadJobs();
+    loadJobs(true);
   } catch (err) {
     const errMsg = err.message || "";
     const isNotFound = errMsg.includes("404") || errMsg.toLowerCase().includes("not found");
@@ -2034,7 +2115,7 @@ window.confirmDeleteJob = async function(jobId) {
         closeJobDetail();
       }
       cachedJobs = cachedJobs.filter(j => (j.job_id !== jobId && j.id !== jobId));
-      loadJobs();
+      loadJobs(true);
     } else {
       showCustomAlert({
         title: "Delete Failed",
@@ -2064,14 +2145,22 @@ window.viewJobById = function(jobId) {
   const sumGrid = document.getElementById("job-detail-summary");
   const paramsBox = document.getElementById("job-detail-params");
   const stdoutBox = document.getElementById("job-detail-stdout");
+  const stdoutWrap = document.getElementById("job-detail-stdout-wrap");
+  const stderrBox = document.getElementById("job-detail-stderr");
+  const stderrWrap = document.getElementById("job-detail-stderr-wrap");
+  const artifactsWrap = document.getElementById("job-detail-artifacts-wrap");
+  const artifactsList = document.getElementById("job-detail-artifacts-list");
+  const inputsWrap = document.getElementById("job-detail-inputs-wrap");
+  const inputsList = document.getElementById("job-detail-inputs-list");
 
   const renderJobInfo = (j) => {
     const id = j.job_id || j.id || "";
-    if (title) title.textContent = `Job: ${id}`;
+    const nameStr = j.name ? ` (${j.name})` : "";
+    if (title) title.textContent = `Job: ${id}${nameStr}`;
     const st = (j.status || j.state || "").toUpperCase();
     if (statusPill) statusPill.innerHTML = renderStatusPill(st);
 
-    const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING");
+    const isCancellable = (st === "QUEUED" || st === "CLAIMED" || st === "RUNNING" || st === "RECOVERING" || st === "ASSIGNED" || st === "RETRY_WAIT" || st === "WAITING_FOR_DEPENDENCY" || st === "NEEDS_ATTENTION");
     if (cancelBtn) {
       cancelBtn.style.display = isCancellable ? "inline-block" : "none";
     }
@@ -2085,34 +2174,131 @@ window.viewJobById = function(jobId) {
     const assignedNode = j.assigned_node || j.target_node || "-";
     const durationStr = res.duration_ms !== undefined ? `${res.duration_ms}ms` : (j.execution_duration_sec ? formatDuration(j.execution_duration_sec) : "-");
     const submittedStr = j.submitted_at || j.created_at ? formatDateIST(j.submitted_at || j.created_at) : "-";
+    const startedStr = j.started_at || j.claimed_at ? formatDateIST(j.started_at || j.claimed_at) : "-";
     const finishedStr = j.finished_at || j.cancelled_at ? formatDateIST(j.finished_at || j.cancelled_at) : "-";
     const retryReason = j.retry_reason || (j.diagnostics && j.diagnostics.failure_reason) || "None";
     const cancelReason = j.cancel_reason || "None";
+    const schedReason = sched.reason || (j.waiting_reason ? `Waiting: ${j.waiting_reason}` : "Standard placement");
 
     if (sumGrid) {
       sumGrid.innerHTML = `
-        <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(st)}</span></div>
+        <div class="detail-item"><span class="detail-label">Status</span><span class="detail-value">${renderStatusPill(st, j.waiting_reason)}</span></div>
         <div class="detail-item"><span class="detail-label">Workload</span><span class="detail-value">${escapeHtml(j.type || "-")}</span></div>
-        <div class="detail-item"><span class="detail-label">Target Node</span><span class="detail-value mono">${escapeHtml(targetNode)}</span></div>
-        <div class="detail-item"><span class="detail-label">Assigned Worker</span><span class="detail-value mono">${escapeHtml(assignedNode)}</span></div>
+        ${j.name ? `<div class="detail-item"><span class="detail-label">Job Name</span><span class="detail-value font-semibold">${escapeHtml(j.name)}</span></div>` : ""}
+        <div class="detail-item"><span class="detail-label">Target</span><span class="detail-value mono">${escapeHtml(targetNode)}</span></div>
+        <div class="detail-item"><span class="detail-label">Assigned Worker</span><span class="detail-value mono font-semibold">${escapeHtml(assignedNode)}</span></div>
+        <div class="detail-item"><span class="detail-label">Priority / Pinned</span><span class="detail-value mono">${escapeHtml(j.priority || "normal")}${j.pinned ? " (Pinned)" : ""}</span></div>
         <div class="detail-item"><span class="detail-label">Attempt</span><span class="detail-value mono">${j.attempt || 1}/${j.max_attempts || 3}</span></div>
         <div class="detail-item"><span class="detail-label">Duration</span><span class="detail-value mono">${durationStr}</span></div>
-        <div class="detail-item"><span class="detail-label">Exit Code</span><span class="detail-value mono">${res.exit_code !== undefined ? res.exit_code : '-'}</span></div>
-        <div class="detail-item"><span class="detail-label">Submitted At</span><span class="detail-value mono">${escapeHtml(submittedStr)}</span></div>
-        <div class="detail-item"><span class="detail-label">Finished At</span><span class="detail-value mono">${escapeHtml(finishedStr)}</span></div>
-        <div class="detail-item"><span class="detail-label">Retry Reason</span><span class="detail-value">${escapeHtml(retryReason)}</span></div>
+        <div class="detail-item"><span class="detail-label">Exit Code</span><span class="detail-value mono">${res.exit_code !== undefined ? res.exit_code : (j.exit_code !== undefined ? j.exit_code : '-')}</span></div>
+        <div class="detail-item" style="grid-column: span 2;"><span class="detail-label">Scheduler Rationale</span><span class="detail-value" style="font-size: 11px;">${escapeHtml(schedReason)}</span></div>
+        <div class="detail-item"><span class="detail-label">Submitted</span><span class="detail-value mono">${escapeHtml(submittedStr)}</span></div>
+        <div class="detail-item"><span class="detail-label">Started</span><span class="detail-value mono">${escapeHtml(startedStr)}</span></div>
+        <div class="detail-item"><span class="detail-label">Finished</span><span class="detail-value mono">${escapeHtml(finishedStr)}</span></div>
+        ${j.waiting_reason ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">Waiting Reason</span><span class="detail-value text-draining">⏳ ${escapeHtml(j.waiting_reason)}</span></div>` : ""}
+        ${j.workflow_id ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">DAG Workflow</span><span class="detail-value mono">Workflow: ${escapeHtml(j.workflow_id)} | Step: ${escapeHtml(j.workflow_step_id || "-")}</span></div>` : ""}
+        ${retryReason !== "None" ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">Retry History</span><span class="detail-value text-offline">${escapeHtml(retryReason)}</span></div>` : ""}
         ${j.cancel_reason ? `<div class="detail-item" style="grid-column: 1 / -1;"><span class="detail-label">Cancel Reason</span><span class="detail-value text-offline">${escapeHtml(cancelReason)}</span></div>` : ""}
       `;
     }
 
-    if (paramsBox) {
-      const p = j.parameters;
-      paramsBox.textContent = p && Object.keys(p).length > 0 ? JSON.stringify(p, null, 2) : "No parameters provided.";
+    // Published Output Artifacts
+    const outArts = j.artifacts || [];
+    if (artifactsWrap && artifactsList) {
+      if (outArts.length > 0) {
+        artifactsList.innerHTML = outArts.map(art => {
+          const artId = art.artifact_id || art.id || "";
+          const artName = art.filename || art.name || "artifact";
+          const artSha = art.sha256 || "";
+          const artSize = art.size_bytes ? formatBytes(art.size_bytes) : "";
+          const downloadUrl = `/api/artifacts/${encodeURIComponent(artId)}/download`;
+
+          return `
+            <div class="artifact-card">
+              <div class="artifact-meta">
+                <div class="artifact-title-row">
+                  <span class="artifact-name">${escapeHtml(artName)}</span>
+                  <span class="artifact-id-badge mono">${escapeHtml(artId)}</span>
+                  ${artSize ? `<span class="cell-muted mono" style="font-size: 11px;">(${artSize})</span>` : ""}
+                </div>
+                ${artSha ? `<div class="artifact-sha mono" title="${escapeHtml(artSha)}">SHA-256: ${escapeHtml(artSha)}</div>` : ""}
+              </div>
+              <a href="${downloadUrl}" class="btn btn-sm btn-primary artifact-download-btn" download="${escapeHtml(artName)}">
+                ⬇ Download
+              </a>
+            </div>
+          `;
+        }).join("");
+        artifactsWrap.style.display = "block";
+      } else {
+        artifactsWrap.style.display = "none";
+      }
     }
 
-    if (stdoutBox) {
-      const outText = res.stdout || res.stderr || (j.result ? JSON.stringify(j.result, null, 2) : "No execution logs recorded.");
-      stdoutBox.textContent = outText;
+    // Consumed Input Artifacts
+    const inArts = j.input_artifacts || [];
+    if (inputsWrap && inputsList) {
+      if (inArts.length > 0) {
+        inputsList.innerHTML = inArts.map(art => {
+          const artId = art.artifact_id || art.id || "";
+          const artName = art.filename || art.name || "input";
+          const artSha = art.sha256 || "";
+          const artSize = art.size_bytes ? formatBytes(art.size_bytes) : "";
+
+          return `
+            <div class="artifact-card">
+              <div class="artifact-meta">
+                <div class="artifact-title-row">
+                  <span class="artifact-name">${escapeHtml(artName)}</span>
+                  <span class="artifact-id-badge mono">${escapeHtml(artId)}</span>
+                  ${artSize ? `<span class="cell-muted mono" style="font-size: 11px;">(${artSize})</span>` : ""}
+                </div>
+                ${artSha ? `<div class="artifact-sha mono" title="${escapeHtml(artSha)}">SHA-256: ${escapeHtml(artSha)}</div>` : ""}
+              </div>
+            </div>
+          `;
+        }).join("");
+        inputsWrap.style.display = "block";
+      } else {
+        inputsWrap.style.display = "none";
+      }
+    }
+
+    if (paramsBox) {
+      const p = j.parameters || {};
+      if (p.code) {
+        paramsBox.textContent = `# Python Workload Code:\n${p.code}\n\n# Parameters:\n` + JSON.stringify(p, null, 2);
+      } else if (j.code) {
+        paramsBox.textContent = `# Python Workload Code:\n${j.code}\n\n# Parameters:\n` + JSON.stringify(p, null, 2);
+      } else {
+        paramsBox.textContent = Object.keys(p).length > 0 ? JSON.stringify(p, null, 2) : "No parameters provided.";
+      }
+    }
+
+    // Standard Output & Error
+    const stdout = res.stdout !== undefined ? res.stdout : (j.stdout !== undefined ? j.stdout : "");
+    const stderr = res.stderr !== undefined ? res.stderr : (j.stderr !== undefined ? j.stderr : "");
+
+    if (stdoutBox && stdoutWrap) {
+      if (stdout) {
+        stdoutBox.textContent = stdout;
+        stdoutWrap.style.display = "block";
+      } else if (!stderr) {
+        stdoutBox.textContent = j.result ? JSON.stringify(j.result, null, 2) : "No execution logs recorded.";
+        stdoutWrap.style.display = "block";
+      } else {
+        stdoutBox.textContent = "No standard output recorded.";
+        stdoutWrap.style.display = "block";
+      }
+    }
+
+    if (stderrBox && stderrWrap) {
+      if (stderr) {
+        stderrBox.textContent = stderr;
+        stderrWrap.style.display = "block";
+      } else {
+        stderrWrap.style.display = "none";
+      }
     }
 
     if (panel) {
@@ -2121,13 +2307,19 @@ window.viewJobById = function(jobId) {
     }
   };
 
-  if (job) {
-    renderJobInfo(job);
-  } else {
-    apiFetch(`/api/jobs/${jobId}`)
-      .then(d => renderJobInfo(d.job || d))
-      .catch(e => showCustomAlert({ title: "Error", message: "Failed to fetch job details: " + e.message, isError: true }));
-  }
+  // Fetch full job record for up-to-date artifacts and diagnostics
+  apiFetch(`/api/jobs/${encodeURIComponent(jobId)}`)
+    .then(d => {
+      const fullJob = d.job || d;
+      renderJobInfo(fullJob);
+    })
+    .catch(e => {
+      if (job) {
+        renderJobInfo(job);
+      } else {
+        showCustomAlert({ title: "Error", message: "Failed to fetch job details: " + e.message, isError: true });
+      }
+    });
 };
 
 window.closeJobDetail = function() {
@@ -2136,13 +2328,71 @@ window.closeJobDetail = function() {
   activeDetailJobId = null;
 };
 
+window.applyJobTemplate = function(val) {
+  const typeSelect = document.getElementById("job-type");
+  const nameInput = document.getElementById("job-name");
+  const codeInput = document.getElementById("job-python-code");
+  const paramsInput = document.getElementById("job-params");
+  const timeoutInput = document.getElementById("job-timeout");
+  const targetSelect = document.getElementById("job-target");
+  if (!val || !typeSelect) return;
+
+  if (val === "python") {
+    typeSelect.value = "python-script";
+    onJobTypeChange("python-script");
+    if (nameInput && !nameInput.value) nameInput.value = "python-workload";
+    if (codeInput) codeInput.value = "import sys, platform\nprint(f'PersonalServer compute node: {platform.node()}')\nprint(f'Python runtime: {sys.version}')\n";
+    if (targetSelect && targetSelect.value === "auto") targetSelect.value = "capability:python3";
+    if (timeoutInput) timeoutInput.value = "60";
+  } else if (val === "ping") {
+    typeSelect.value = "ping-check";
+    onJobTypeChange("ping-check");
+    if (nameInput && !nameInput.value) nameInput.value = "ping-check";
+    if (paramsInput) paramsInput.value = JSON.stringify({ host: "8.8.8.8", count: 4 });
+    if (timeoutInput) timeoutInput.value = "15";
+  } else if (val === "http") {
+    typeSelect.value = "http-check";
+    onJobTypeChange("http-check");
+    if (nameInput && !nameInput.value) nameInput.value = "http-health";
+    if (paramsInput) paramsInput.value = JSON.stringify({ url: "https://httpbin.org/status/200", expected_status: 200, timeout: 5 });
+    if (timeoutInput) timeoutInput.value = "20";
+  } else if (val === "dns") {
+    typeSelect.value = "dns-check";
+    onJobTypeChange("dns-check");
+    if (nameInput && !nameInput.value) nameInput.value = "dns-resolve";
+    if (paramsInput) paramsInput.value = JSON.stringify({ host: "google.com" });
+    if (timeoutInput) timeoutInput.value = "15";
+  } else if (val === "shell") {
+    typeSelect.value = "shell-script";
+    onJobTypeChange("shell-script");
+    if (nameInput && !nameInput.value) nameInput.value = "shell-command";
+    if (paramsInput) paramsInput.value = JSON.stringify({ script: "echo PersonalServer Cluster Node Health OK" });
+    if (timeoutInput) timeoutInput.value = "30";
+  } else if (val === "sysinfo") {
+    typeSelect.value = "system-info";
+    onJobTypeChange("system-info");
+    if (nameInput && !nameInput.value) nameInput.value = "system-metrics";
+    if (paramsInput) paramsInput.value = "{}";
+    if (timeoutInput) timeoutInput.value = "30";
+  }
+};
+
 // Dispatch job
 document.getElementById("job-submit-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
+  const name = document.getElementById("job-name")?.value.trim() || "";
   const type = document.getElementById("job-type").value;
   const target = document.getElementById("job-target").value;
   const timeout = parseInt(document.getElementById("job-timeout").value, 10) || 60;
-  const paramsRaw = document.getElementById("job-params").value.trim();
+  const pinned = document.getElementById("job-pinned")?.checked || false;
+  const priority = document.getElementById("job-priority")?.value || "normal";
+  const pythonCode = document.getElementById("job-python-code")?.value || "";
+  const argsRaw = document.getElementById("job-args")?.value.trim() || "";
+  const inputsRaw = document.getElementById("job-inputs")?.value.trim() || "";
+  const outputsRaw = document.getElementById("job-outputs")?.value.trim() || "";
+  const minRam = parseInt(document.getElementById("job-min-ram")?.value, 10);
+  const minCores = parseInt(document.getElementById("job-min-cores")?.value, 10);
+  const paramsRaw = document.getElementById("job-params")?.value.trim() || "";
 
   let params = {};
   if (paramsRaw) {
@@ -2151,22 +2401,80 @@ document.getElementById("job-submit-form")?.addEventListener("submit", async (e)
     } catch (err) {
       showCustomAlert({
         title: "Invalid Parameters",
-        message: "Invalid JSON parameters: " + err.message,
+        message: "Invalid JSON in custom parameters: " + err.message,
         isError: true
       });
       return;
     }
   }
 
+  const payload = {
+    type,
+    target,
+    timeout,
+    pinned: Boolean(pinned),
+    priority,
+    parameters: params
+  };
+
+  if (name) {
+    payload.name = name;
+  }
+
+  // Workload code
+  if (type === "python-script" && pythonCode) {
+    payload.code = pythonCode;
+  }
+
+  // Script args
+  if (argsRaw) {
+    try {
+      if (argsRaw.startsWith("[") && argsRaw.endsWith("]")) {
+        payload.args = JSON.parse(argsRaw);
+      } else {
+        payload.args = argsRaw.split(/\s+/).filter(Boolean);
+      }
+    } catch (e) {
+      payload.args = argsRaw.split(/\s+/).filter(Boolean);
+    }
+  }
+
+  // Input artifacts
+  if (inputsRaw) {
+    payload.inputs = inputsRaw.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+  }
+
+  // Expected output files
+  if (outputsRaw) {
+    payload.outputs = outputsRaw.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+  }
+
+  // Resource requirements
+  const reqs = {};
+  if (!isNaN(minRam) && minRam > 0) reqs.min_ram_mb = minRam;
+  if (!isNaN(minCores) && minCores > 0) reqs.min_cores = minCores;
+  if (type === "python-script" || (target && target.includes("python3"))) {
+    reqs.verified_capabilities = ["python3"];
+  }
+  if (Object.keys(reqs).length > 0) {
+    payload.requirements = reqs;
+  }
+
   try {
-    await apiFetch("/api/jobs", {
+    const res = await apiFetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type, target, timeout, parameters: params })
+      body: JSON.stringify(payload)
     });
+
     toggleSubmitJobCard(false);
     jobCurrentPage = 1;
-    loadJobs();
+    loadJobs(true);
+
+    const createdId = res.job_id || (res.job && res.job.job_id);
+    if (createdId) {
+      setTimeout(() => viewJobById(createdId), 300);
+    }
   } catch (err) {
     showCustomAlert({
       title: "Job Submission Failed",
@@ -2201,6 +2509,31 @@ document.getElementById("jobs-sort-by")?.addEventListener("change", () => {
   loadJobs();
 });
 
+// Background live polling for active workload jobs (6-second bounded interval)
+setInterval(() => {
+  const currentHash = (window.location.hash || "").replace("#", "");
+  if (currentHash !== "jobs") return;
+
+  const activeStates = ["QUEUED", "CLAIMED", "ASSIGNED", "RUNNING", "RECOVERING", "RETRY_WAIT", "WAITING_FOR_DEPENDENCY", "NEEDS_ATTENTION"];
+  const hasActiveJob = cachedJobs && cachedJobs.some(j => activeStates.includes((j.status || j.state || "").toUpperCase()));
+
+  const badge = document.getElementById("jobs-auto-refresh-badge");
+  if (badge) {
+    badge.classList.toggle("active", hasActiveJob);
+    badge.textContent = hasActiveJob ? "● Live (polling)" : "● Live";
+  }
+
+  if (hasActiveJob || activeDetailJobId) {
+    loadJobs(true);
+    if (activeDetailJobId) {
+      const targetJob = cachedJobs.find(j => (j.job_id === activeDetailJobId || j.id === activeDetailJobId));
+      if (targetJob && activeStates.includes((targetJob.status || targetJob.state || "").toUpperCase())) {
+        viewJobById(activeDetailJobId);
+      }
+    }
+  }
+}, 6000);
+
 // 4. Storage View (Windows File Explorer Subsystem)
 let cachedStorageItems = [];
 let storageFilterQuery = "";
@@ -2234,23 +2567,41 @@ async function loadStorageNodes() {
   // Populate address bar location dropdown & left pane location list
   const nodeSelect = document.getElementById("storage-node-select");
   if (nodeSelect) {
-    const currentVal = selectedStorageNode || "auto";
     nodeSelect.innerHTML = `<option value="auto">Storage: Auto (Cluster)</option>` +
-      cachedStorageNodes.map(n => `<option value="${n.name || n.node_id}">Node: ${n.name || n.node_id}${n.is_local ? ' (Local)' : ''} [${n.status}]</option>`).join("");
-    nodeSelect.value = selectedStorageNode ? (selectedStorageNode === "vivo-y31" ? "auto" : selectedStorageNode) : "auto";
+      cachedStorageNodes.map(n => {
+        const canonicalId = n.node_id || n.name;
+        const noStorage = (n.storage_supported === false);
+        const tag = noStorage ? ' [Compute Only]' : ` [${n.status}]`;
+        return `<option value="${canonicalId}" ${noStorage ? 'disabled' : ''}>Node: ${n.name || n.node_id}${n.is_local ? ' (Local)' : ''}${tag}</option>`;
+      }).join("");
+
+    if (selectedStorageNode) {
+      const match = cachedStorageNodes.find(n => n.node_id === selectedStorageNode || n.name === selectedStorageNode);
+      if (match) {
+        nodeSelect.value = match.is_local ? "auto" : (match.node_id || match.name);
+      } else {
+        nodeSelect.value = selectedStorageNode;
+      }
+    } else {
+      nodeSelect.value = "auto";
+    }
   }
 
   const nodeList = document.getElementById("explorer-node-list");
   if (nodeList) {
     nodeList.innerHTML = cachedStorageNodes.map(n => {
       const isOnline = (n.status || "").toUpperCase() === "ONLINE";
+      const canonicalId = n.node_id || n.name;
       const isSelected = n.name === selectedStorageNode || n.node_id === selectedStorageNode;
       const isAutoSelected = !selectedStorageNode && n.is_local;
       const activeClass = (isSelected || isAutoSelected) ? "active" : "";
+      const noStorage = (n.storage_supported === false);
+      const storageBadge = noStorage ? `<span class="badge" style="font-size: 10px; margin-left: 4px; opacity: 0.7;">No Storage</span>` : '';
       return `
-        <a href="javascript:void(0)" class="explorer-node-item ${activeClass}" onclick="switchStorageNode('${n.name || n.node_id}')">
+        <a href="javascript:void(0)" class="explorer-node-item ${activeClass} ${noStorage ? 'disabled-node' : ''}" onclick="switchStorageNode('${canonicalId}')">
           <span class="${isOnline ? 'text-online' : 'text-offline'}" style="font-size: 9px;">●</span>
           <span>${n.name || n.node_id}${n.is_local ? ' (Local)' : ''}</span>
+          ${storageBadge}
         </a>
       `;
     }).join("");
@@ -2357,8 +2708,20 @@ async function loadStorage(path = "", node = selectedStorageNode, pushHistory = 
   }
   const isLocal = !nodeObj || nodeObj.is_local;
   const isOnline = (nodeObj?.status || "").toUpperCase() === "ONLINE";
+  const isStorageSupported = (nodeObj?.storage_supported !== false);
 
   const actionsContainer = document.getElementById("storage-actions-container");
+  const tbody = document.getElementById("storage-tbody");
+
+  if (!isStorageSupported) {
+    if (actionsContainer) {
+      actionsContainer.innerHTML = `<span class="storage-badge-ro">Storage Not Supported (Compute Node)</span>`;
+    }
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="5" class="cell-muted" style="text-align: center; padding: 24px;">Storage browsing is not supported on this node (Compute / Build only).</td></tr>`;
+    }
+    return;
+  }
   if (actionsContainer) {
     if (isOnline) {
       const currentFolderName = path ? (path.split("/").pop() || "Folder") : "";
@@ -2406,8 +2769,9 @@ async function loadStorage(path = "", node = selectedStorageNode, pushHistory = 
     }
   }
 
-  const tbody = document.getElementById("storage-tbody");
-  tbody.innerHTML = `<tr><td colspan="5" class="cell-muted" style="text-align: center; padding: 24px;">Loading storage items...</td></tr>`;
+  if (tbody) {
+    tbody.innerHTML = `<tr><td colspan="5" class="cell-muted" style="text-align: center; padding: 24px;">Loading storage items...</td></tr>`;
+  }
 
   try {
     const listUrl = isLocal 
@@ -2865,17 +3229,6 @@ async function executeFolderUploadQueue(overwrite = false) {
     if (currFile) currFile.textContent = relPath;
     if (statsDetail) {
       statsDetail.textContent = `${folderUploadState.completedCount} / ${totalFiles} completed (${formatBytes(folderUploadState.completedBytes)} / ${formatBytes(folderUploadState.totalBytes)})`;
-    }
-
-    // Client-side 100 MB check
-    if (file.size > 100 * 1024 * 1024) {
-      folderUploadState.failedQueue.push({
-        file,
-        relPath,
-        error: "File exceeds 100 MB limit",
-        isConflict: false
-      });
-      continue;
     }
 
     folderUploadState.abortController = new AbortController();

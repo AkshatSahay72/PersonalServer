@@ -261,11 +261,18 @@ def parse_and_validate_blueprint(blueprint_input: Any, apps_db: Optional[Dict[st
     return sanitized_blueprint
 
 
-def fetch_github_source(app_id: str, repository: str, branch: str = "main", root_directory: str = ".") -> Dict[str, Any]:
+def fetch_github_source(
+    app_id: str,
+    repository: str,
+    branch: str = "main",
+    root_directory: str = ".",
+    commit_sha: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Fetches GitHub source repository into sandboxed application storage directory:
     storage/applications/<app_id>/source/
     Ensures safe unpacking and zero path traversal.
+    Supports branch names, commit SHAs, and native Python applications.
     """
     if not re.match(r'^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$', repository.strip()):
         raise ValueError("Invalid repository format. Expected 'owner/repository'.")
@@ -280,12 +287,25 @@ def fetch_github_source(app_id: str, repository: str, branch: str = "main", root
     # Check local test fixture directories (e.g. tests/fixtures/sample_repo)
     repo_leaf = repository.split("/")[-1]
     fixture_dir = BASE_DIR / "tests" / "fixtures" / repo_leaf
-    commit_sha = "main"
+    resolved_commit = commit_sha.strip() if commit_sha else ("main" if branch == "main" else branch)
+
+    try:
+        from common.dns_utils import enable_dns_fallback
+        enable_dns_fallback()
+    except Exception:
+        pass
 
     if fixture_dir.exists() and fixture_dir.is_dir():
         shutil.copytree(fixture_dir, target_source_dir, dirs_exist_ok=True)
     else:
-        url = f"https://codeload.github.com/{repository}/tar.gz/refs/heads/{branch}"
+        if commit_sha:
+            ref_path = commit_sha.strip()
+            url = f"https://codeload.github.com/{repository}/tar.gz/{ref_path}"
+        elif re.match(r'^[0-9a-fA-F]{40}$', branch):
+            url = f"https://codeload.github.com/{repository}/tar.gz/{branch}"
+        else:
+            url = f"https://codeload.github.com/{repository}/tar.gz/refs/heads/{branch}"
+
         req = urllib.request.Request(url, headers={"User-Agent": "PersonalServer-SourceDeployer/1.0"})
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -297,7 +317,13 @@ def fetch_github_source(app_id: str, repository: str, branch: str = "main", root
                     members = tar.getmembers()
                     if not members:
                         raise ValueError("Empty repository archive.")
-                    root_prefix = members[0].name.split("/")[0] + "/"
+                    top_name = members[0].name.split("/")[0]
+                    root_prefix = top_name + "/"
+                    if "-" in top_name:
+                        cand_sha = top_name.split("-")[-1]
+                        if cand_sha and re.match(r'^[0-9a-fA-F]{7,40}$', cand_sha):
+                            resolved_commit = cand_sha
+
                     for member in members:
                         rel_path = member.name[len(root_prefix):] if member.name.startswith(root_prefix) else member.name
                         if not rel_path or rel_path.startswith("/") or ".." in rel_path:
@@ -308,14 +334,15 @@ def fetch_github_source(app_id: str, repository: str, branch: str = "main", root
                         tar.extract(member, path=target_source_dir)
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                raise RuntimeError(f"Repository '{repository}' or branch '{branch}' not found on GitHub (404).")
+                target_desc = f"commit '{commit_sha}'" if commit_sha else f"branch '{branch}'"
+                raise RuntimeError(f"Repository '{repository}' or {target_desc} not found on GitHub (404).")
             raise RuntimeError(f"GitHub returned HTTP {e.code}: {e.reason}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"Failed to connect to GitHub: {e.reason}")
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch GitHub repository '{repository}' on branch '{branch}': {e}")
+            raise RuntimeError(f"Failed to fetch GitHub repository '{repository}': {e}")
 
-    # Inspect fetched source for blueprint or Dockerfile
+    # Inspect fetched source for blueprint, Dockerfile, or native Python entrypoint
     resolved_root = (target_source_dir / (root_directory or ".")).resolve()
     try:
         resolved_root.relative_to(target_source_dir)
@@ -352,15 +379,31 @@ def fetch_github_source(app_id: str, repository: str, branch: str = "main", root
                 }
             ]
         }
+    elif (resolved_root / "app.py").exists() or (resolved_root / "main.py").exists() or (resolved_root / "server.py").exists():
+        app_name = repository.split("/")[-1].lower().replace(".", "-")
+        blueprint = {
+            "version": "1.0",
+            "services": [
+                {
+                    "type": "web",
+                    "name": app_name,
+                    "runtime": "python",
+                    "rootDir": root_directory or ".",
+                    "route": f"/{app_name}",
+                    "envVars": []
+                }
+            ]
+        }
     else:
-        raise ValueError("No 'personalserver.yaml' blueprint or 'Dockerfile' found in repository.")
+        raise ValueError("No 'personalserver.yaml' blueprint, 'Dockerfile', or Python entrypoint (app.py/main.py) found in repository.")
 
     return {
         "status": "fetched",
         "repository": repository,
         "branch": branch,
         "root_directory": root_directory,
-        "commit": commit_sha[:8],
+        "commit": resolved_commit[:8] if resolved_commit else "latest",
+        "commit_full": resolved_commit if resolved_commit else "latest",
         "source_dir": str(target_source_dir),
         "blueprint": blueprint,
         "has_blueprint": is_blueprint_file,
@@ -402,6 +445,13 @@ def mask_app_record(app: Optional[Dict[str, Any]], reveal_secrets: bool = False)
             is_sec = bool(any(s in k.lower() for s in ("key", "secret", "password", "token", "auth")))
             masked_raw[k] = str(v) if (reveal_secrets or not is_sec) else "********"
         app_copy["env"] = masked_raw
+
+    # Mask webhook secret
+    wh = app_copy.get("webhook")
+    if isinstance(wh, dict) and "secret" in wh and not reveal_secrets:
+        wh_masked = dict(wh)
+        wh_masked["secret"] = "••••••••"
+        app_copy["webhook"] = wh_masked
 
     # Attach dynamic public URL from centralized PlatformConfig
     route = app_copy.get("route")

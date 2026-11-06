@@ -287,6 +287,10 @@ class ControllerPaths:
         self.backup_nodes_file = self.data_dir / "nodes.json.bak"
         self.jobs_file = self.data_dir / "jobs.json"
         self.backup_jobs_file = self.data_dir / "jobs.json.bak"
+        self.workflows_file = self.data_dir / "workflows.json"
+        self.backup_workflows_file = self.data_dir / "workflows.json.bak"
+        self.artifacts_file = self.data_dir / "artifacts.json"
+        self.backup_artifacts_file = self.data_dir / "artifacts.json.bak"
         self.apps_file = self.data_dir / "apps.json"
         self.backup_apps_file = self.data_dir / "apps.json.bak"
         self.onboarding_codes_file = self.data_dir / "onboarding_codes.json"
@@ -296,10 +300,11 @@ class ControllerPaths:
         self.backup_shares_file = self.data_dir / "shares.json.bak"
         self.leader_lease_file = self.data_dir / "leader_lease.json"
         self.ha_state_file = self.data_dir / "ha_state.json"
+        self.artifacts_dir = self.storage_dir / "artifacts"
 
     def ensure_directories(self):
         """Creates all needed directory structures safely across Windows and Linux."""
-        for d in (self.data_dir, self.secrets_dir, self.runtime_dir, self.logs_dir, self.storage_dir):
+        for d in (self.data_dir, self.secrets_dir, self.runtime_dir, self.logs_dir, self.storage_dir, self.artifacts_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     def validate(self):
@@ -328,8 +333,11 @@ class ControllerPaths:
             "runtime_dir": str(self.runtime_dir),
             "logs_dir": str(self.logs_dir),
             "storage_dir": str(self.storage_dir),
+            "artifacts_dir": str(self.artifacts_dir),
             "nodes_file": str(self.nodes_file),
             "jobs_file": str(self.jobs_file),
+            "workflows_file": str(self.workflows_file),
+            "artifacts_file": str(self.artifacts_file),
             "apps_file": str(self.apps_file),
             "onboarding_codes_file": str(self.onboarding_codes_file),
             "enrollment_token_file": str(self.enrollment_token_file),

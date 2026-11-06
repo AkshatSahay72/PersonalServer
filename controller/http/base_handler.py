@@ -30,7 +30,7 @@ class BaseHandler(BaseHTTPRequestHandler):
     heartbeat_timeout = DEFAULT_HEARTBEAT_TIMEOUT
     default_backoff_sec = 0.0
 
-    def send_json(self, status_code: int, data: Any) -> None:
+    def send_json(self, status_code: int, data: Any, headers: Optional[Dict[str, str]] = None) -> None:
         """Sends a JSON formatted HTTP response with CORS and correlation headers."""
         corr_id = getattr(self, "current_correlation_id", None)
         if corr_id and isinstance(data, dict) and "correlation_id" not in data:
@@ -39,6 +39,9 @@ class BaseHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if headers:
+            for k, v in headers.items():
+                self.send_header(k, v)
         if corr_id:
             self.send_header("X-Correlation-ID", corr_id)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -61,6 +64,25 @@ class BaseHandler(BaseHTTPRequestHandler):
         if auth_header.startswith("Bearer "):
             return auth_header[7:].strip()
         return self.headers.get("X-Auth-Token", "").strip()
+
+    def is_authenticated_admin(self) -> bool:
+        """Verifies if caller has the cluster enrollment token."""
+        token = self.parse_auth_token()
+        if not token:
+            return False
+        enrollment_token = get_or_create_enrollment_token()
+        return constant_time_compare(token, enrollment_token)
+
+    def get_authenticated_node_id(self) -> Optional[str]:
+        """Returns node_id if caller is an authenticated node, or None if admin or unauthenticated."""
+        token = self.parse_auth_token()
+        if not token:
+            return None
+        nodes_db = load_nodes_db()
+        for node_id, node in nodes_db.get("nodes", {}).items():
+            if node.get("auth_token") and constant_time_compare(node.get("auth_token"), token):
+                return node.get("node_id") or node_id
+        return None
 
     def is_authenticated_admin_or_node(self) -> bool:
         """Verifies if caller has valid cluster enrollment token or registered node auth token."""
@@ -130,14 +152,18 @@ class BaseHandler(BaseHTTPRequestHandler):
         return True
 
     def read_json_body(self) -> Optional[Dict[str, Any]]:
-        """Safely parses JSON request body with Content-Length limits."""
+        """Safely parses JSON request body with Content-Length limits and retains raw bytes."""
         try:
             content_len = int(self.headers.get("Content-Length", 0))
             if content_len == 0:
+                self.raw_request_body = b""
                 return None
-            raw = self.rfile.read(content_len).decode("utf-8")
+            raw_bytes = self.rfile.read(content_len)
+            self.raw_request_body = raw_bytes
+            raw = raw_bytes.decode("utf-8")
             return json.loads(raw)
         except Exception:
+            self.raw_request_body = b""
             return None
 
     def log_message(self, format: str, *args: Any) -> None:

@@ -20,39 +20,83 @@ STATE_REMOVED = "REMOVED"
 
 VALID_ROLES = ["compute", "storage", "gateway", "controller", "hybrid"]
 
-# Centralized Job States (V1.0 Lifecycle)
+# Centralized Job States (V2.0 Extended Lifecycle)
 JOB_STATE_QUEUED = "QUEUED"
-JOB_STATE_CLAIMED = "CLAIMED"
+JOB_STATE_WAITING_FOR_DEPENDENCY = "WAITING_FOR_DEPENDENCY"
+JOB_STATE_ASSIGNED = "ASSIGNED"
+JOB_STATE_CLAIMED = "CLAIMED"              # Compatible alias for ASSIGNED
 JOB_STATE_RUNNING = "RUNNING"
+JOB_STATE_RETRY_WAIT = "RETRY_WAIT"
+JOB_STATE_RECOVERING = "RECOVERING"        # Compatible alias for RETRY_WAIT
 JOB_STATE_SUCCEEDED = "SUCCEEDED"
 JOB_STATE_FAILED = "FAILED"
-JOB_STATE_TIMEOUT = "TIMEOUT"
+JOB_STATE_TIMED_OUT = "TIMED_OUT"
+JOB_STATE_TIMEOUT = "TIMEOUT"              # Compatible alias for TIMED_OUT
 JOB_STATE_CANCELLED = "CANCELLED"
-JOB_STATE_RECOVERING = "RECOVERING"
+JOB_STATE_NEEDS_ATTENTION = "NEEDS_ATTENTION"
 JOB_STATE_REJECTED = "REJECTED"
 
-# Formal Job State Transitions Lifecycle
-VALID_JOB_TRANSITIONS: Dict[str, Set[str]] = {
-    JOB_STATE_QUEUED: {JOB_STATE_CLAIMED, JOB_STATE_CANCELLED, JOB_STATE_REJECTED},
-    JOB_STATE_CLAIMED: {JOB_STATE_RUNNING, JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED, JOB_STATE_RECOVERING},
-    JOB_STATE_RUNNING: {JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMEOUT, JOB_STATE_CANCELLED, JOB_STATE_RECOVERING},
-    JOB_STATE_RECOVERING: {JOB_STATE_CLAIMED, JOB_STATE_FAILED, JOB_STATE_CANCELLED},
+# State Aliases for transparent compatibility
+JOB_STATE_ALIASES: Dict[str, str] = {
+    JOB_STATE_CLAIMED: JOB_STATE_ASSIGNED,
+    JOB_STATE_RECOVERING: JOB_STATE_RETRY_WAIT,
+    JOB_STATE_TIMEOUT: JOB_STATE_TIMED_OUT,
+}
+
+def canonicalize_job_state(state: str) -> str:
+    """Returns canonical state identifier for aliases."""
+    if not state:
+        return ""
+    st = state.strip().upper()
+    return JOB_STATE_ALIASES.get(st, st)
+
+# Formal Job State Transitions Lifecycle (defined on canonical states)
+CANONICAL_JOB_TRANSITIONS: Dict[str, Set[str]] = {
+    JOB_STATE_QUEUED: {JOB_STATE_ASSIGNED, JOB_STATE_WAITING_FOR_DEPENDENCY, JOB_STATE_CANCELLED, JOB_STATE_REJECTED, JOB_STATE_NEEDS_ATTENTION},
+    JOB_STATE_WAITING_FOR_DEPENDENCY: {JOB_STATE_QUEUED, JOB_STATE_FAILED, JOB_STATE_CANCELLED, JOB_STATE_NEEDS_ATTENTION},
+    JOB_STATE_ASSIGNED: {JOB_STATE_RUNNING, JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_CANCELLED, JOB_STATE_RETRY_WAIT, JOB_STATE_NEEDS_ATTENTION, JOB_STATE_QUEUED},
+    JOB_STATE_RUNNING: {JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_CANCELLED, JOB_STATE_RETRY_WAIT, JOB_STATE_NEEDS_ATTENTION},
+    JOB_STATE_RETRY_WAIT: {JOB_STATE_QUEUED, JOB_STATE_ASSIGNED, JOB_STATE_FAILED, JOB_STATE_CANCELLED, JOB_STATE_NEEDS_ATTENTION},
+    JOB_STATE_NEEDS_ATTENTION: {JOB_STATE_QUEUED, JOB_STATE_ASSIGNED, JOB_STATE_FAILED, JOB_STATE_CANCELLED},
     JOB_STATE_SUCCEEDED: set(),   # Terminal
     JOB_STATE_FAILED: set(),      # Terminal
-    JOB_STATE_TIMEOUT: set(),     # Terminal if max_attempts reached
+    JOB_STATE_TIMED_OUT: set(),   # Terminal if max_attempts reached
     JOB_STATE_CANCELLED: set(),   # Terminal
     JOB_STATE_REJECTED: set(),    # Terminal
 }
+
+# Compatibility dictionary: includes both canonical and legacy alias keys/values
+VALID_JOB_TRANSITIONS: Dict[str, Set[str]] = {}
+for src, dsts in CANONICAL_JOB_TRANSITIONS.items():
+    expanded_dsts = set(dsts)
+    if JOB_STATE_ASSIGNED in dsts:
+        expanded_dsts.add(JOB_STATE_CLAIMED)
+    if JOB_STATE_RETRY_WAIT in dsts:
+        expanded_dsts.add(JOB_STATE_RECOVERING)
+    if JOB_STATE_TIMED_OUT in dsts:
+        expanded_dsts.add(JOB_STATE_TIMEOUT)
+
+    VALID_JOB_TRANSITIONS[src] = expanded_dsts
+    # Populate legacy aliases as sources too
+    if src == JOB_STATE_ASSIGNED:
+        VALID_JOB_TRANSITIONS[JOB_STATE_CLAIMED] = expanded_dsts
+    elif src == JOB_STATE_RETRY_WAIT:
+        VALID_JOB_TRANSITIONS[JOB_STATE_RECOVERING] = expanded_dsts
+    elif src == JOB_STATE_TIMED_OUT:
+        VALID_JOB_TRANSITIONS[JOB_STATE_TIMEOUT] = expanded_dsts
 
 
 def validate_job_transition(current_state: str, new_state: str) -> bool:
     """
     Validates whether transitioning from current_state to new_state is allowed by the lifecycle state machine.
+    Transparently normalizes aliases (e.g. CLAIMED <-> ASSIGNED, TIMEOUT <-> TIMED_OUT).
     """
-    if current_state == new_state:
+    curr_c = canonicalize_job_state(current_state)
+    new_c = canonicalize_job_state(new_state)
+    if curr_c == new_c:
         return True  # Idempotent re-affirmation
-    allowed = VALID_JOB_TRANSITIONS.get(current_state, set())
-    return new_state in allowed
+    allowed = CANONICAL_JOB_TRANSITIONS.get(curr_c, set())
+    return new_c in allowed
 
 
 # Centralized Application States (Phase 11-13 Lifecycle)
@@ -76,10 +120,17 @@ ALLOWLISTED_WORKLOADS = {
     "system-info": "Gather system hardware and OS metrics",
     "health-check": "Run node health check script",
     "node-status": "Run node status check script",
-    "python-script": "Execute safe inline python script",
+    "ping-check": "Run safe ICMP or network ping probe",
+    "http-check": "Run safe HTTP/HTTPS endpoint probe",
+    "dns-check": "Run DNS resolution and connectivity diagnostic",
+    "python-script": "Execute safe inline python script or function",
+    "shell-script": "Execute approved structured shell script on compatible hosts",
     "echo": "Echo back test message",
     "failing-test": "Controlled error-handling test workload",
     "timeout-test": "Controlled timeout test workload",
+    "image-build": "Build, tag, and compute immutable metadata for container image from source",
+    "image-tag": "Tag image with versioned tag and compute immutable digest",
+    "image-inspect": "Inspect local/registry image metadata and architecture compatibility",
     "docker-deploy": "Pull image and safely launch containerized application",
     "docker-build-deploy": "Build image from source context and launch containerized application",
     "docker-stop": "Stop running containerized application",
@@ -99,15 +150,23 @@ __all__ = [
     "STATE_REMOVED",
     "VALID_ROLES",
     "JOB_STATE_QUEUED",
+    "JOB_STATE_WAITING_FOR_DEPENDENCY",
+    "JOB_STATE_ASSIGNED",
     "JOB_STATE_CLAIMED",
     "JOB_STATE_RUNNING",
+    "JOB_STATE_RETRY_WAIT",
+    "JOB_STATE_RECOVERING",
     "JOB_STATE_SUCCEEDED",
     "JOB_STATE_FAILED",
+    "JOB_STATE_TIMED_OUT",
     "JOB_STATE_TIMEOUT",
     "JOB_STATE_CANCELLED",
-    "JOB_STATE_RECOVERING",
+    "JOB_STATE_NEEDS_ATTENTION",
     "JOB_STATE_REJECTED",
+    "JOB_STATE_ALIASES",
+    "canonicalize_job_state",
     "VALID_JOB_TRANSITIONS",
+    "CANONICAL_JOB_TRANSITIONS",
     "validate_job_transition",
     "APP_STATE_CREATED",
     "APP_STATE_FETCHING_SOURCE",

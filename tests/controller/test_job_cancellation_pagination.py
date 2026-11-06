@@ -378,6 +378,7 @@ class TestJobsCancellationAndPagination(unittest.TestCase):
         self.assertEqual(c_code, 200)
 
         # Sweeper runs with disconnected node
+        db = load_jobs_db()
         sweep_expired_leases(db, {"nodes": {"disconnected-node": {"status": "OFFLINE"}}}, timeout_seconds=1)
 
         # Job must stay CANCELLED

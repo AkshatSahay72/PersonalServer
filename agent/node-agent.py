@@ -19,14 +19,26 @@ import shutil
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Tuple, Optional, List, Dict, Any
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
-# Import local JobExecutor
-from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+# Import local JobExecutor & Artifact helpers
+try:
+    from job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+except ImportError:
+    from agent.job_executor import JobExecutor, ALLOWLISTED_WORKLOADS
+
+from common.artifact_manager import (
+    validate_artifact_path,
+    compute_file_sha256,
+    MAX_ARTIFACT_SIZE_BYTES
+)
 from config.structured_logger import (
     agent_logger,
     extract_correlation_id,
@@ -250,6 +262,18 @@ def load_node_config():
             print(f"Warning: Failed to read {NODE_CONF}: {e}", file=sys.stderr)
 
     hw = discover_hardware()
+    raw_caps = config.get("capabilities", hw["capabilities"])
+    try:
+        from agent.capability_prober import run_capability_probes
+        probe_data = run_capability_probes(raw_caps)
+        adv_caps = probe_data["advertised_capabilities"]
+        ver_caps = probe_data["verified_capabilities"]
+        probe_res = probe_data["probe_results"]
+    except Exception:
+        adv_caps = dict(raw_caps) if isinstance(raw_caps, dict) else {str(c): True for c in raw_caps}
+        ver_caps = {}
+        probe_res = {}
+
     return {
         "node_id": config.get("node_id", "unknown"),
         "name": config.get("name", config.get("node_name", hw["name"])),
@@ -260,7 +284,10 @@ def load_node_config():
         "cpu_cores": int(config.get("cpu_cores", hw["cpu_cores"])),
         "ram_mb": int(config.get("ram_mb", hw["ram_mb"])),
         "storage_gb": int(config.get("storage_gb", hw["storage_gb"])),
-        "capabilities": config.get("capabilities", hw["capabilities"])
+        "capabilities": adv_caps,
+        "advertised_capabilities": adv_caps,
+        "verified_capabilities": ver_caps,
+        "probe_results": probe_res
     }
 
 
@@ -674,7 +701,14 @@ def is_pid_alive(pid_str, pattern=None):
     except OSError:
         return False
     if pattern:
-        args = run_cmd(f"ps -p {pid} -o args=")
+        cmdline_file = Path(f"/proc/{pid}/cmdline")
+        if cmdline_file.exists():
+            try:
+                cmd_raw = cmdline_file.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                return pattern in cmd_raw
+            except Exception:
+                pass
+        args = run_cmd(f"ps -p {pid} -o args= 2>/dev/null || ps -ef")
         return pattern in args
     return True
 
@@ -684,33 +718,65 @@ def get_service_states():
 
     if is_docker_available():
         services["docker"] = "running"
+    elif is_udocker_available():
+        services["container_runtime"] = "running"
 
-    if (BASE_DIR / "services" / "node-api" / "app.py").exists():
-        api_pid = ""
-        api_pid_file = RUNTIME_DIR / "node-api.pid"
-        if api_pid_file.exists():
-            try:
-                api_pid = api_pid_file.read_text().strip()
-            except Exception:
-                pass
+    # Track Node Worker daemon
+    worker_pid = ""
+    worker_pid_file = RUNTIME_DIR / "node-worker.pid"
+    if worker_pid_file.exists():
+        try:
+            worker_pid = worker_pid_file.read_text().strip()
+        except Exception:
+            pass
+    if not is_pid_alive(worker_pid, "node-agent.py work"):
+        worker_pid = run_cmd("pgrep -f 'agent/node-agent.py work' | head -n 1")
+    if not is_pid_alive(worker_pid, "node-agent.py work"):
+        worker_pid = run_cmd("pgrep -f 'node-agent.py work' | head -n 1")
 
-        if not is_pid_alive(api_pid, "services/node-api/app.py"):
-            api_pid = run_cmd("pgrep -f 'services/node-api/app.py' | head -n 1")
+    if is_pid_alive(worker_pid, "node-agent.py work") or is_pid_alive(worker_pid, "agent/node-agent.py work"):
+        services["node_worker"] = "running"
+    else:
+        # Also check local_worker
+        lw_pid = run_cmd("pgrep -f 'local_worker' | head -n 1")
+        if is_pid_alive(lw_pid, "local_worker"):
+            services["node_worker"] = "running"
 
-        if is_pid_alive(api_pid, "services/node-api/app.py"):
-            try:
-                req = urllib.request.Request("http://127.0.0.1:8080/health", headers={"User-Agent": "NodeAgent/1.0"})
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    if resp.status == 200:
-                        services["node_api"] = "running"
-                    else:
-                        services["node_api"] = "degraded"
-            except Exception:
-                services["node_api"] = "unresponsive"
-        elif (BASE_DIR / "scripts" / "start.sh").exists() or (BASE_DIR / "start.sh").exists():
-            services["node_api"] = "stopped"
+    # Track Node API and Cloudflare only for controller/gateway nodes
+    node_cfg = load_node_config() or {}
+    role = node_cfg.get("role", "")
+    token_file = SECRETS_DIR / "cloudflared.token"
+    is_gateway = (role in ("controller", "gateway"))
 
-    if (BASE_DIR / "scripts" / "start.sh").exists() or (BASE_DIR / "start.sh").exists():
+    if (BASE_DIR / "services" / "node-api" / "app.py").exists() and is_gateway:
+        is_healthy = False
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8080/health", headers={"User-Agent": "NodeAgent/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    services["node_api"] = "running"
+                    is_healthy = True
+        except Exception:
+            pass
+
+        if not is_healthy:
+            api_pid = ""
+            api_pid_file = RUNTIME_DIR / "node-api.pid"
+            if api_pid_file.exists():
+                try:
+                    api_pid = api_pid_file.read_text().strip()
+                except Exception:
+                    pass
+
+            if not is_pid_alive(api_pid, "services/node-api/app.py"):
+                api_pid = run_cmd("pgrep -f 'services/node-api/app.py' | tail -n 1")
+
+            if is_pid_alive(api_pid, "services/node-api/app.py"):
+                services["node_api"] = "degraded"
+            else:
+                services["node_api"] = "stopped"
+
+    if is_gateway and token_file.exists():
         cf_pid = ""
         cf_pid_file = RUNTIME_DIR / "cloudflared.pid"
         if cf_pid_file.exists():
@@ -1059,17 +1125,18 @@ def cmd_heartbeat(args=None):
     now = get_current_iso_timestamp()
 
     node_config = load_node_config() or {}
-    caps = dict(node_config.get("capabilities", {}))
-    if is_docker_available():
-        caps["container_runtime:docker"] = True
-    if is_udocker_available():
-        caps["container_runtime:udocker"] = True
+    adv_caps = dict(node_config.get("advertised_capabilities", node_config.get("capabilities", {})))
+    ver_caps = dict(node_config.get("verified_capabilities", {}))
+    probe_res = dict(node_config.get("probe_results", {}))
 
     payload_data = {
         "node_id": node_id,
         "status": "online",
         "timestamp": now,
-        "capabilities": caps,
+        "capabilities": adv_caps,
+        "advertised_capabilities": adv_caps,
+        "verified_capabilities": ver_caps,
+        "probe_results": probe_res,
         "services": services_state,
         "workloads": workload_metrics,
         "battery": system_metrics.get("battery", {}),
@@ -1300,9 +1367,148 @@ def cmd_registration_status(args):
     return 0
 
 
+def _post_job_result(controller_url: str, auth_token: str, job_id: str, corr_id: str, result: dict) -> dict:
+    """Posts job execution result back to the controller with correlation headers."""
+    result_url = f"{controller_url.rstrip('/')}/jobs/{job_id}/result"
+    res_req = urllib.request.Request(
+        result_url,
+        data=json.dumps(result).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {auth_token}",
+            "X-Correlation-ID": corr_id,
+            "User-Agent": "PersonalServer-NodeAgent/1.0"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(res_req, timeout=10) as res_resp:
+        return json.loads(res_resp.read().decode("utf-8"))
+
+
+def _download_input_artifacts(controller_url: str, auth_token: str, input_artifacts: list, sandbox_dir: Path) -> Tuple[bool, Optional[str]]:
+    """
+    Downloads required input artifacts into the sandbox directory with streaming SHA-256 validation.
+    Returns (True, None) on success or (False, error_reason) on failure.
+    """
+    for art in input_artifacts:
+        art_id = art.get("artifact_id")
+        raw_dest_name = art.get("name") or art.get("filename")
+        if not raw_dest_name:
+            return False, "Input artifact missing name/filename."
+        try:
+            dest_path = validate_artifact_path(sandbox_dir, raw_dest_name)
+        except ValueError as ve:
+            return False, f"Invalid destination path for artifact '{raw_dest_name}': {ve}"
+
+        expected_sha = art.get("sha256")
+        download_url = f"{controller_url.rstrip('/')}/artifacts/{art_id}/download"
+        req = urllib.request.Request(
+            download_url,
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+                "User-Agent": "PersonalServer-NodeAgent/1.0"
+            }
+        )
+        tmp_dest = dest_path.with_suffix(f".tmp.{secrets.token_hex(4)}")
+        hasher = hashlib.sha256()
+        bytes_read = 0
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                with open(tmp_dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        bytes_read += len(chunk)
+                        if bytes_read > MAX_ARTIFACT_SIZE_BYTES:
+                            raise ValueError(f"Artifact '{raw_dest_name}' exceeded maximum size limit of {MAX_ARTIFACT_SIZE_BYTES} bytes.")
+                        f.write(chunk)
+                        hasher.update(chunk)
+
+            actual_sha = hasher.hexdigest()
+            if expected_sha and actual_sha.lower() != expected_sha.lower():
+                if tmp_dest.exists():
+                    tmp_dest.unlink(missing_ok=True)
+                return False, f"Checksum mismatch for artifact '{raw_dest_name}': expected {expected_sha}, got {actual_sha}."
+
+            shutil.move(str(tmp_dest), str(dest_path))
+        except Exception as e:
+            if tmp_dest.exists():
+                try:
+                    tmp_dest.unlink()
+                except Exception:
+                    pass
+            return False, f"Failed to download input artifact '{raw_dest_name}': {e}"
+
+    return True, None
+
+
+def _upload_output_artifacts(controller_url: str, auth_token: str, declared_outputs: list, job: dict) -> Tuple[bool, list, Optional[str]]:
+    """
+    Streams output artifacts produced by the job to the controller with SHA-256 verification.
+    Returns (True, uploaded_list, None) or (False, uploaded_list, error_reason).
+    """
+    uploaded_records = []
+    job_id = job.get("job_id", "")
+    workflow_id = job.get("workflow_id", "")
+    step_id = job.get("workflow_step_id", "")
+
+    for out in declared_outputs:
+        filename = out.get("filename")
+        name = out.get("name") or filename
+        filepath = Path(out.get("path"))
+        sha256 = out.get("sha256")
+        size_bytes = out.get("size_bytes", 0)
+
+        if not filepath.exists() or not filepath.is_file():
+            return False, uploaded_records, f"Output artifact file '{filepath}' missing on disk."
+
+        query_str = urllib.parse.urlencode({
+            "filename": filename,
+            "name": name,
+            "sha256": sha256,
+            "job_id": job_id,
+            "workflow_id": workflow_id,
+            "step_id": step_id
+        })
+        upload_url = f"{controller_url.rstrip('/')}/artifacts/upload/raw?{query_str}"
+
+        try:
+            with open(filepath, "rb") as f:
+                file_bytes = f.read()
+
+            req = urllib.request.Request(
+                upload_url,
+                data=file_bytes,
+                headers={
+                    "Authorization": f"Bearer {auth_token}",
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(size_bytes),
+                    "X-Artifact-Filename": filename,
+                    "X-Artifact-Name": name,
+                    "X-Artifact-Sha256": sha256,
+                    "X-Job-Id": job_id,
+                    "X-Workflow-Id": workflow_id,
+                    "X-Workflow-Step-Id": step_id,
+                    "User-Agent": "PersonalServer-NodeAgent/1.0"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                art_rec = resp_data.get("artifact")
+                if art_rec:
+                    uploaded_records.append(art_rec)
+        except Exception as e:
+            return False, uploaded_records, f"Failed to upload artifact '{filename}': {e}"
+
+    return True, uploaded_records, None
+
+
 def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon=False):
     """Polls controller for the next job assigned to node_id, executes it, and submits results."""
-    fetch_url = f"{controller_url}/nodes/{node_id}/jobs/next"
+    fetch_url = f"{controller_url.rstrip('/')}/nodes/{node_id}/jobs/next"
     req = urllib.request.Request(
         fetch_url,
         headers={
@@ -1326,6 +1532,9 @@ def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon
             job_id = job.get("job_id")
             corr_id = job.get("correlation_id") or extract_correlation_id(body=job)
             attempt = job.get("attempt", 1)
+            sandbox_dir = (JOBS_DIR / job_id).resolve()
+            sandbox_dir.mkdir(parents=True, exist_ok=True)
+
             agent_logger.info(
                 "job.received",
                 f"Assigned Job: {job_id} ({job.get('type')}, attempt: {attempt})",
@@ -1335,11 +1544,40 @@ def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon
                 attempt=attempt
             )
 
+            # Download required input artifacts (if declared by workflow)
+            input_artifacts = job.get("input_artifacts") or []
+            if input_artifacts:
+                print(f"-> Downloading {len(input_artifacts)} input artifact(s)...")
+                dl_ok, dl_err = _download_input_artifacts(controller_url, auth_token, input_artifacts, sandbox_dir)
+                if not dl_ok:
+                    print(f"-> Failed to download input artifacts: {dl_err}", file=sys.stderr)
+                    fail_result = {
+                        "job_id": job_id,
+                        "correlation_id": corr_id,
+                        "attempt": attempt,
+                        "lease_generation": int(job.get("lease_generation", 1)),
+                        "status": "FAILED",
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": f"Input artifact resolution error: {dl_err}",
+                        "duration_ms": 0,
+                        "started_at": get_current_iso_timestamp(),
+                        "finished_at": get_current_iso_timestamp(),
+                        "diagnostics": {
+                            "failure_reason": f"Input artifact resolution error: {dl_err}"
+                        }
+                    }
+                    try:
+                        _post_job_result(controller_url, auth_token, job_id, corr_id, fail_result)
+                    except Exception as pe:
+                        print(f"Failed to post failure result: {pe}", file=sys.stderr)
+                    return True, False
+
             print(f"-> Assigned Job: {job_id} ({job.get('type')})")
             print(f"-> Executing workload under user permissions...")
 
-            # Execute via JobExecutor
-            result = JobExecutor.execute(job)
+            # Execute via JobExecutor inside dedicated sandbox
+            result = JobExecutor.execute(job, sandbox_dir=sandbox_dir)
 
             agent_logger.info(
                 "job.completed",
@@ -1352,24 +1590,22 @@ def _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon
             )
             print(f"-> Execution completed with status: {result.get('status')} (Exit: {result.get('exit_code')})")
 
-            # Post result back to controller
-            result_url = f"{controller_url}/jobs/{job.get('job_id')}/result"
-            res_req = urllib.request.Request(
-                result_url,
-                data=json.dumps(result).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {auth_token}",
-                    "X-Correlation-ID": corr_id,
-                    "User-Agent": "PersonalServer-NodeAgent/1.0"
-                },
-                method="POST"
-            )
+            # Upload declared outputs (if execution succeeded and outputs declared)
+            if result.get("status") == "SUCCEEDED" and result.get("declared_outputs"):
+                print(f"-> Uploading {len(result['declared_outputs'])} output artifact(s)...")
+                up_ok, uploaded_arts, up_err = _upload_output_artifacts(controller_url, auth_token, result["declared_outputs"], job)
+                if not up_ok:
+                    print(f"-> Failed to upload output artifacts: {up_err}", file=sys.stderr)
+                    result["status"] = "FAILED"
+                    result["exit_code"] = 1
+                    result["stderr"] = f"Output artifact upload error: {up_err}"
+                else:
+                    result["artifacts"] = uploaded_arts
 
-            with urllib.request.urlopen(res_req, timeout=5) as res_resp:
-                ack_data = json.loads(res_resp.read().decode("utf-8"))
-                ack_status = ack_data.get("job_status") or ack_data.get("status") or "ACK"
-                print(f"-> Result reported to controller: {ack_status}")
+            # Post result back to controller
+            ack_data = _post_job_result(controller_url, auth_token, job_id, corr_id, result)
+            ack_status = ack_data.get("job_status") or ack_data.get("status") or "ACK"
+            print(f"-> Result reported to controller: {ack_status}")
 
             return True, True
 
@@ -1408,6 +1644,7 @@ def cmd_work(args):
     print("==========================================")
 
     try:
+        last_heartbeat_time = 0.0
         while True:
             # Refresh registration in case URL or token updated
             curr_reg = load_registration_state()
@@ -1415,6 +1652,15 @@ def cmd_work(args):
                 auth_token = curr_reg.get("auth_token", auth_token)
                 if not args.controller:
                     controller_url = (curr_reg.get("controller_url") or controller_url).rstrip("/")
+
+            # Send periodic heartbeat to keep node ONLINE with fresh capabilities
+            now = time.time()
+            if now - last_heartbeat_time >= 15.0:
+                try:
+                    cmd_heartbeat(None)
+                    last_heartbeat_time = now
+                except Exception:
+                    pass
 
             job_processed, success = _fetch_and_execute_single_job(controller_url, auth_token, node_id, is_daemon=True)
 

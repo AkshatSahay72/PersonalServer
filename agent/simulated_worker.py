@@ -89,7 +89,10 @@ class SimulatedWorker:
         architecture: str = "amd64",
         resources: Optional[Dict[str, Any]] = None,
         capabilities: Optional[Dict[str, Any]] = None,
-        behavior: WorkerBehavior = WorkerBehavior.NORMAL
+        behavior: WorkerBehavior = WorkerBehavior.NORMAL,
+        verified_capabilities: Optional[Dict[str, Any]] = None,
+        advertised_capabilities: Optional[Dict[str, Any]] = None,
+        probe_results: Optional[Dict[str, Any]] = None
     ):
         # Guarantee logical node ID clearly marks worker as simulated
         if not (node_id.startswith("sim-node-") or node_id.startswith("sim-")):
@@ -116,6 +119,9 @@ class SimulatedWorker:
             "network": True,
             "container_runtime:docker": False
         }
+        self.verified_capabilities = verified_capabilities
+        self.advertised_capabilities = advertised_capabilities
+        self.probe_results = probe_results
 
         self.behavior = behavior
         self.auth_token: Optional[str] = None
@@ -130,7 +136,7 @@ class SimulatedWorker:
 
     def get_metadata(self) -> Dict[str, Any]:
         """Returns registration payload."""
-        return {
+        meta = {
             "node_id": self.node_id,
             "name": self.name,
             "role": self.role,
@@ -142,6 +148,13 @@ class SimulatedWorker:
             "storage_gb": int(self.resources.get("storage_gb", 100)),
             "capabilities": dict(self.capabilities)
         }
+        if self.verified_capabilities is not None:
+            meta["verified_capabilities"] = dict(self.verified_capabilities)
+        if self.advertised_capabilities is not None:
+            meta["advertised_capabilities"] = dict(self.advertised_capabilities)
+        if self.probe_results is not None:
+            meta["probe_results"] = dict(self.probe_results)
+        return meta
 
     def _check_network(self):
         """Simulates network drop or partition."""
@@ -208,6 +221,7 @@ class SimulatedWorker:
             "status": "online",
             "timestamp": now_iso,
             "capabilities": dict(self.capabilities),
+            "resources": dict(self.resources),
             "services": services or {"simulated_worker": "running"},
             "workloads": workloads or {"active_jobs": len(self.active_jobs)},
             "system": {
@@ -218,6 +232,12 @@ class SimulatedWorker:
                 "uptime": "simulated"
             }
         }
+        if self.verified_capabilities is not None:
+            payload["verified_capabilities"] = dict(self.verified_capabilities)
+        if self.advertised_capabilities is not None:
+            payload["advertised_capabilities"] = dict(self.advertised_capabilities)
+        if self.probe_results is not None:
+            payload["probe_results"] = dict(self.probe_results)
 
         url = f"{self.controller_url}/heartbeat"
         req = urllib.request.Request(
@@ -308,6 +328,88 @@ class SimulatedWorker:
 
         return job
 
+    def upload_artifact(
+        self,
+        job_id: str,
+        filename: str,
+        content_bytes: bytes,
+        name: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        custom_auth: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Uploads an artifact to the controller with SHA-256 calculation."""
+        self._check_network()
+        import hashlib
+        import base64
+        token = custom_auth if custom_auth is not None else (self.auth_token or self.enrollment_token)
+        sha256 = hashlib.sha256(content_bytes).hexdigest()
+        b64_content = base64.b64encode(content_bytes).decode("ascii")
+
+        payload = {
+            "job_id": job_id,
+            "filename": filename,
+            "name": name or filename,
+            "content_base64": b64_content,
+            "sha256": sha256,
+            "workflow_id": workflow_id,
+            "metadata": {
+                "step_id": step_id,
+                "node_id": self.node_id
+            }
+        }
+
+        url = f"{self.controller_url}/artifacts/upload"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "PersonalServer-SimulatedWorker/1.0"
+            },
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data.get("artifact", data)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            raise SimulatedWorkerError(f"Artifact upload failed (HTTP {e.code}): {err_body}")
+
+    def download_and_verify_artifact(
+        self,
+        artifact_id: str,
+        expected_sha256: Optional[str] = None,
+        custom_auth: Optional[str] = None
+    ) -> bytes:
+        """Downloads an artifact from controller and verifies SHA-256."""
+        self._check_network()
+        import hashlib
+        token = custom_auth if custom_auth is not None else (self.auth_token or self.enrollment_token)
+        url = f"{self.controller_url}/artifacts/{artifact_id}/download"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "PersonalServer-SimulatedWorker/1.0"
+            },
+            method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content = resp.read()
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            raise SimulatedWorkerError(f"Artifact download failed (HTTP {e.code}): {err_body}")
+
+        if expected_sha256:
+            actual_sha = hashlib.sha256(content).hexdigest()
+            if actual_sha.lower() != expected_sha256.lower():
+                raise ValueError(f"Checksum mismatch for artifact {artifact_id}: expected {expected_sha256}, got {actual_sha}")
+        return content
+
     def submit_job_result(
         self,
         job_id: str,
@@ -318,7 +420,8 @@ class SimulatedWorker:
         duration_ms: int = 15,
         started_at: Optional[str] = None,
         custom_auth: Optional[str] = None,
-        attempt: Optional[int] = None
+        attempt: Optional[int] = None,
+        artifacts: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """Submits completed/failed job execution result to the controller."""
         self._check_network()
@@ -341,6 +444,8 @@ class SimulatedWorker:
         }
         if att is not None:
             result_payload["attempt"] = att
+        if artifacts:
+            result_payload["artifacts"] = artifacts
 
         url = f"{self.controller_url}/jobs/{job_id}/result"
         req = urllib.request.Request(
@@ -398,8 +503,8 @@ class SimulatedWorker:
     def step_execute_job(self) -> Optional[Dict[str, Any]]:
         """
         Deterministic, synchronous single step execution:
-        Claims next available job, applies configured simulated behavior,
-        and submits the outcome.
+        Claims next available job, downloads input artifacts (with SHA-256 validation),
+        applies configured simulated behavior, uploads output artifacts, and submits the outcome.
         """
         job = self.poll_and_claim_job()
         if not job:
@@ -435,12 +540,63 @@ class SimulatedWorker:
                 stderr=f"Capability required for job {job_id} not supported by simulated node."
             )
 
+        # 1. Download and verify input artifacts if declared
+        input_artifacts = job.get("input_artifacts") or []
+        for in_art in input_artifacts:
+            art_id = in_art.get("artifact_id")
+            exp_sha = in_art.get("sha256")
+            try:
+                self.download_and_verify_artifact(art_id, expected_sha256=exp_sha)
+            except Exception as e:
+                return self.submit_job_result(
+                    job_id,
+                    status=JOB_STATE_FAILED,
+                    exit_code=1,
+                    stderr=f"Input artifact '{in_art.get('name')}' verification failed: {e}"
+                )
+
+        # 2. Upload declared output artifacts if specified in job parameters
+        wf_id = job.get("workflow_id")
+        step_id = job.get("workflow_step_id")
+        declared_outputs = job.get("outputs") or job.get("parameters", {}).get("outputs") or job.get("parameters", {}).get("artifacts") or []
+        produced_artifacts = []
+
+        for out in declared_outputs:
+            if isinstance(out, str):
+                out_name = out
+                out_fn = out
+            elif isinstance(out, dict):
+                out_name = out.get("name") or out.get("filename") or "output.dat"
+                out_fn = out.get("filename") or out_name
+            else:
+                continue
+
+            content = f"Simulated output from {self.node_id} for step {step_id or job_id} at {time.time()}".encode("utf-8")
+            try:
+                uploaded = self.upload_artifact(
+                    job_id=job_id,
+                    filename=out_fn,
+                    content_bytes=content,
+                    name=out_name,
+                    workflow_id=wf_id,
+                    step_id=step_id
+                )
+                produced_artifacts.append(uploaded)
+            except Exception as e:
+                return self.submit_job_result(
+                    job_id,
+                    status=JOB_STATE_FAILED,
+                    exit_code=1,
+                    stderr=f"Failed to upload simulated artifact '{out_fn}': {e}"
+                )
+
         # Default: Normal success
         return self.submit_job_result(
             job_id,
             status=JOB_STATE_SUCCEEDED,
             exit_code=0,
-            stdout=f"Simulated execution succeeded on node {self.node_id}."
+            stdout=f"Simulated execution succeeded on node {self.node_id}.",
+            artifacts=produced_artifacts if produced_artifacts else None
         )
 
     # --------------------------------------------------------------------------
@@ -480,7 +636,10 @@ class SimulatedCluster:
         architecture: str = "amd64",
         resources: Optional[Dict[str, Any]] = None,
         capabilities: Optional[Dict[str, Any]] = None,
-        behavior: WorkerBehavior = WorkerBehavior.NORMAL
+        behavior: WorkerBehavior = WorkerBehavior.NORMAL,
+        verified_capabilities: Optional[Dict[str, Any]] = None,
+        advertised_capabilities: Optional[Dict[str, Any]] = None,
+        probe_results: Optional[Dict[str, Any]] = None
     ) -> SimulatedWorker:
         """Instantiates and registers a simulated worker in the cluster."""
         worker = SimulatedWorker(
@@ -492,7 +651,10 @@ class SimulatedCluster:
             architecture=architecture,
             resources=resources,
             capabilities=capabilities,
-            behavior=behavior
+            behavior=behavior,
+            verified_capabilities=verified_capabilities,
+            advertised_capabilities=advertised_capabilities,
+            probe_results=probe_results
         )
         self.workers[worker.node_id] = worker
         return worker

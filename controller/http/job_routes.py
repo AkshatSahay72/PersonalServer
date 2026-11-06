@@ -7,15 +7,29 @@ execution result reporting, retry recovery, and cancellation.
 """
 
 import math
+import base64
+import math
+import os
 import secrets
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+from common.artifact_manager import (
+    generate_artifact_id,
+    store_artifact_bytes,
+    store_artifact_stream,
+    verify_artifact_integrity,
+)
+from controller.http.workflow_routes import handle_workflow_get, handle_workflow_post
+from controller.http.artifact_routes import handle_artifact_get, handle_artifact_post
+from controller.http.job_query_routes import handle_job_query_get
+from controller.http.job_submission_routes import handle_job_submission_post
 from common.crypto_utils import constant_time_compare
 from common.time_utils import get_current_iso_timestamp
-from config.platform_config import get_controller_runtime_config
+from config.platform_config import get_controller_paths, get_controller_runtime_config
 from config.structured_logger import (
     controller_logger,
     generate_correlation_id,
@@ -27,19 +41,25 @@ from controller.constants import (
     APP_STATE_FAILED,
     APP_STATE_RUNNING,
     APP_STATE_STOPPED,
+    JOB_STATE_ASSIGNED,
     JOB_STATE_CANCELLED,
     JOB_STATE_CLAIMED,
     JOB_STATE_FAILED,
+    JOB_STATE_NEEDS_ATTENTION,
     JOB_STATE_QUEUED,
     JOB_STATE_RECOVERING,
     JOB_STATE_REJECTED,
+    JOB_STATE_RETRY_WAIT,
     JOB_STATE_RUNNING,
     JOB_STATE_SUCCEEDED,
     JOB_STATE_TIMEOUT,
+    JOB_STATE_TIMED_OUT,
+    JOB_STATE_WAITING_FOR_DEPENDENCY,
     STATE_DEBOARDING,
     STATE_DRAINING,
     STATE_OFFLINE,
     STATE_REMOVED,
+    canonicalize_job_state,
     validate_job_transition,
 )
 
@@ -50,19 +70,46 @@ from controller.notifications import notify_job_failure
 from controller.onboarding import get_or_create_enrollment_token
 from controller.stores import (
     load_apps_db,
+    load_artifacts_db,
     load_jobs_db,
     load_nodes_db,
+    load_workflows_db,
     save_apps_db,
+    save_artifacts_db,
     save_jobs_db,
+    save_workflows_db,
 )
-from scheduler.scheduler import ResourceScheduler, compute_node_liveness
+from controller.workflow_engine import (
+    WorkflowValidationError,
+    cancel_workflow,
+    instantiate_workflow,
+    progress_workflows,
+)
+from scheduler.scheduler import (
+    ResourceScheduler,
+    compute_node_liveness,
+    is_node_eligible,
+)
 
 
 def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
     """
-    Handles GET requests for job querying and worker job lease claims.
+    Handles GET requests for worker job lease claims, and delegates read-only
+    job queries, workflows, and artifacts.
     Returns True if handled, False otherwise.
     """
+    # Delegated Read-Only Job Queries (metrics, job list, filtering, pagination, detail)
+    if handle_job_query_get(handler, path, query):
+        return True
+
+    # Delegated Workflow Routes
+    if path == "/workflows" or path.startswith("/workflows/"):
+        return handle_workflow_get(handler, path, query)
+
+    # Delegated Artifact Routes
+    if path == "/artifacts" or path.startswith("/artifacts/"):
+        return handle_artifact_get(handler, path, query)
+
     # GET /nodes/<node_id>/jobs/next (Node Agent fetching its assigned job with Lease)
     if path.startswith("/nodes/") and path.endswith("/jobs/next"):
         node_id = path[7:-10].strip()
@@ -81,20 +128,36 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
             return True
 
         jobs_db = load_jobs_db()
+        # Progress workflows so any newly unblocked jobs transition to QUEUED before selecting claimable jobs
+        try:
+            workflows_db = load_workflows_db()
+            if progress_workflows(workflows_db, jobs_db):
+                save_workflows_db(workflows_db)
+                save_jobs_db(jobs_db)
+        except Exception as wf_err:
+            print(f"[CONTROLLER-WORKFLOW] Error evaluating workflows during poll: {wf_err}", file=sys.stderr)
+
         # Perform sweep before claiming
         sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
 
         now_epoch = time.time()
         # Find jobs waiting for this node (respecting retry_after backoff)
+        # Also auto-match jobs targeting "auto" if no node was assigned yet and this node is eligible!
         claimable_jobs = [
             j for j in jobs_db.get("jobs", {}).values()
-            if j.get("target_node") == node_id and (
-                j.get("status") == JOB_STATE_QUEUED
+            if (
+                j.get("target_node") == node_id
                 or (
-                    j.get("status") == JOB_STATE_RECOVERING
+                    not j.get("target_node")
+                    and is_node_eligible(node, j.get("requirements", {}), handler.heartbeat_timeout)
+                )
+            ) and (
+                j.get("status") in (JOB_STATE_QUEUED, JOB_STATE_ASSIGNED)
+                or (
+                    j.get("status") in (JOB_STATE_RECOVERING, JOB_STATE_RETRY_WAIT)
                     and now_epoch >= j.get("retry_after", 0)
                 )
-            )
+            ) and j.get("status") != JOB_STATE_WAITING_FOR_DEPENDENCY
         ]
 
         if not claimable_jobs:
@@ -108,10 +171,23 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         timeout_sec = next_job.get("timeout", 60)
         lease_duration = timeout_sec + DEFAULT_LEASE_GRACE_SEC
 
+        next_job["target_node"] = node_id
+        next_job["assigned_node"] = node_id
         next_job["status"] = JOB_STATE_CLAIMED
+        next_job["state"] = JOB_STATE_ASSIGNED
         next_job["claimed_at"] = now_iso
         next_job["started_at"] = now_iso
         next_job["lease_expires_at"] = now_epoch + lease_duration
+        next_job["waiting_reason"] = None
+        # Increment lease generation as a fencing token to prevent duplicate / stale execution
+        next_job["lease_generation"] = int(next_job.get("lease_generation", 0)) + 1
+
+        if next_job.get("target") == "auto":
+            next_job["scheduler"] = {
+                "mode": "resource-aware-claimed",
+                "selected_node": node_id,
+                "reason": f"Claimed by eligible worker '{node_id}'"
+            }
 
         save_jobs_db(jobs_db)
 
@@ -119,7 +195,7 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         next_job["correlation_id"] = corr_id
         controller_logger.info(
             "job.claimed",
-            f"Job {next_job['job_id']} ({next_job['type']}) CLAIMED by node '{node_id}' (Attempt {next_job.get('attempt', 1)}, Lease {lease_duration}s)",
+            f"Job {next_job['job_id']} ({next_job.get('type', next_job.get('job_type', 'unknown'))}) CLAIMED by node '{node_id}' (Attempt {next_job.get('attempt', 1)}, Lease {lease_duration}s)",
             correlation_id=corr_id,
             job_id=next_job["job_id"],
             node_id=node_id,
@@ -129,103 +205,9 @@ def handle_job_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         handler.send_json(200, {"job": next_job})
         return True
 
-    # GET /jobs
-    if path == "/jobs":
-        jobs_db = load_jobs_db()
-        nodes_db = load_nodes_db()
-        sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
-
-        all_jobs = list(jobs_db.get("jobs", {}).values())
-        filter_node = query.get("node", [None])[0]
-        filter_status = query.get("status", [None])[0]
-        filter_type = query.get("type", [None])[0]
-        search_q = query.get("search", query.get("q", [None]))[0]
-        sort_by = query.get("sort", ["recent"])[0]
-
-        if filter_node and filter_node != "all":
-            all_jobs = [j for j in all_jobs if j.get("target_node") == filter_node or j.get("assigned_node") == filter_node]
-        if filter_status and filter_status != "all":
-            all_jobs = [j for j in all_jobs if j.get("status") == filter_status.upper()]
-        if filter_type and filter_type != "all":
-            all_jobs = [j for j in all_jobs if j.get("type") == filter_type]
-        if search_q:
-            q_lower = search_q.strip().lower()
-            all_jobs = [
-                j for j in all_jobs
-                if q_lower in (j.get("job_id") or "").lower()
-                or q_lower in (j.get("type") or "").lower()
-                or q_lower in (j.get("target_node") or "").lower()
-                or q_lower in (j.get("assigned_node") or "").lower()
-            ]
-
-        # Sorting: default recent first
-        if sort_by == "oldest":
-            all_jobs.sort(key=lambda j: j.get("created_at") or j.get("submitted_at") or "")
-        elif sort_by == "duration":
-            all_jobs.sort(key=lambda j: (j.get("result", {}) or {}).get("duration_ms") or j.get("execution_duration_sec") or 0, reverse=True)
-        else:
-            all_jobs.sort(key=lambda j: j.get("created_at") or j.get("submitted_at") or "", reverse=True)
-
-        total_count = len(all_jobs)
-
-        # Optional server-side pagination: limit, page, offset
-        limit_str = query.get("limit", query.get("page_size", [None]))[0]
-        page_str = query.get("page", [None])[0]
-        offset_str = query.get("offset", [None])[0]
-
-        if limit_str is not None or page_str is not None or offset_str is not None:
-            limit = max(1, min(100, int(limit_str) if limit_str else 25))
-            if offset_str is not None:
-                offset = max(0, int(offset_str))
-                page = (offset // limit) + 1
-            elif page_str is not None:
-                page = max(1, int(page_str))
-                offset = (page - 1) * limit
-            else:
-                offset = 0
-                page = 1
-
-            paginated_jobs = all_jobs[offset : offset + limit]
-            total_pages = max(1, math.ceil(total_count / limit)) if total_count > 0 else 1
-
-            handler.send_json(200, {
-                "jobs": paginated_jobs,
-                "count": len(paginated_jobs),
-                "total_count": total_count,
-                "page": page,
-                "page_size": limit,
-                "total_pages": total_pages
-            })
-            return True
-
-        handler.send_json(200, {
-            "jobs": all_jobs,
-            "count": len(all_jobs),
-            "total_count": total_count
-        })
-        return True
-
-    # GET /jobs/<job_id>
-    if path.startswith("/jobs/"):
-        job_id = path[6:].strip()
-        jobs_db = load_jobs_db()
-        nodes_db = load_nodes_db()
-        sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
-
-        job = jobs_db.get("jobs", {}).get(job_id)
-        if not job:
-            handler.send_json(404, {"error": f"Job '{job_id}' not found"})
-            return True
-        diagnostics = {
-            "attempts_total": len(job.get("attempts_history", [])),
-            "current_attempt": job.get("attempt", 1),
-            "is_active": job.get("status") in (JOB_STATE_QUEUED, JOB_STATE_CLAIMED, JOB_STATE_RUNNING, JOB_STATE_RECOVERING),
-            "last_failure_reason": job.get("retry_reason"),
-            "correlation_id": job.get("correlation_id"),
-            "lease_active": bool(job.get("lease_expires_at") and time.time() < job.get("lease_expires_at")),
-        }
-        handler.send_json(200, {"job": job, "diagnostics": diagnostics})
-        return True
+    # Delegated Artifact Routes
+    if path.startswith("/jobs/") and path.endswith("/artifacts"):
+        return handle_artifact_get(handler, path, query)
 
     return False
 
@@ -236,149 +218,8 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
     and cancellation.
     Returns True if handled, False otherwise.
     """
-    # POST /jobs - Job Submission
-    if path == "/jobs":
-        if not body:
-            handler.send_json(400, {"error": "Missing JSON request body"})
-            return True
-
-        target = body.get("target") or body.get("target_node") or "auto"
-        job_type = body.get("type")
-        job_name = body.get("name", job_type or "job")
-        timeout_sec = int(body.get("timeout", 60))
-        max_attempts = int(body.get("max_attempts", 3))
-        parameters = body.get("parameters", {}) or {}
-        requirements = body.get("requirements", {}) or {}
-
-        # Validation: Safe allowlisted workload type rejection
-        if job_type not in ALLOWLISTED_WORKLOADS:
-            handler.send_json(400, {
-                "error": f"Job type '{job_type}' is not in the safe allowlist. Allowed: {list(ALLOWLISTED_WORKLOADS.keys())}",
-                "status": JOB_STATE_REJECTED
-            })
-            return True
-
-        nodes_db = load_nodes_db()
-        target_node = None
-        scheduler_info = None
-
-        # Path A: Automatic Resource-Aware Scheduling
-        if target.lower() == "auto":
-            decision = ResourceScheduler.select_node(requirements, nodes_db, handler.heartbeat_timeout)
-            if not decision["selected_node"]:
-                handler.send_json(400, {
-                    "error": f"Scheduling Failed: {decision['reason']}",
-                    "status": JOB_STATE_REJECTED,
-                    "scheduler": decision
-                })
-                return True
-            target_node = decision["selected_node"]
-            scheduler_info = {
-                "mode": "resource-aware",
-                "selected_node": target_node,
-                "score": decision["score"],
-                "reason": decision["reason"],
-                "candidates_count": len(decision["candidates"])
-            }
-            print(f"[CONTROLLER-SCHEDULER] Auto-selected node '{target_node}': {decision['reason']}")
-
-        # Path B: Explicit Target Node (Preserves explicit target policy)
-        else:
-            target_node = target
-            node_entry = nodes_db.get("nodes", {}).get(target_node)
-
-            if not node_entry:
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' does not exist in cluster.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
-
-            if node_entry.get("status") == STATE_REMOVED:
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' was removed from the cluster.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
-
-            live_status = compute_node_liveness(node_entry, handler.heartbeat_timeout)
-            if live_status == STATE_OFFLINE:
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' is currently OFFLINE (heartbeat timeout). Cannot submit job.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
-
-            if live_status in (STATE_DRAINING, STATE_DEBOARDING) or node_entry.get("status") in (STATE_DRAINING, STATE_DEBOARDING):
-                handler.send_json(400, {
-                    "error": f"Target node '{target_node}' is currently {live_status or node_entry.get('status')} (no new workloads accepted). Cannot submit job.",
-                    "status": JOB_STATE_REJECTED
-                })
-                return True
-
-            scheduler_info = {
-                "mode": "explicit",
-                "target_node": target_node,
-                "reason": "Explicit node specified by client"
-            }
-
-        timeout_sec = max(5, min(timeout_sec, 300))
-        job_id = f"job-{secrets.token_hex(6)}"
-        now = get_current_iso_timestamp()
-
-        corr_id = getattr(handler, "current_correlation_id", None) or generate_correlation_id()
-        job_record = {
-            "id": job_id,
-            "job_id": job_id,
-            "correlation_id": corr_id,
-            "name": job_name,
-            "type": job_type,
-            "parameters": parameters,
-            "requirements": requirements,
-            "target": target,
-            "target_node": target_node,
-            "assigned_node": target_node,
-            "scheduler": scheduler_info,
-            "timeout": timeout_sec,
-            "max_attempts": max_attempts,
-            "attempt": 1,
-            "claimed_at": None,
-            "lease_expires_at": None,
-            "created_at": now,
-            "started_at": None,
-            "finished_at": None,
-            "status": JOB_STATE_QUEUED,
-            "state": JOB_STATE_QUEUED,
-            "retryable": bool(body.get("retryable", True)),
-            "backoff_sec": body.get("backoff_sec"),
-            "retry_reason": None,
-            "attempts_history": [],
-            "result": None
-        }
-
-        jobs_db = load_jobs_db()
-        jobs_db.setdefault("jobs", {})[job_id] = job_record
-        save_jobs_db(jobs_db)
-
-        controller_logger.info(
-            "job.scheduled",
-            f"Queued job {job_id} ({job_type}) for target node {target_node} [mode={scheduler_info['mode']}]",
-            correlation_id=corr_id,
-            job_id=job_id,
-            node_id=target_node,
-            job_type=job_type,
-            mode=scheduler_info["mode"],
-            score=scheduler_info.get("score"),
-            reason=scheduler_info.get("reason")
-        )
-        handler.send_json(200, {
-            "status": JOB_STATE_QUEUED,
-            "job_id": job_id,
-            "id": job_id,
-            "target_node": target_node,
-            "scheduler": scheduler_info,
-            "job": job_record
-        })
+    # Delegated Job Submission Route (POST /jobs)
+    if handle_job_submission_post(handler, path, body, token, query):
         return True
 
     # POST /jobs/<job_id>/result - Job Result Submission & Retry Handling
@@ -405,41 +246,149 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             handler.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
             return True
 
-        # Stale worker protection: check attempt number if provided
-        reported_attempt = body.get("attempt")
-        current_attempt = job.get("attempt", 1)
         corr_id = job.get("correlation_id") or getattr(handler, "current_correlation_id", None) or generate_correlation_id()
-        if reported_attempt is not None and int(reported_attempt) < current_attempt:
+        current_attempt = int(job.get("attempt", 1))
+        canon_curr_status = canonicalize_job_state(job.get("status"))
+
+        # 1. Idempotency / Terminal state protection
+        # If job is already in a terminal state, guard against overwriting terminal states or acknowledge duplicates.
+        if canon_curr_status in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED, JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_REJECTED):
+            reported_st = canonicalize_job_state(body.get("status"))
+            if canon_curr_status in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED):
+                handler.send_json(200, {
+                    "status": job.get("status"),
+                    "message": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Duplicate report ignored.",
+                    "job_id": job_id,
+                    "duplicate": True
+                })
+                return True
+            elif reported_st == JOB_STATE_SUCCEEDED:
+                controller_logger.warning(
+                    "worker.late_success_on_terminal",
+                    f"Rejected late result for terminal job '{job_id}': current state is '{job.get('status')}', reported status is '{body.get('status')}'",
+                    correlation_id=corr_id,
+                    job_id=job_id,
+                    node_id=target_node,
+                    current_status=job.get("status"),
+                    reported_status=body.get("status")
+                )
+                handler.send_json(409, {
+                    "error": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Late result rejected.",
+                    "job_id": job_id,
+                    "status": job.get("status"),
+                    "terminal": True
+                })
+                return True
+            elif canon_curr_status in (JOB_STATE_FAILED, JOB_STATE_TIMED_OUT, JOB_STATE_REJECTED):
+                if reported_st == JOB_STATE_TIMED_OUT and canon_curr_status == JOB_STATE_FAILED:
+                    pass  # Allow worker's truthful timeout execution result to refine swept failure state
+                else:
+                    handler.send_json(200, {
+                        "status": job.get("status"),
+                        "message": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Duplicate failure report ignored.",
+                        "job_id": job_id,
+                        "duplicate": True
+                    })
+                    return True
+
+        # 2. In-flight lease protection: reject results if active lease was revoked or in retry wait
+        if canon_curr_status in (JOB_STATE_RETRY_WAIT, JOB_STATE_RECOVERING):
             controller_logger.warning(
-                "worker.stale_attempt",
-                f"Stale worker result for job '{job_id}': reported attempt {reported_attempt} < current attempt {current_attempt}",
+                "worker.recovering_lease_expired",
+                f"Rejected result for job '{job_id}' in '{job.get('status')}' state: active lease was revoked or worker disconnected",
                 correlation_id=corr_id,
                 job_id=job_id,
                 node_id=target_node,
-                reported_attempt=reported_attempt,
                 current_attempt=current_attempt
             )
             handler.send_json(409, {
-                "error": f"Stale worker result: reported attempt {reported_attempt} is older than current attempt {current_attempt}.",
+                "error": f"Cannot submit result for job '{job_id}' in '{job.get('status')}' state: active lease expired or worker disconnected.",
+                "job_id": job_id,
+                "current_attempt": current_attempt,
+                "lease_expired": True
+            })
+            return True
+
+        # 3. Fencing token: reject superseded lease generations (J1/J3 mandatory HTTP 412)
+        reported_gen = body.get("lease_generation")
+        if reported_gen is None and body.get("fencing_token") is not None:
+            reported_gen = body.get("fencing_token")
+        current_gen = int(job.get("lease_generation", 1))
+        if reported_gen is not None and int(reported_gen) < current_gen:
+            controller_logger.warning(
+                "worker.stale_generation",
+                f"Superseded lease generation result for job '{job_id}': reported generation {reported_gen} < current generation {current_gen}",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                reported_generation=reported_gen,
+                current_generation=current_gen
+            )
+            handler.send_json(412, {
+                "error": f"Precondition Failed: Superseded lease generation {reported_gen} is older than current generation {current_gen}.",
+                "job_id": job_id,
+                "current_generation": current_gen,
+                "fencing_token": current_gen,
+                "superseded": True
+            })
+            return True
+
+        # 4. Stale worker protection: check attempt number if provided (or default to 1 for unversioned reports)
+        reported_attempt = body.get("attempt")
+        if reported_attempt is not None:
+            eff_reported_attempt = int(reported_attempt)
+        elif reported_gen is not None and int(reported_gen) == current_gen:
+            eff_reported_attempt = current_attempt
+        else:
+            eff_reported_attempt = 1 if current_attempt > 1 else current_attempt
+
+        if eff_reported_attempt < current_attempt:
+            controller_logger.warning(
+                "worker.stale_attempt",
+                f"Stale worker result for job '{job_id}': reported attempt {eff_reported_attempt} < current attempt {current_attempt}",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                reported_attempt=eff_reported_attempt,
+                current_attempt=current_attempt
+            )
+            handler.send_json(409, {
+                "error": f"Stale worker result: reported attempt {eff_reported_attempt} is older than current attempt {current_attempt}.",
                 "job_id": job_id,
                 "current_attempt": current_attempt,
                 "stale_attempt": True
             })
             return True
 
-        # Idempotency / Stale report protection: Ignore duplicate reports if job is already terminal
-        if job.get("status") in (JOB_STATE_SUCCEEDED, JOB_STATE_CANCELLED) or (job.get("status") == JOB_STATE_FAILED and job.get("result") is not None and current_attempt >= job.get("max_attempts", 3)):
-            handler.send_json(200, {
-                "status": job.get("status"),
-                "message": f"Job '{job_id}' has already reached terminal state '{job.get('status')}'. Duplicate report ignored.",
-                "job_id": job_id,
-                "duplicate": True
-            })
-            return True
-
         job_status = body.get("status", JOB_STATE_FAILED)
         now_iso = get_current_iso_timestamp()
         now_epoch = time.time()
+
+        # 5. Controller-authoritative lease validity check:
+        # If the controller clock indicates the lease has expired, reject the result.
+        lease_exp = job.get("lease_expires_at")
+        if (
+            lease_exp is not None
+            and now_epoch > float(lease_exp)
+            and canon_curr_status in (JOB_STATE_ASSIGNED, JOB_STATE_RUNNING)
+        ):
+            controller_logger.warning(
+                "worker.lease_expired_on_submission",
+                f"Rejected result for job '{job_id}': controller clock indicates lease expired at {lease_exp} (now: {now_epoch})",
+                correlation_id=corr_id,
+                job_id=job_id,
+                node_id=target_node,
+                current_attempt=current_attempt,
+                lease_expires_at=lease_exp,
+            )
+            sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
+            handler.send_json(409, {
+                "error": f"Cannot submit result for job '{job_id}': active lease expired at {lease_exp} (controller time: {now_epoch}).",
+                "job_id": job_id,
+                "current_attempt": current_attempt,
+                "lease_expired": True
+            })
+            return True
 
         # Record attempt
         attempt = current_attempt
@@ -468,6 +417,13 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             job["retry_reason"] = f"Attempt {attempt} completed with status: {job_status}"
             job["claimed_at"] = None
             job["lease_expires_at"] = None
+            # Advance fencing token on retry (J1/J3)
+            job["lease_generation"] = int(job.get("lease_generation", 0)) + 1
+            try:
+                from controller.stores.reservations import release_reservation
+                release_reservation(jobs_db, job_id, attempt=attempt, force=True)
+            except Exception:
+                pass
 
             # Compute backoff
             base_backoff = float(job.get("backoff_sec") if job.get("backoff_sec") is not None else getattr(handler, "default_backoff_sec", 0.0))
@@ -517,6 +473,11 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             job["state"] = job_status
             job["finished_at"] = now_iso
             job["lease_expires_at"] = None
+            try:
+                from controller.stores.reservations import release_reservation
+                release_reservation(jobs_db, job_id, attempt=attempt, force=True)
+            except Exception:
+                pass
             if not is_retryable and job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
                 job["retry_reason"] = f"Non-retryable failure on attempt {attempt}: {body.get('stderr') or job_status}"
             job["result"] = {
@@ -525,6 +486,8 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 "stdout": stdout_bounded,
                 "stderr": stderr_bounded,
                 "duration_ms": body.get("duration_ms", 0),
+                "declared_outputs": body.get("declared_outputs"),
+                "outputs": body.get("outputs") or body.get("declared_outputs"),
             }
             if job_status in (JOB_STATE_FAILED, JOB_STATE_TIMEOUT):
                 controller_logger.error(
@@ -685,6 +648,81 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                             app["previous_working_deployment"] = prev_working["deployment_id"]
                             print(f"[CONTROLLER-ROLLBACK] Preserving previous working deployment '{prev_working['deployment_id']}' for app '{app_id}'")
 
+                elif job.get("type") == "app-deploy":
+                    dep_id = job.get("deployment_id") or job.get("parameters", {}).get("deployment_id")
+                    from controller.deployment_state_machine import DeploymentStateMachine, DEP_STATE_STARTING, DEP_STATE_HEALTH_CHECK, DEP_STATE_ACTIVATING, DEP_STATE_SUCCEEDED, DEP_STATE_FAILED
+                    if job_status == JOB_STATE_SUCCEEDED:
+                        out_meta = body.get("declared_outputs") or body.get("outputs") or {}
+                        port = out_meta.get("port") or job.get("parameters", {}).get("port") or app.get("port", 8090)
+                        assigned_node = job.get("assigned_node") or job.get("target_node")
+
+                        try:
+                            curr_dep = DeploymentStateMachine.get_deployment(app_id, dep_id, paths=handler.paths)
+                            if curr_dep and curr_dep.get("status") == DEP_STATE_STARTING:
+                                DeploymentStateMachine.transition(
+                                    app_id=app_id,
+                                    deployment_id=dep_id,
+                                    next_state=DEP_STATE_HEALTH_CHECK,
+                                    reason="Worker health verification succeeded",
+                                    metadata={"pid": out_meta.get("pid"), "port": port},
+                                    paths=handler.paths
+                                )
+                            DeploymentStateMachine.transition(
+                                app_id=app_id,
+                                deployment_id=dep_id,
+                                next_state=DEP_STATE_ACTIVATING,
+                                reason="Health verification succeeded",
+                                paths=handler.paths
+                            )
+                            DeploymentStateMachine.transition(
+                                app_id=app_id,
+                                deployment_id=dep_id,
+                                next_state=DEP_STATE_SUCCEEDED,
+                                reason="Release activated",
+                                metadata={
+                                    "node": assigned_node,
+                                    "port": port,
+                                    "address": f"http://{assigned_node}:{port}",
+                                    "pid": out_meta.get("pid")
+                                },
+                                paths=handler.paths
+                            )
+                        except Exception as tr_err:
+                            print(f"[CONTROLLER-DEPLOY] State transition error: {tr_err}", flush=True)
+
+                        app["status"] = APP_STATE_RUNNING
+                        app["selected_node"] = assigned_node
+                        app["node"] = assigned_node
+                        app["assigned_node"] = assigned_node
+                        app["port"] = port
+                        app["host_port"] = port
+                        app["active_deployment_id"] = dep_id
+                        app["error"] = None
+                        app["failure_reason"] = None
+                        app["updated_at"] = now_iso
+                    else:
+                        err_text = body.get("stderr") or body.get("diagnostics", {}).get("failure_reason") or "Application deployment failed"
+                        try:
+                            DeploymentStateMachine.transition(
+                                app_id=app_id,
+                                deployment_id=dep_id,
+                                next_state=DEP_STATE_FAILED,
+                                error=err_text,
+                                reason="Worker execution or health check failed",
+                                paths=handler.paths
+                            )
+                        except Exception:
+                            pass
+
+                        if app.get("active_deployment_id") and app.get("active_deployment_id") != dep_id:
+                            app["status"] = APP_STATE_RUNNING
+                            app["error"] = f"Deployment {dep_id} failed: {err_text}"
+                        else:
+                            app["status"] = APP_STATE_FAILED
+                            app["error"] = err_text
+                            app["failure_reason"] = err_text
+                        app["updated_at"] = now_iso
+
                 elif job.get("type") == "docker-stop" and job_status == JOB_STATE_SUCCEEDED:
                     app["status"] = APP_STATE_STOPPED
                     app["updated_at"] = now_iso
@@ -692,6 +730,31 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     app["status"] = APP_STATE_RUNNING
                     app["updated_at"] = now_iso
                 save_apps_db(apps_db)
+
+        reported_artifacts = body.get("artifacts")
+        if reported_artifacts and isinstance(reported_artifacts, list):
+            job["artifacts"] = reported_artifacts
+            try:
+                artifacts_db = load_artifacts_db()
+                for art in reported_artifacts:
+                    if isinstance(art, dict) and art.get("artifact_id"):
+                        art["job_id"] = job_id
+                        if not art.get("producing_node"):
+                            art["producing_node"] = target_node
+                        artifacts_db.setdefault("artifacts", {})[art["artifact_id"]] = art
+                save_artifacts_db(artifacts_db)
+            except Exception as e:
+                print(f"[CONTROLLER-ARTIFACTS] Error storing reported artifacts: {e}", file=sys.stderr)
+
+        # Progress any parent workflow if job belongs to a workflow
+        wf_id = job.get("workflow_id")
+        if wf_id:
+            try:
+                workflows_db = load_workflows_db()
+                if progress_workflows(workflows_db, jobs_db):
+                    save_workflows_db(workflows_db)
+            except Exception as e:
+                print(f"[CONTROLLER-WORKFLOW] Error progressing workflow '{wf_id}': {e}", file=sys.stderr)
 
         save_jobs_db(jobs_db)
 
@@ -767,6 +830,17 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             job["terminated_active_workload"] = True
         save_jobs_db(jobs_db)
 
+        # Progress any parent workflow if job belongs to a workflow
+        wf_id = job.get("workflow_id")
+        if wf_id:
+            try:
+                workflows_db = load_workflows_db()
+                if progress_workflows(workflows_db, jobs_db):
+                    save_workflows_db(workflows_db)
+                    save_jobs_db(jobs_db)
+            except Exception as e:
+                print(f"[CONTROLLER-WORKFLOW] Error progressing workflow '{wf_id}' after cancellation: {e}", file=sys.stderr)
+
         print(f"[CONTROLLER] Job {job_id} CANCELLED: {reason}")
         handler.send_json(200, {
             "status": JOB_STATE_CANCELLED,
@@ -774,6 +848,65 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "message": f"Job '{job_id}' successfully cancelled.",
             "termination": termination_info,
             "job": job
+        })
+        return True
+
+    # POST /jobs/<job_id>/lease/renew - Worker lease renewal (heartbeat extension)
+    if path.startswith("/jobs/") and path.endswith("/lease/renew"):
+        job_id = path[6:-12].strip()
+        jobs_db = load_jobs_db()
+        job = jobs_db.get("jobs", {}).get(job_id)
+        if not job:
+            handler.send_json(404, {"error": f"Job '{job_id}' not found"})
+            return True
+
+        target_node = job.get("target_node")
+        nodes_db = load_nodes_db()
+        node_entry = nodes_db.get("nodes", {}).get(target_node, {})
+        expected_auth = node_entry.get("auth_token")
+        enrollment_token = get_or_create_enrollment_token()
+        if not token or (not constant_time_compare(token, expected_auth) and not constant_time_compare(token, enrollment_token)):
+            handler.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
+            return True
+
+        req_gen = body.get("lease_generation") if body else None
+        if req_gen is None and body and body.get("fencing_token") is not None:
+            req_gen = body.get("fencing_token")
+        curr_gen = int(job.get("lease_generation", 1))
+        if req_gen is not None and int(req_gen) < curr_gen:
+            handler.send_json(412, {
+                "error": f"Precondition Failed: Cannot renew superseded lease generation {req_gen} (current is {curr_gen})",
+                "lease_generation": curr_gen,
+                "fencing_token": curr_gen
+            })
+            return True
+
+        curr_st = canonicalize_job_state(job.get("status"))
+        if curr_st not in (JOB_STATE_ASSIGNED, JOB_STATE_RUNNING):
+            handler.send_json(400, {"error": f"Cannot renew lease for job in '{curr_st}' state"})
+            return True
+
+        now_epoch = time.time()
+        lease_exp = job.get("lease_expires_at")
+        if lease_exp is not None and now_epoch > float(lease_exp):
+            sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
+            handler.send_json(409, {
+                "error": f"Cannot renew expired lease for job '{job_id}': lease expired at {lease_exp} (controller time: {now_epoch}).",
+                "job_id": job_id,
+                "lease_expired": True
+            })
+            return True
+
+        extension_sec = min(300, max(10, int((body or {}).get("extension_sec", job.get("timeout", 60) + DEFAULT_LEASE_GRACE_SEC))))
+        now_epoch = time.time()
+        job["lease_expires_at"] = now_epoch + extension_sec
+        save_jobs_db(jobs_db)
+
+        handler.send_json(200, {
+            "status": "ok",
+            "job_id": job_id,
+            "lease_expires_at": job["lease_expires_at"],
+            "lease_generation": curr_gen
         })
         return True
 
@@ -799,8 +932,30 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             handler.send_json(401, {"error": "Unauthorized: Invalid node authentication credentials"})
             return True
 
+        req_gen = body.get("lease_generation") if body else None
+        if req_gen is None and body and body.get("fencing_token") is not None:
+            req_gen = body.get("fencing_token")
+        curr_gen = int(job.get("lease_generation", 1))
+        if req_gen is not None and int(req_gen) < curr_gen:
+            handler.send_json(412, {
+                "error": f"Precondition Failed: Superseded lease generation {req_gen} (current is {curr_gen})",
+                "lease_generation": curr_gen,
+                "fencing_token": curr_gen
+            })
+            return True
+
         new_status = (body.get("status") or "").upper()
         current_st = job.get("status")
+        now_epoch = time.time()
+        lease_exp = job.get("lease_expires_at")
+        if lease_exp is not None and now_epoch > float(lease_exp) and current_st in (JOB_STATE_ASSIGNED, JOB_STATE_RUNNING):
+            sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
+            handler.send_json(409, {
+                "error": f"Cannot update status for job '{job_id}': active lease expired at {lease_exp} (controller time: {now_epoch}).",
+                "job_id": job_id,
+                "lease_expired": True
+            })
+            return True
         if not validate_job_transition(current_st, new_status):
             handler.send_json(400, {
                 "error": f"Invalid state transition from '{current_st}' to '{new_status}'.",
@@ -814,6 +969,18 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         job["state"] = new_status
         if new_status == JOB_STATE_RUNNING and not job.get("started_at"):
             job["started_at"] = now_iso
+            # Activate reservation in authoritative ledger (J3.3)
+            try:
+                from controller.stores.reservations import activate_reservation
+                activate_reservation(jobs_db, job_id, int(job.get("attempt", 1)), curr_gen)
+            except Exception:
+                pass
+        elif new_status in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
+            try:
+                from controller.stores.reservations import release_reservation
+                release_reservation(jobs_db, job_id, int(job.get("attempt", 1)), curr_gen)
+            except Exception:
+                pass
         save_jobs_db(jobs_db)
 
         handler.send_json(200, {
@@ -822,6 +989,14 @@ def handle_job_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
             "current_status": new_status
         })
         return True
+
+    # Delegated Workflow Routes
+    if path == "/workflows" or path.startswith("/workflows/"):
+        return handle_workflow_post(handler, path, body, token, query)
+
+    # Delegated Artifact Routes
+    if path == "/artifacts/upload" or path == "/artifacts/upload/raw" or (path.startswith("/artifacts/") and path.endswith("/verify")):
+        return handle_artifact_post(handler, path, body, token, query)
 
     return False
 
@@ -850,15 +1025,29 @@ def handle_job_delete(handler: Any, path: str, token: str) -> bool:
         handler.send_json(404, {"error": f"Job '{job_id}' not found"})
         return True
 
-    # Guard: Active running / claimed jobs cannot be deleted without cancelling first
+    # Guard: Active jobs and jobs belonging to active workflows cannot be deleted
     status = (job.get("status") or job.get("state") or "").upper()
-    if status in (JOB_STATE_RUNNING, JOB_STATE_CLAIMED):
+    canon_st = canonicalize_job_state(status)
+    if canon_st in (JOB_STATE_RUNNING, JOB_STATE_ASSIGNED, JOB_STATE_QUEUED, JOB_STATE_RETRY_WAIT, JOB_STATE_WAITING_FOR_DEPENDENCY, JOB_STATE_NEEDS_ATTENTION):
         handler.send_json(409, {
-            "error": f"Cannot delete job '{job_id}' while in {status} state. Cancel the job first.",
-            "status": status,
+            "error": f"Cannot delete job '{job_id}' while in active state '{canon_st}'. Cancel the job first.",
+            "status": canon_st,
             "job_id": job_id
         })
         return True
+
+    # Check if job belongs to an active DAG workflow
+    wf_id = job.get("workflow_id")
+    if wf_id:
+        workflows_db = load_workflows_db()
+        wf = workflows_db.get("workflows", {}).get(wf_id)
+        if wf and wf.get("status") not in (JOB_STATE_SUCCEEDED, JOB_STATE_FAILED, JOB_STATE_CANCELLED):
+            handler.send_json(409, {
+                "error": f"Cannot delete job '{job_id}': step of active workflow '{wf_id}'. Cancel or delete workflow first.",
+                "workflow_id": wf_id,
+                "job_id": job_id
+            })
+            return True
 
     # Delete job from database
     del jobs_db["jobs"][job_id]
@@ -883,6 +1072,7 @@ def handle_job_delete(handler: Any, path: str, token: str) -> bool:
 
 __all__ = [
     "handle_job_get",
+    "handle_job_query_get",
     "handle_job_post",
     "handle_job_delete",
 ]

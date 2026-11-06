@@ -32,6 +32,8 @@ UNIT_TEST_FILES = [
     "tests/unit/test_node_telemetry_metrics.py",
     "tests/unit/test_cross_platform_reliability.py",
     "tests/unit/test_doctor.py",
+    "tests/unit/test_worker_lifecycle_safety.py",
+    "tests/unit/test_capability_probes.py",
 ]
 
 # Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing, HA
@@ -46,6 +48,13 @@ INTEGRATION_TEST_FILES = [
     "tests/controller/test_local_worker.py",
     "tests/controller/test_multi_node_simulation.py",
     "tests/controller/test_notifications.py",
+    "tests/controller/test_distributed_scheduler.py",
+    "tests/controller/test_capability_scheduling.py",
+    "tests/controller/test_dag_workflows.py",
+    "tests/controller/test_controller_recovery.py",
+    "tests/controller/test_operational_reliability.py",
+    "tests/controller/test_cross_worker_artifact_exchange.py",
+    "tests/canary/test_staging_canary.py",
     # Storage domain
     "tests/storage/test_storage_explorer_api.py",
     "tests/storage/test_storage_folder_features.py",
@@ -66,6 +75,7 @@ INTEGRATION_TEST_FILES = [
     "tests/ha/test_ha_failover.py",
     "tests/ha/test_ha_global_header.py",
     "tests/ha/test_ha_leader_identity_audit.py",
+    "tests/ha/test_cluster_inventory_v18.py",
     # Web UI domain
     "tests/ui/test_dashboard_js_syntax.py",
     "tests/ui/test_shell_layout_stability.py",

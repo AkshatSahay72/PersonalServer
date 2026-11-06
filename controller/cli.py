@@ -12,7 +12,14 @@ import os
 import secrets
 import sys
 from http.server import HTTPServer
-from typing import Any, Optional
+from socketserver import ThreadingMixIn
+from typing import Any, Optional, List, Dict
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
 
 from common.time_utils import get_current_iso_timestamp
 from config.platform_config import get_controller_paths, get_controller_runtime_config
@@ -31,14 +38,31 @@ from controller.constants import (
     STATE_REMOVED,
 )
 from controller.ha_helper import get_ha_manager, resolve_controller_node_id
-from controller.lease_sweeper import start_background_lease_sweeper, sweep_expired_leases
+from controller.lease_sweeper import (
+    reconcile_startup_recovery,
+    start_background_lease_sweeper,
+    sweep_expired_leases,
+)
 from controller.node_manager import get_cluster_summary, sanitize_node_record
 from controller.onboarding import (
     DEFAULT_ONBOARDING_TTL_SEC,
     generate_onboarding_code,
     get_or_create_enrollment_token,
 )
-from controller.stores import load_jobs_db, load_nodes_db, save_jobs_db, save_nodes_db
+from controller.stores import (
+    load_jobs_db,
+    load_nodes_db,
+    load_workflows_db,
+    save_jobs_db,
+    save_nodes_db,
+    save_workflows_db,
+)
+from controller.workflow_engine import (
+    WorkflowValidationError,
+    cancel_workflow,
+    instantiate_workflow,
+    progress_workflows,
+)
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness
 
 PATHS = get_controller_paths()
@@ -71,12 +95,16 @@ def start_server(host: Optional[str] = None, port: Optional[int] = None, timeout
     handler_class.heartbeat_timeout = timeout
 
     # Recover orphaned jobs from previous shutdown
-    jobs_db = load_jobs_db()
-    nodes_db = load_nodes_db()
-    sweep_expired_leases(jobs_db, nodes_db, timeout)
+    jobs_db = load_jobs_db(paths=paths)
+    nodes_db = load_nodes_db(paths=paths)
+    recovery_summary = reconcile_startup_recovery(jobs_db, nodes_db, timeout, paths=paths)
+    if recovery_summary.get("active_leases_preserved") or recovery_summary.get("expired_leases_swept") or recovery_summary.get("steps_unblocked"):
+        print(f"Startup Recovery: {recovery_summary['active_leases_preserved']} active lease(s) preserved, "
+              f"{recovery_summary['expired_leases_swept']} expired lease(s) recovered, "
+              f"{recovery_summary['steps_unblocked']} workflow step(s) unblocked.")
 
     # Start background lease sweeper thread
-    start_background_lease_sweeper(timeout)
+    start_background_lease_sweeper(timeout, paths=paths)
 
     # Initialize High Availability (HA) Manager
     ha_role = role or os.environ.get("PERSONALSERVER_HA_ROLE", "auto")
@@ -97,7 +125,7 @@ def start_server(host: Optional[str] = None, port: Optional[int] = None, timeout
     print(f"Jobs database:         {JOBS_FILE}")
     print("==========================================")
 
-    server = HTTPServer((host, port), handler_class)
+    server = ThreadedHTTPServer((host, port), handler_class)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -154,7 +182,11 @@ def submit_job(
     timeout: int = 60,
     params_json: Optional[str] = None,
     reqs_json: Optional[str] = None,
-    max_attempts: int = 3
+    max_attempts: int = 3,
+    code: Optional[str] = None,
+    args: Optional[List[str]] = None,
+    inputs: Optional[Any] = None,
+    outputs: Optional[Any] = None
 ) -> int:
     """Submits a workload job to an explicit node or 'auto' for resource-aware scheduling."""
     nodes_db = load_nodes_db()
@@ -171,6 +203,90 @@ def submit_job(
         except Exception as e:
             print(f"Error parsing params JSON: {e}", file=sys.stderr)
             return 1
+    if not isinstance(params, dict):
+        params = {}
+
+    if code and "code" not in params:
+        params["code"] = code
+    if args and "args" not in params:
+        params["args"] = args
+
+    # Parse and normalize outputs
+    raw_outputs = []
+    if outputs:
+        if isinstance(outputs, str):
+            try:
+                parsed_out = json.loads(outputs)
+                raw_outputs = parsed_out if isinstance(parsed_out, list) else [str(parsed_out)]
+            except Exception:
+                raw_outputs = [o.strip() for o in outputs.split(",") if o.strip()]
+        elif isinstance(outputs, (list, tuple)):
+            raw_outputs = list(outputs)
+    elif "outputs" in params or "expected_outputs" in params:
+        raw_outputs = params.get("outputs") or params.get("expected_outputs") or []
+
+    normalized_outputs = []
+    for item in raw_outputs:
+        if isinstance(item, str):
+            s = item.strip()
+            if s:
+                normalized_outputs.append({"name": s, "filename": s, "path": s})
+        elif isinstance(item, dict):
+            out_name = item.get("name") or item.get("filename") or item.get("path")
+            out_filename = item.get("filename") or item.get("path") or item.get("name")
+            out_path = item.get("path") or item.get("filename") or item.get("name")
+            if out_name:
+                out_copy = dict(item)
+                out_copy["name"] = str(out_name).strip()
+                out_copy["filename"] = str(out_filename).strip()
+                out_copy["path"] = str(out_path).strip()
+                normalized_outputs.append(out_copy)
+
+    # Parse and resolve inputs against artifacts database
+    raw_inputs = []
+    if inputs:
+        if isinstance(inputs, str):
+            try:
+                parsed_in = json.loads(inputs)
+                raw_inputs = parsed_in if isinstance(parsed_in, list) else [parsed_in]
+            except Exception:
+                raw_inputs = [i.strip() for i in inputs.split(",") if i.strip()]
+        elif isinstance(inputs, (list, tuple)):
+            raw_inputs = list(inputs)
+    elif "inputs" in params:
+        raw_inputs = params.get("inputs") or []
+
+    resolved_input_artifacts = []
+    if raw_inputs:
+        from controller.stores import load_artifacts_db
+        artifacts_db = load_artifacts_db()
+        known_artifacts = artifacts_db.get("artifacts", {})
+        for item in raw_inputs:
+            art_id = None
+            dest_name = None
+            if isinstance(item, str):
+                art_id = item.strip()
+            elif isinstance(item, dict):
+                art_id = str(item.get("artifact_id") or item.get("id") or item.get("art_id") or "").strip()
+                dest_name = item.get("name") or item.get("filename")
+            else:
+                print(f"Error: Invalid input specification '{item}'.", file=sys.stderr)
+                return 1
+
+            if not art_id or art_id not in known_artifacts:
+                print(f"Error: Input artifact '{art_id}' not found in cluster database.", file=sys.stderr)
+                return 1
+
+            art_entry = known_artifacts[art_id]
+            final_dest_name = str(dest_name or art_entry.get("name") or art_entry.get("filename") or art_id).strip()
+            resolved_input_artifacts.append({
+                "artifact_id": art_id,
+                "name": final_dest_name,
+                "filename": art_entry.get("filename") or final_dest_name,
+                "sha256": art_entry.get("sha256"),
+                "size_bytes": art_entry.get("size_bytes", 0),
+                "source_job_id": art_entry.get("job_id")
+            })
 
     reqs = {}
     if reqs_json:
@@ -182,19 +298,26 @@ def submit_job(
 
     target_node = None
     scheduler_info = None
+    waiting_reason = None
 
     if not target_or_auto or target_or_auto.lower() == "auto":
         decision = ResourceScheduler.select_node(reqs, nodes_db)
-        if not decision["selected_node"]:
-            print(f"Scheduling Error: {decision['reason']}", file=sys.stderr)
-            return 1
-        target_node = decision["selected_node"]
-        scheduler_info = {
-            "mode": "resource-aware",
-            "selected_node": target_node,
-            "score": decision["score"],
-            "reason": decision["reason"]
-        }
+        if decision.get("selected_node"):
+            target_node = decision["selected_node"]
+            scheduler_info = {
+                "mode": "resource-aware",
+                "selected_node": target_node,
+                "score": decision["score"],
+                "reason": decision["reason"]
+            }
+        else:
+            target_node = None
+            waiting_reason = f"Awaiting eligible worker: {decision['reason']}"
+            scheduler_info = {
+                "mode": "resource-aware-pending",
+                "reason": decision["reason"],
+                "rejected": decision.get("rejected", {})
+            }
     else:
         target_node = target_or_auto
         node = nodes_db.get("nodes", {}).get(target_node)
@@ -208,6 +331,11 @@ def submit_job(
         if live_status == STATE_OFFLINE:
             print(f"Error: Node '{target_node}' is OFFLINE. Cannot submit job.", file=sys.stderr)
             return 1
+        if reqs:
+            eligible, err_reason = ResourceScheduler.is_node_eligible(node, reqs)
+            if not eligible:
+                print(f"Error: Node '{target_node}' does not satisfy job requirements: {err_reason}", file=sys.stderr)
+                return 1
         scheduler_info = {"mode": "explicit", "target_node": target_node, "reason": "Explicit node"}
 
     job_id = f"job-{secrets.token_hex(6)}"
@@ -224,6 +352,11 @@ def submit_job(
         "target_node": target_node,
         "assigned_node": target_node,
         "scheduler": scheduler_info,
+        "waiting_reason": waiting_reason,
+        "inputs": raw_inputs,
+        "input_artifacts": resolved_input_artifacts,
+        "outputs": normalized_outputs,
+        "expected_outputs": normalized_outputs,
         "timeout": int(timeout),
         "max_attempts": int(max_attempts),
         "attempt": 1,
@@ -449,6 +582,254 @@ def remove_node(node_id: str) -> int:
     return 0
 
 
+def list_workflows() -> None:
+    """Lists all DAG workflows with overall progress and state."""
+    workflows_db = load_workflows_db()
+    jobs_db = load_jobs_db()
+    if progress_workflows(workflows_db, jobs_db):
+        save_workflows_db(workflows_db)
+        save_jobs_db(jobs_db)
+
+    wfs = list(workflows_db.get("workflows", {}).values())
+    if not wfs:
+        print("No workflows found.")
+        return
+
+    print("==========================================================================================")
+    print(" WORKFLOW ID       NAME                  STATUS      PROGRESS   TOTAL   COMPLETED   CREATED")
+    print("==========================================================================================")
+    for wf in wfs:
+        wid = (wf.get("workflow_id") or wf.get("id", ""))[:16].ljust(16)
+        name = (wf.get("name") or "unnamed")[:20].ljust(20)
+        status = (wf.get("status") or "UNKNOWN")[:10].ljust(10)
+        pct = f"{wf.get('progress_percent', 0.0):.1f}%".rjust(8)
+        tot = str(wf.get("total_steps", 0)).rjust(6)
+        cmp_cnt = str(wf.get("completed_steps", 0)).rjust(10)
+        created = (wf.get("created_at") or "")[:19]
+        print(f" {wid}  {name}  {status}  {pct}  {tot}  {cmp_cnt}   {created}")
+    print("==========================================================================================")
+
+
+def show_workflow_details(workflow_id: str) -> int:
+    """Displays detailed per-job workflow state and dependency graph."""
+    workflows_db = load_workflows_db()
+    jobs_db = load_jobs_db()
+    if progress_workflows(workflows_db, jobs_db):
+        save_workflows_db(workflows_db)
+        save_jobs_db(jobs_db)
+
+    wf = workflows_db.get("workflows", {}).get(workflow_id)
+    if not wf:
+        print(f"Error: Workflow '{workflow_id}' not found.", file=sys.stderr)
+        return 1
+
+    print("==========================================")
+    print(f" Workflow: {wf.get('name')} ({wf.get('workflow_id')})")
+    print("==========================================")
+    print(f"Status:          {wf.get('status')}")
+    print(f"Progress:        {wf.get('progress_percent', 0.0):.1f}% ({wf.get('completed_steps')}/{wf.get('total_steps')} steps)")
+    print(f"Failure Policy:  {wf.get('failure_policy', 'fail_fast')}")
+    print(f"Created At:      {wf.get('created_at')}")
+    print(f"Started At:      {wf.get('started_at') or 'N/A'}")
+    print(f"Finished At:     {wf.get('finished_at') or 'N/A'}")
+    if wf.get("cancel_reason"):
+        print(f"Cancel Reason:   {wf.get('cancel_reason')}")
+
+    print("\n--- Steps & Child Jobs ---")
+    all_jobs = jobs_db.get("jobs", {})
+    for step_id, step in wf.get("steps", {}).items():
+        jid = step.get("job_id")
+        job = all_jobs.get(jid, {})
+        deps = step.get("depends_on") or []
+        deps_str = ", ".join(deps) if deps else "None (root)"
+        assigned = job.get("assigned_node") or job.get("target_node") or "auto"
+        print(f"\n  • Step '{step_id}' [{step.get('type')}]:")
+        print(f"      Job ID:        {jid}")
+        print(f"      Status:        {job.get('status', step.get('status'))}")
+        print(f"      Dependencies:  {deps_str}")
+        print(f"      Assigned Node: {assigned}")
+        if job.get("waiting_reason"):
+            print(f"      Waiting:       {job.get('waiting_reason')}")
+        if job.get("blocked_reason"):
+            print(f"      Blocked:       {job.get('blocked_reason')}")
+        if job.get("retry_reason"):
+            print(f"      Retry/Error:   {job.get('retry_reason')}")
+        if job.get("cancel_reason"):
+            print(f"      Cancel Reason: {job.get('cancel_reason')}")
+        if job.get("input_artifacts"):
+            print(f"      Inputs:        {len(job['input_artifacts'])} resolved artifact(s)")
+            for a in job["input_artifacts"]:
+                print(f"        - {a.get('name')} (id={a.get('artifact_id')}, sha256={str(a.get('sha256'))[:12]}...)")
+        if job.get("artifacts"):
+            print(f"      Outputs:       {len(job['artifacts'])} artifact(s)")
+            for a in job["artifacts"]:
+                print(f"        - {a.get('name') or a.get('filename')} (id={a.get('artifact_id')}, sha256={str(a.get('sha256'))[:12]}...)")
+    print("==========================================")
+    return 0
+
+
+def submit_workflow_cmd(spec_arg: str) -> int:
+    """Instantiates and submits a DAG workflow from JSON string or file."""
+    if os.path.exists(spec_arg):
+        try:
+            with open(spec_arg, "r", encoding="utf-8") as f:
+                spec = json.load(f)
+        except Exception as e:
+            print(f"Error reading workflow spec file '{spec_arg}': {e}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            spec = json.loads(spec_arg)
+        except Exception as e:
+            print(f"Error parsing workflow JSON: {e}", file=sys.stderr)
+            return 1
+
+    jobs_db = load_jobs_db()
+    workflows_db = load_workflows_db()
+    try:
+        wf_rec, created_jobs = instantiate_workflow(spec, jobs_db)
+    except WorkflowValidationError as e:
+        print(f"Workflow Validation Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Failed to instantiate workflow: {e}", file=sys.stderr)
+        return 1
+
+    wf_id = wf_rec["workflow_id"]
+    workflows_db.setdefault("workflows", {})[wf_id] = wf_rec
+    save_workflows_db(workflows_db)
+    save_jobs_db(jobs_db)
+
+    print("==========================================")
+    print(f" Workflow Created: {wf_rec['name']}")
+    print("==========================================")
+    print(f"Workflow ID:  {wf_id}")
+    print(f"Total Steps:  {len(created_jobs)}")
+    for j in created_jobs:
+        print(f"  • {j['workflow_step_id']}: job={j['job_id']} status={j['status']}")
+    print("==========================================")
+    return 0
+
+
+def cancel_workflow_cmd(workflow_id: str, reason: str = "Cancelled by operator") -> int:
+    """Cancels an active workflow and its non-terminal child jobs."""
+    workflows_db = load_workflows_db()
+    jobs_db = load_jobs_db()
+    cancelled = cancel_workflow(workflow_id, workflows_db, jobs_db, reason=reason)
+    if not cancelled:
+        print(f"Error: Workflow '{workflow_id}' not found.", file=sys.stderr)
+        return 1
+    save_workflows_db(workflows_db)
+    save_jobs_db(jobs_db)
+    print(f"Workflow '{workflow_id}' and all active/pending steps cancelled.")
+    return 0
+
+
+def handle_app_cli(args) -> int:
+    """Handles CLI application management actions."""
+    from controller.deployment_manager import DeploymentManager
+    from controller.stores import load_apps_db
+    from pathlib import Path
+
+    action = getattr(args, "app_action", None)
+    if not action or action == "list":
+        db = load_apps_db()
+        apps = db.get("apps", {})
+        if not apps:
+            print("No applications registered.")
+            return 0
+        print(f"{'APP ID':<22} {'NAME':<20} {'STATUS':<12} {'PORT':<8} {'PUBLIC PATH'}")
+        print("-" * 75)
+        for app in apps.values():
+            if app.get("status") not in ("DELETED", "deleted"):
+                print(f"{app.get('app_id', '-'):<22} {app.get('name', '-'):<20} {app.get('status', '-'):<12} {str(app.get('port', '-')):<8} {app.get('public_path', '-')}")
+        return 0
+
+    elif action == "register":
+        spec_path = Path(args.manifest)
+        if not spec_path.exists():
+            print(f"Error: Manifest file not found: {args.manifest}", file=sys.stderr)
+            return 1
+        with open(spec_path, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+        try:
+            rec = DeploymentManager.register_manifest(manifest_data)
+            print(f"Application registered successfully: {rec['app_id']} ({rec['name']}) at {rec['public_path']}")
+            return 0
+        except Exception as e:
+            print(f"Error registering application: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "deploy":
+        app_id = args.app_id
+        artifact_path = Path(args.artifact) if getattr(args, "artifact", None) else None
+        artifact_sha256 = getattr(args, "sha256", None)
+        port = getattr(args, "port", None)
+        try:
+            res = DeploymentManager.deploy_application(
+                app_id=app_id,
+                artifact_path=artifact_path,
+                artifact_sha256=artifact_sha256,
+                port_override=port
+            )
+            print(f"Deployment succeeded: {res['deployment_id']} for '{app_id}' on {res['address']}")
+            print(f"Health check: {res.get('health_probe')}")
+            return 0
+        except Exception as e:
+            print(f"Deployment failed: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "status":
+        app_id = args.app_id
+        try:
+            st = DeploymentManager.get_application_status(app_id)
+            print(f"App ID:         {st['app_id']}")
+            print(f"Name:           {st['name']}")
+            print(f"Status:         {st['status']}")
+            print(f"Active Release: {st.get('active_deployment_id') or '-'}")
+            print(f"Address:        {st.get('address') or '-'}")
+            print(f"PID:            {st.get('pid') or '-'}")
+            print(f"Deployments:    {st.get('deployments_count', 0)}")
+            return 0
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "stop":
+        app_id = args.app_id
+        try:
+            res = DeploymentManager.stop_application(app_id)
+            print(f"Stopped: {res.get('message')}")
+            return 0
+        except Exception as e:
+            print(f"Error stopping application: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "restart":
+        app_id = args.app_id
+        try:
+            res = DeploymentManager.restart_application(app_id)
+            print(f"Restarted: {res.get('deployment_id')} on {res.get('address')}")
+            return 0
+        except Exception as e:
+            print(f"Error restarting application: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "rollback":
+        app_id = args.app_id
+        target_dep = getattr(args, "deployment_id", None)
+        try:
+            res = DeploymentManager.rollback_application(app_id, target_dep)
+            print(f"Rolled back to release {res.get('restored_deployment_id')} on port {res.get('port')}")
+            print(f"Health probe: {res.get('health_probe')}")
+            return 0
+        except Exception as e:
+            print(f"Rollback failed: {e}", file=sys.stderr)
+            return 1
+
+    return 1
+
+
 def main(args_list: Optional[list] = None) -> None:
     """Entry point for controller command-line invocation."""
     parser = argparse.ArgumentParser(
@@ -488,6 +869,10 @@ def main(args_list: Optional[list] = None) -> None:
     p_submit.add_argument("--max-attempts", type=int, default=3, help="Max retry attempts (default 3)")
     p_submit.add_argument("--params", help="JSON string of parameters")
     p_submit.add_argument("--requirements", help="JSON string of scheduler requirements")
+    p_submit.add_argument("--code", help="Inline Python code string for python-script workload")
+    p_submit.add_argument("--args", nargs="*", help="Positional argument strings passed to script")
+    p_submit.add_argument("--inputs", help="JSON string or comma-separated list of input artifact IDs")
+    p_submit.add_argument("--outputs", help="JSON string or comma-separated list of declared output filenames")
 
     # schedule-test command
     p_sched = subparsers.add_parser("schedule-test", help="Test scheduler evaluation against current cluster")
@@ -518,6 +903,57 @@ def main(args_list: Optional[list] = None) -> None:
     p_onboard = subparsers.add_parser("onboard-code", help="Generate a short-lived single-use node onboarding code")
     p_onboard.add_argument("--ttl", type=int, default=DEFAULT_ONBOARDING_TTL_SEC, help="Time to live in seconds (default: 900 / 15m)")
 
+    # workflows command
+    subparsers.add_parser("workflows", help="List all DAG workflows")
+
+    # workflow command
+    p_wf = subparsers.add_parser("workflow", help="Inspect single workflow details and child jobs")
+    p_wf.add_argument("workflow_id", help="Workflow ID to inspect")
+
+    # submit-workflow command
+    p_sub_wf = subparsers.add_parser("submit-workflow", help="Submit a DAG workflow from JSON string or file path")
+    p_sub_wf.add_argument("spec", help="Path to workflow JSON file or JSON string")
+
+    # cancel-workflow command
+    p_canc_wf = subparsers.add_parser("cancel-workflow", help="Cancel an active DAG workflow")
+    p_canc_wf.add_argument("workflow_id", help="Workflow ID to cancel")
+    p_canc_wf.add_argument("--reason", default="Cancelled by operator", help="Cancellation reason")
+
+    # app command group
+    p_app = subparsers.add_parser("app", help="Manage application deployments and lifecycle")
+    app_sub = p_app.add_subparsers(dest="app_action", help="Application action")
+    
+    # app list
+    app_sub.add_parser("list", help="List registered applications")
+
+    # app register
+    p_app_reg = app_sub.add_parser("register", help="Register an application manifest")
+    p_app_reg.add_argument("manifest", help="Path to manifest JSON file")
+
+    # app deploy
+    p_app_dep = app_sub.add_parser("deploy", help="Deploy an application")
+    p_app_dep.add_argument("app_id", help="Application ID to deploy")
+    p_app_dep.add_argument("--artifact", help="Optional path to artifact file (e.g. zip bundle)")
+    p_app_dep.add_argument("--sha256", help="Optional artifact SHA-256 checksum for verification")
+    p_app_dep.add_argument("--port", type=int, help="Optional port override")
+
+    # app status
+    p_app_st = app_sub.add_parser("status", help="Inspect application runtime status and health")
+    p_app_st.add_argument("app_id", help="Application ID")
+
+    # app stop
+    p_app_stop = app_sub.add_parser("stop", help="Safely stop an active application")
+    p_app_stop.add_argument("app_id", help="Application ID")
+
+    # app restart
+    p_app_rst = app_sub.add_parser("restart", help="Safely restart an active application")
+    p_app_rst.add_argument("app_id", help="Application ID")
+
+    # app rollback
+    p_app_rb = app_sub.add_parser("rollback", help="Roll back application to a previous successful release")
+    p_app_rb.add_argument("app_id", help="Application ID")
+    p_app_rb.add_argument("--deployment-id", help="Optional specific prior deployment ID to restore")
+
     args = parser.parse_args(args_list)
 
     if not args.command or args.command == "start":
@@ -537,7 +973,19 @@ def main(args_list: Optional[list] = None) -> None:
     elif args.command == "schedule-test":
         sys.exit(schedule_test(args.requirements))
     elif args.command == "submit":
-        sys.exit(submit_job(args.node, args.type, args.name, args.timeout, args.params, args.requirements, getattr(args, "max_attempts", 3)))
+        sys.exit(submit_job(
+            args.node,
+            args.type,
+            args.name,
+            args.timeout,
+            args.params,
+            args.requirements,
+            getattr(args, "max_attempts", 3),
+            getattr(args, "code", None),
+            getattr(args, "args", None),
+            getattr(args, "inputs", None),
+            getattr(args, "outputs", None)
+        ))
     elif args.command == "jobs":
         list_jobs(getattr(args, "node", None), getattr(args, "status", None))
     elif args.command == "job":
@@ -557,6 +1005,17 @@ def main(args_list: Optional[list] = None) -> None:
         print(f"Onboarding code: {code}")
         print(f"Expires in:      {minutes} minutes")
         print("==========================================")
+    elif args.command == "workflows":
+        list_workflows()
+    elif args.command == "workflow":
+        sys.exit(show_workflow_details(args.workflow_id))
+    elif args.command == "submit-workflow":
+        sys.exit(submit_workflow_cmd(args.spec))
+    elif args.command == "cancel-workflow":
+        sys.exit(cancel_workflow_cmd(args.workflow_id, getattr(args, "reason", "Cancelled by operator")))
+    elif args.command == "app":
+        from controller.cli import handle_app_cli
+        sys.exit(handle_app_cli(args))
 
 
 __all__ = [
@@ -571,5 +1030,10 @@ __all__ = [
     "show_node_details",
     "show_cluster",
     "remove_node",
+    "handle_app_cli",
     "main",
 ]
+
+if __name__ == "__main__":
+    main()
+

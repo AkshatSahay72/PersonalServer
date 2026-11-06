@@ -140,33 +140,96 @@ class ApplicationRouter:
         path_only = parsed.path
         parts = [p for p in path_only.split("/") if p]
 
-        if not parts:
-            return None, None, None, False, None
-
-        prefix = f"/{parts[0].lower()}"
-
-        # Find matching app
+        # 1. Match sub-applications by longest matching prefix
+        sub_apps = []
         for app in apps_db.get("apps", {}).values():
-            if app.get("status") == "DELETED":
+            if app.get("status") in ("DELETED", "deleted"):
                 continue
+            reg_path = str(app.get("public_path") or app.get("route", {}).get("path") or f"/{app.get('name', '')}").strip()
+            if reg_path and reg_path != "/":
+                if not reg_path.startswith("/"):
+                    reg_path = "/" + reg_path
+                sub_apps.append((reg_path.rstrip("/"), app))
 
-            route = app.get("route")
-            if not route or not isinstance(route, dict) or not route.get("enabled", True):
-                continue
+        # Sort by length of registered path descending for longest-prefix match
+        sub_apps.sort(key=lambda x: len(x[0]), reverse=True)
 
-            registered_path = str(route.get("path", "")).strip().lower()
-            if registered_path == prefix:
-                # Check trailing slash normalization for root route access
-                # e.g. GET /recallflow without trailing slash -> redirect to /recallflow/
-                if path_only == prefix:
-                    return app, prefix, "/", True, None
+        path_only_lower = path_only.lower()
+        for reg_path_clean, app in sub_apps:
+            reg_lower = reg_path_clean.lower()
+            if path_only_lower == reg_lower or path_only_lower.startswith(reg_lower + "/"):
+                if path_only_lower == reg_lower:
+                    # Missing trailing slash -> redirect to /reg_path/
+                    return app, reg_path_clean, "/", True, None
 
-                # Calculate remainder path
-                remainder = path_only[len(prefix):]
+                remainder = path_only[len(reg_path_clean):]
                 if not remainder.startswith("/"):
                     remainder = "/" + remainder
 
-                return app, prefix, remainder, False, None
+                # Check component routing if present
+                components = app.get("components")
+                if components and isinstance(components, dict):
+                    # 1. API route precedence: check backend components first
+                    for comp_name, comp in components.items():
+                        c_type = str(comp.get("type", "")).lower()
+                        c_routing = comp.get("routing", {})
+                        if c_type == "backend" and c_routing.get("api_priority", True):
+                            api_prefix = str(c_routing.get("path_prefix", "/api")).strip().lower()
+                            if not api_prefix.startswith("/"):
+                                api_prefix = "/" + api_prefix
+                            rem_lower = remainder.lower()
+                            if rem_lower == api_prefix or rem_lower.startswith(api_prefix + "/"):
+                                matched_app = dict(app)
+                                matched_app["_active_component"] = comp
+                                matched_app["_is_api"] = True
+                                return matched_app, reg_path_clean, remainder, False, None
+
+                    # 2. Frontend route evaluation
+                    for comp_name, comp in components.items():
+                        c_type = str(comp.get("type", "")).lower()
+                        if c_type == "frontend":
+                            matched_app = dict(app)
+                            matched_app["_active_component"] = comp
+                            matched_app["_is_api"] = False
+                            return matched_app, reg_path_clean, remainder, False, None
+
+                return app, reg_path_clean, remainder, False, None
+
+        # 2. Application namespace boundary: requests under /apps/ must not fall through to root
+        if path_only_lower == "/apps" or path_only_lower.startswith("/apps/"):
+            return None, None, None, False, None
+
+        # 3. Root application fallback (longest-prefix: serves '/' and all unreserved top-level paths)
+        for app in apps_db.get("apps", {}).values():
+            if app.get("status") in ("DELETED", "deleted"):
+                continue
+            reg_path = str(app.get("public_path") or app.get("route", {}).get("path", "")).strip()
+            if reg_path == "/":
+                components = app.get("components")
+                if components and isinstance(components, dict):
+                    # Check backend components if path starts with API prefix
+                    for comp_name, comp in components.items():
+                        c_type = str(comp.get("type", "")).lower()
+                        c_routing = comp.get("routing", {})
+                        if c_type == "backend":
+                            api_prefix = str(c_routing.get("path_prefix", "/api")).strip().lower()
+                            if path_only.lower() == api_prefix or path_only.lower().startswith(api_prefix + "/"):
+                                matched_app = dict(app)
+                                matched_app["_active_component"] = comp
+                                matched_app["_is_api"] = True
+                                return matched_app, "/", path_only, False, None
+
+                    # Check frontend/web component
+                    for comp_name, comp in components.items():
+                        c_type = str(comp.get("type", "")).lower()
+                        if c_type in ("frontend", "web"):
+                            matched_app = dict(app)
+                            matched_app["_active_component"] = comp
+                            matched_app["_is_api"] = False
+                            return matched_app, "/", path_only, False, None
+
+                # Legacy single container root app
+                return app, "/", path_only, False, None
 
         return None, None, None, False, None
 
@@ -187,13 +250,30 @@ class ApplicationRouter:
         if app_status == "FAILED":
             return 502, {"error": "Application is currently unhealthy", "status": 502}, {}
 
-        if app_status != "RUNNING":
+        if app_status not in ("RUNNING", "active", "ACTIVE"):
             return 503, {"error": f"Application is currently in {app_status} state", "status": 503}, {}
 
-        selected_node = app.get("selected_node")
-        host_port = app.get("host_port")
+        # If component specified with external/direct destination URL
+        active_comp = app.get("_active_component")
+        if active_comp:
+            dest = str(active_comp.get("destination") or "").strip().rstrip("/")
+            if dest.startswith("http://") or dest.startswith("https://"):
+                return 200, dest, {}
 
-        if not selected_node or not host_port:
+        selected_node = app.get("selected_node")
+        raw_port = app.get("host_port") if app.get("host_port") is not None else app.get("port")
+
+        if raw_port is None:
+            return 504, {"error": "Application host port is missing or unassigned", "status": 504}, {}
+
+        try:
+            host_port = int(raw_port)
+            if not (1 <= host_port <= 65535):
+                raise ValueError("Port out of range")
+        except (TypeError, ValueError):
+            return 504, {"error": f"Application host port '{raw_port}' is invalid", "status": 504}, {}
+
+        if not selected_node:
             return 504, {"error": "Application host node is temporarily unreachable", "status": 504}, {}
 
         # Verify selected node is ONLINE in cluster registry
@@ -299,6 +379,18 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response(404, {"error": "Application route not found", "status": 404})
             return
 
+        # Direct application/route redirect support (e.g. root domain portfolio redirect)
+        redirect_target = app.get("redirect") or (app.get("route", {}) if isinstance(app.get("route"), dict) else {}).get("redirect")
+        if redirect_target:
+            target_url = f"{str(redirect_target).rstrip('/')}{path}"
+            if query_str:
+                target_url += f"?{query_str}"
+            self.send_response(307)
+            self.send_header("Location", target_url)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         # Upstream resolution
         status_code, target_res, extra_hdrs = ApplicationRouter.resolve_target_upstream(app, nodes_db)
         if status_code != 200:
@@ -306,10 +398,28 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
             return
 
         upstream_base_url = target_res
-        route_meta = app.get("route", {})
-        strip_prefix = route_meta.get("strip_prefix", True)
+        active_comp = app.get("_active_component")
+        if active_comp:
+            c_routing = active_comp.get("routing", {})
+            strip_mode = c_routing.get("strip_mode", "strip_app")
+            if strip_mode == "strip_app":
+                forwarded_path = remainder
+            elif strip_mode == "strip_all":
+                api_pfx = str(c_routing.get("path_prefix", "/api")).strip().lower()
+                rem_lower = remainder.lower()
+                if rem_lower.startswith(api_pfx):
+                    forwarded_path = remainder[len(api_pfx):]
+                else:
+                    forwarded_path = remainder
+                if not forwarded_path.startswith("/"):
+                    forwarded_path = "/" + forwarded_path
+            else:  # preserve
+                forwarded_path = path
+        else:
+            route_meta = app.get("route", {})
+            strip_prefix = route_meta.get("strip_prefix", True)
+            forwarded_path = remainder if strip_prefix else path
 
-        forwarded_path = remainder if strip_prefix else path
         if query_str:
             forwarded_path += f"?{query_str}"
 
@@ -351,14 +461,17 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
                     # Rewrite Location header for redirects
                     if hdr_lower == "location":
                         client_proto = self.headers.get("X-Forwarded-Proto") or get_platform_config().app_scheme
-                        if hdr_val.startswith("/"):
+                        if route_prefix == "/":
+                            pass  # Root application already has root-relative location
+                        elif hdr_val.startswith("/"):
                             hdr_val = f"{route_prefix}{hdr_val}"
                         elif upstream_base_url in hdr_val:
                             hdr_val = hdr_val.replace(upstream_base_url, f"{client_proto}://{client_host}{route_prefix}")
 
                     # Rewrite Set-Cookie Path
                     elif hdr_lower == "set-cookie":
-                        hdr_val = re.sub(r'Path=\/([^;]*)', f'Path={route_prefix}\\1', hdr_val, flags=re.IGNORECASE)
+                        if route_prefix != "/":
+                            hdr_val = re.sub(r'Path=\/([^;]*)', f'Path={route_prefix}\\1', hdr_val, flags=re.IGNORECASE)
 
                     self.send_header(hdr_key, hdr_val)
 
@@ -374,12 +487,16 @@ class RouterHTTPHandler(BaseHTTPRequestHandler):
             for hdr_key, hdr_val in e.headers.items():
                 hdr_lower = hdr_key.lower()
                 client_proto = self.headers.get("X-Forwarded-Proto") or get_platform_config().app_scheme
-                if hdr_lower == "location" and hdr_val.startswith("/"):
-                    hdr_val = f"{route_prefix}{hdr_val}"
-                elif hdr_lower == "location" and upstream_base_url in hdr_val:
-                    hdr_val = hdr_val.replace(upstream_base_url, f"{client_proto}://{client_host}{route_prefix}")
+                if hdr_lower == "location":
+                    if route_prefix == "/":
+                        pass
+                    elif hdr_val.startswith("/"):
+                        hdr_val = f"{route_prefix}{hdr_val}"
+                    elif upstream_base_url in hdr_val:
+                        hdr_val = hdr_val.replace(upstream_base_url, f"{client_proto}://{client_host}{route_prefix}")
                 elif hdr_lower == "set-cookie":
-                    hdr_val = re.sub(r'Path=\/([^;]*)', f'Path={route_prefix}\\1', hdr_val, flags=re.IGNORECASE)
+                    if route_prefix != "/":
+                        hdr_val = re.sub(r'Path=\/([^;]*)', f'Path={route_prefix}\\1', hdr_val, flags=re.IGNORECASE)
                 self.send_header(hdr_key, hdr_val)
             self.end_headers()
             self.wfile.write(err_body)
