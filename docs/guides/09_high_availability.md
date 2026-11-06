@@ -1,8 +1,8 @@
-# 05 — High Availability Guide: Leader Leases & Failover
+# 09 — High Availability Guide: Leader Leases & Failover
 
-> **Reading Order**: **Step 5 of 9** in the PersonalServer User Guide sequence.  
-> **Previous Guide**: [04 — Cluster Management Guide](04_cluster_management.md)  
-> **Next Guide**: [06 — Storage & Artifacts Guide](06_storage_and_artifacts.md)  
+> **Reading Order**: **Step 9 of 12** in the PersonalServer Guide Series (Completes the Operator Journey).  
+> **Previous Guide**: [08 — Monitoring & Recovery](08_monitoring_and_recovery.md)  
+> **Next Guide**: [10 — Development](10_development.md) *(Begins the Engineer Journey)*  
 > **Audience**: Operators configuring high availability, standby nodes, and failover consensus.  
 > **Prerequisites**: Two or more connected nodes running PersonalServer.
 
@@ -125,8 +125,8 @@ If Node A abruptly powers off or crashes:
 
 ---
 
-## 7. Next Steps
+## 7. Next Step
 
-Now that your cluster is highly available, learn how applications and batch jobs manage storage, artifacts, and file integrity:
+Congratulations! You have completed the **Operator Journey**. If you wish to inspect the codebase, run test suites, and write custom code:
 
-👉 **Continue to [06 — Storage and Artifacts Guide](06_storage_and_artifacts.md)**
+👉 **Continue to [10 — Development Guide](10_development.md)**

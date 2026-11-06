@@ -1,8 +1,8 @@
-# 06 — Storage & Artifacts Guide: File Exchange & Integrity
+# 07 — Storage & Artifacts Guide: File Exchange & Verification
 
-> **Reading Order**: **Step 6 of 9** in the PersonalServer User Guide sequence.  
-> **Previous Guide**: [05 — High Availability Guide](05_high_availability.md)  
-> **Next Guide**: [07 — Monitoring & Troubleshooting Guide](07_monitoring_and_troubleshooting.md)  
+> **Reading Order**: **Step 7 of 12** in the PersonalServer Guide Series.  
+> **Previous Guide**: [06 — Cluster Management](06_cluster_management.md)  
+> **Next Guide**: [08 — Monitoring & Recovery](08_monitoring_and_recovery.md)  
 > **Audience**: Users managing application files, data persistence, and job build artifacts.  
 > **Prerequisites**: A functional PersonalServer controller and storage directory.
 
@@ -60,7 +60,7 @@ python controller/cli.py artifacts download \
 
 ## 4. Job Output Artifact Discovery (J5 Result Management)
 
-When running distributed batch jobs (from Guide 04), declared outputs are automatically ingested into cluster storage:
+When running distributed batch jobs (Guide 06), declared outputs are automatically ingested into cluster storage:
 
 1. **Declared Match**: The worker monitors the job working directory for files matching declared output names or globs.
 2. **Size Bounds Verification**: Files exceeding maximum bounds (50MB per individual file or 200MB per attempt) are rejected with a descriptive error to protect smartphone flash storage.
@@ -81,8 +81,8 @@ python controller/cli.py storage cleanup --older-than 7d
 
 ---
 
-## 6. Next Steps
+## 6. Next Step
 
-Learn how to monitor node thermals, inspect logs, and use the automated self-healing diagnostic framework:
+Learn how to monitor node thermals, inspect system logs, and use the automated self-healing diagnostic framework:
 
-👉 **Continue to [07 — Monitoring & Troubleshooting Guide](07_monitoring_and_troubleshooting.md)**
+👉 **Continue to [08 — Monitoring & Recovery Guide](08_monitoring_and_recovery.md)**

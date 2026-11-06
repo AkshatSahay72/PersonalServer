@@ -157,18 +157,24 @@ python scripts/run_tests.py --lint
 
 For in-depth operational runbooks, architecture specifications, and API guides, consult the [`docs/`](docs/README.md) directory.
 
-### User Guides (Follow in numerical order):
-1. **[01 — Setup Guide](docs/01_setup.md)**: Hardware overview, prerequisites, cloning, initial configuration, starting the controller.
-2. **[02 — Node Setup Guide](docs/02_node_setup.md)**: Preparing Android/Termux, Linux, and Windows nodes; private mesh setup; zero-touch pairing.
-3. **[03 — Deployment Guide](docs/03_deployment.md)**: Application manifests (`app.json`), packaging, deploying Node.js/Python/Static apps, auto-rollback.
-4. **[04 — Cluster Management](docs/04_cluster_management.md)**: Node roles, capability inspection, submitting batch jobs, scheduler decisions.
-5. **[05 — High Availability](docs/05_high_availability.md)**: Active-standby consensus, leader leases, automated failover, split-brain immunity.
-6. **[06 — Storage & Artifacts](docs/06_storage_and_artifacts.md)**: Sandboxed application storage, artifact transfer, SHA-256 integrity verification.
-7. **[07 — Monitoring & Troubleshooting](docs/07_monitoring_and_troubleshooting.md)**: Health checks, log streaming, automated self-healing doctor utility.
-8. **[08 — Development Guide](docs/08_development.md)**: Repository layout, running offline test suites, contribution principles.
-9. **[09 — Architecture Reference](docs/09_architecture_reference.md)**: Subsystem component map, data flows, and links to normative specifications.
+### Sequential User Guides (`docs/guides/`):
+- **[01 — Introduction](docs/guides/01_introduction.md)**: Platform overview, philosophy, architecture principles.
+- **[02 — Requirements](docs/guides/02_requirements.md)**: Hardware matrix, operating systems, prerequisites.
+- **[03 — Installation](docs/guides/03_installation.md)**: Cloning repository, running doctor, launching controller.
+- **[04 — Node Setup](docs/guides/04_node_setup.md)**: Termux setup, Linux nodes, Tailscale mesh, zero-touch pairing.
+- **[05 — First Deployment](docs/guides/05_first_deployment.md)**: Application manifests (`app.json`), packaging, deploying apps.
+- **[06 — Cluster Management](docs/guides/06_cluster_management.md)**: Managing workloads, submitting batch jobs, scheduler decisions.
+- **[07 — Storage & Artifacts](docs/guides/07_storage_and_artifacts.md)**: Sandboxed storage, cryptographic verification, file exchange.
+- **[08 — Monitoring & Recovery](docs/guides/08_monitoring_and_recovery.md)**: Self-healing doctor utility, system logs, common error recovery.
+- **[09 — High Availability](docs/guides/09_high_availability.md)**: Active-standby consensus, leader leases, automated failover.
+- **[10 — Development](docs/guides/10_development.md)**: Repository structure, offline test running, contribution rules.
+- **[11 — Architecture](docs/guides/11_architecture.md)**: Subsystem component map, data flows, controller state machine.
+- **[12 — Protocols & Specs](docs/guides/12_protocols_and_specifications.md)**: Normative specifications, protocol schemas, wire contracts.
 
-### Normative Specifications & Technical Reference:
+### Operations & Runbooks (`docs/operations/`):
+- **[Troubleshooting](docs/operations/troubleshooting.md)** | **[Maintenance](docs/operations/maintenance.md)** | **[Backup & Restore](docs/operations/backup_and_restore.md)** | **[Security](docs/operations/security.md)** | **[Networking](docs/operations/networking.md)**
+
+### Normative Specifications (`docs/reference/`):
 - **[Universal Job Contract (J1)](docs/reference/universal_job_contract_j1.md)**
 - **[Capability Registry (J2)](docs/reference/capability_registry_j2.md)**
 - **[Universal Scheduler (J3)](docs/reference/universal_scheduler_j3.md)**

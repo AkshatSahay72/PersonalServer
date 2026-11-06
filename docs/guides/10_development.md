@@ -1,8 +1,8 @@
-# 08 — Development Guide: Architecture, Testing & Contributions
+# 10 — Development Guide: Architecture, Testing & Contributions
 
-> **Reading Order**: **Step 8 of 9** in the PersonalServer User Guide sequence.  
-> **Previous Guide**: [07 — Monitoring & Troubleshooting Guide](07_monitoring_and_troubleshooting.md)  
-> **Next Guide**: [09 — Architecture Reference](09_architecture_reference.md)  
+> **Reading Order**: **Step 10 of 12** in the PersonalServer Guide Series (Begins the Engineer Journey).  
+> **Previous Guide**: [09 — High Availability](09_high_availability.md)  
+> **Next Guide**: [11 — Architecture Reference](11_architecture.md)  
 > **Audience**: Contributors, core developers, and test engineers.  
 > **Prerequisites**: Python 3.10+ development environment and a cloned repository.
 
@@ -25,6 +25,8 @@ PersonalServer/
 │   ├── stores/             # Durable JSON databases with atomic read-modify-write locks
 │   └── deployment_manager.py # Application deployment state machine (R1-R9)
 ├── docs/                   # Numbered user guides and technical documentation
+│   ├── guides/             # 12-step sequential developer and operator guides
+│   ├── operations/         # Operational runbooks and maintenance guides
 │   └── reference/          # Normative specifications (J1-J3, D0)
 ├── router/                 # Dynamic reverse proxy, subpath router, and ingress gateway
 ├── scheduler/              # Universal Scheduler (J3 8-stage eligibility pipeline)
@@ -99,8 +101,8 @@ To support a new application runtime (e.g. Go, Rust, Ruby):
 
 ---
 
-## 6. Next Steps
+## 6. Next Step
 
-Review the high-level architecture component map and links to frozen specifications:
+Review the system component map and detailed subsystem interactions:
 
-👉 **Continue to [09 — Architecture Reference](09_architecture_reference.md)**
+👉 **Continue to [11 — Architecture Reference](11_architecture.md)**

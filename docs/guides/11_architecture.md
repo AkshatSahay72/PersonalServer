@@ -1,9 +1,10 @@
-# 09 — Architecture Reference: Subsystems & Specifications
+# 11 — Architecture Reference: Subsystems & Data Flows
 
-> **Reading Order**: **Step 9 of 9** in the PersonalServer User Guide sequence.  
-> **Previous Guide**: [08 — Development Guide](08_development.md)  
+> **Reading Order**: **Step 11 of 12** in the PersonalServer Guide Series.  
+> **Previous Guide**: [10 — Development](10_development.md)  
+> **Next Guide**: [12 — Protocols and Specifications](12_protocols_and_specifications.md)  
 > **Audience**: System architects, security auditors, and core contributors.  
-> **Prerequisites**: Familiarity with Guides 01 through 08.
+> **Prerequisites**: Familiarity with Guides 01 through 10.
 
 ---
 
@@ -59,31 +60,28 @@ flowchart TD
 
 ---
 
-## 3. Normative Technical Specifications (`docs/reference/`)
+## 3. Data Flows
 
-For exact technical contracts, state transition matrices, error codes, and mathematical formulas, consult the normative specifications:
+### A. Job Submission & Execution Flow:
+1. Client submits job via `POST /api/jobs` with optional output declarations.
+2. Controller normalizes payload, generates monotonic fencing generation token, and writes state to `jobs_store.json`.
+3. Universal Scheduler evaluates cluster nodes and creates an atomic resource reservation.
+4. Assigned worker receives dispatch, validates lease and fencing token, and executes code in an isolated attempt directory.
+5. Upon exit, worker hashes output artifacts (SHA-256) and uploads them to the controller staging area.
+6. Controller executes two-phase CAS promotion, updates job status to `SUCCEEDED`, and releases reservations.
 
-| Specification | Path | Scope |
-|---|---|---|
-| **Universal Job Contract (J1)** | [docs/reference/universal_job_contract_j1.md](reference/universal_job_contract_j1.md) | Standardized job definition, execution environment, and artifact schema |
-| **Capability Registry (J2)** | [docs/reference/capability_registry_j2.md](reference/capability_registry_j2.md) | Static and dynamic hardware/software capability discovery |
-| **Universal Scheduler (J3)** | [docs/reference/universal_scheduler_j3.md](reference/universal_scheduler_j3.md) | 8-stage eligibility pipeline, scoring formula, and atomic reservations |
-| **Deployment Architecture (D0)** | [docs/reference/deployment_architecture_d0.md](reference/deployment_architecture_d0.md) | Universal multi-runtime application deployment lifecycle and rollback |
-
----
-
-## 4. Hardware Migration & Research Archives (`docs/reference/`)
-
-Historical planning documents and research papers detailing the progression of PersonalServer:
-- [Hardware Migration Plan](reference/hardware_migration_plan.md): Architectural roadmap transitioning from Windows development to dual-Android Termux and Raspberry Pi hardware.
-- [Raspberry Pi Migration](reference/raspberry_pi_migration.md): Linux Filesystem Hierarchy Standard (FHS) mapping and systemd daemon units.
-- [Multi-Node Simulation Suite](reference/multi_node_simulation.md): Offline loopback test harness for multi-worker fault injection.
-- [Image Build & Deploy Workflow](reference/image_build_deploy_workflow.md): Decoupled 8-stage image pipeline and OCI digest verification.
+### B. Deployment & Rollback Flow:
+1. Operator triggers deployment via CLI or Web UI.
+2. Deployment manager writes deployment record (`QUEUED`) and packages artifact bundle.
+3. Candidate node unpacks release into versioned directory (`releases/<deployment_id>`).
+4. Runtime adapter boots process on ephemeral port and controller conducts health checks.
+5. If health check succeeds, reverse proxy updates upstream pointer to new port.
+6. If health check times out, process is killed and previous healthy release is restored.
 
 ---
 
-## 5. Congratulations!
+## 4. Next Step
 
-You have completed the entire PersonalServer documentation series. To review or start from the beginning:
+Inspect the authoritative normative specifications, protocol schemas, and mathematical algorithms:
 
-👉 **Return to [01 — Setup Guide](01_setup.md)** or consult the [Documentation Index](README.md).
+👉 **Continue to [12 — Protocols and Specifications](12_protocols_and_specifications.md)**

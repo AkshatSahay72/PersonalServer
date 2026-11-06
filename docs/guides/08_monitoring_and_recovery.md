@@ -1,8 +1,8 @@
-# 07 — Monitoring & Troubleshooting Guide: Diagnostics & Self-Healing
+# 08 — Monitoring & Recovery Guide: Diagnostics & Self-Healing
 
-> **Reading Order**: **Step 7 of 9** in the PersonalServer User Guide sequence.  
-> **Previous Guide**: [06 — Storage & Artifacts Guide](06_storage_and_artifacts.md)  
-> **Next Guide**: [08 — Development Guide](08_development.md)  
+> **Reading Order**: **Step 8 of 12** in the PersonalServer Guide Series.  
+> **Previous Guide**: [07 — Storage & Artifacts](07_storage_and_artifacts.md)  
+> **Next Guide**: [09 — High Availability](09_high_availability.md)  
 > **Audience**: Operators diagnosing cluster health, resolving errors, and inspecting logs.  
 > **Prerequisites**: A running PersonalServer controller or worker node.
 
@@ -24,7 +24,7 @@ python scripts/doctor.py
 4. **Tailscale Mesh Connectivity**: Tests ping and WireGuard handshake to peer controller nodes.
 5. **Storage Sandbox & File Permissions**: Validates write permissions and detects primary database corruption.
 
-### Automated Repair (Self-Healing):
+### Automated Repair (Self-Healing Mode):
 If degraded or orphaned services are detected, run the doctor in repair mode:
 ```bash
 python scripts/doctor.py --repair
@@ -84,8 +84,8 @@ Get-Content storage\logs\controller.log -Wait -Tail 30
 
 ---
 
-## 4. Next Steps
+## 4. Next Step
 
-Interested in extending PersonalServer, writing custom runtime adapters, or contributing code?
+Learn how to configure active-standby High Availability across two nodes for seamless zero-downtime failover:
 
-👉 **Continue to [08 — Development Guide](08_development.md)**
+👉 **Continue to [09 — High Availability Guide](09_high_availability.md)**
