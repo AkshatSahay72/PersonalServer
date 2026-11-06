@@ -144,6 +144,41 @@ def handle_ha_post(handler: Any, path: str, body: Optional[Dict[str, Any]], toke
         })
         return True
 
+    if path in ("/ha/handover", "/api/ha/handover"):
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required for leadership handover"})
+            return True
+        mgr = get_ha_manager()
+        target_id = (body or {}).get("target_node_id")
+        if not target_id:
+            handler.send_json(400, {"error": "Missing required field 'target_node_id'"})
+            return True
+        res = mgr.controlled_handover(target_id, admin_token=token)
+        code = 200 if res.get("status") == "success" else 400
+        handler.send_json(code, res)
+        return True
+
+    if path in ("/ha/mode", "/api/ha/mode"):
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to configure cluster HA mode"})
+            return True
+        mgr = get_ha_manager()
+        mode = str((body or {}).get("mode", "automatic")).lower()
+        if mode not in ("automatic", "manual_preference"):
+            handler.send_json(400, {"error": "Invalid mode: Expected 'automatic' or 'manual_preference'"})
+            return True
+        mgr.cluster_mode = mode
+        if "preferred_leader_id" in (body or {}):
+            mgr.preferred_leader_id = (body or {}).get("preferred_leader_id")
+        handler.send_json(200, {
+            "status": "ok",
+            "cluster_mode": mgr.cluster_mode,
+            "preferred_leader_id": mgr.preferred_leader_id
+        })
+        return True
+
     return False
 
 

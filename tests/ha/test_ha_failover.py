@@ -80,7 +80,7 @@ class TestHAFailover(unittest.TestCase):
             storage_dir=self.standby_dir / "storage"
         )
 
-        get_ha_manager(paths=self.master_paths, force_reload=True)
+        get_ha_manager(paths=self.master_paths, role="leader", force_reload=True)
 
     def tearDown(self):
         if hasattr(self, "paths_ctx"):
@@ -288,7 +288,8 @@ class TestHAFailover(unittest.TestCase):
             check_interval_sec=0.1,
             auth_token=self.enrollment_token,
             paths=self.standby_paths,
-            on_promotion_callback=on_promoted
+            on_promotion_callback=on_promoted,
+            auto_promotion_enabled=True
         )
 
         # Sync initial state from live master

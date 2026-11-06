@@ -457,21 +457,38 @@ def collect_cpu_thermal_info():
 
     # Method C: Windows ACPI thermal zone via WMI (if supported)
     if temperature_c is None and sys.platform == "win32":
+        # 1. In-memory WMI COM query (silent, no subprocess)
         try:
-            wmic_res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", "Get-WmiObject -Namespace root/wmi -Class MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -ExpandProperty CurrentTemperature"],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            if wmic_res.returncode == 0 and wmic_res.stdout.strip():
-                # Values in tenths of Kelvin: (val - 2732) / 10.0
-                k_val = float(wmic_res.stdout.strip().splitlines()[0])
+            import win32com.client
+            wmi = win32com.client.GetObject("winmgmts:root\\wmi")
+            zones = wmi.ExecQuery("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
+            for z in zones:
+                k_val = float(z.CurrentTemperature)
                 c_val = (k_val - 2732) / 10.0
                 if 10.0 <= c_val <= 115.0:
                     temperature_c = round(c_val, 1)
+                    break
         except Exception:
             pass
+
+        # 2. Silent powershell fallback with CREATE_NO_WINDOW
+        if temperature_c is None:
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW
+                wmic_res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", "Get-WmiObject -Namespace root/wmi -Class MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -ExpandProperty CurrentTemperature"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    creationflags=creationflags
+                )
+                if wmic_res.returncode == 0 and wmic_res.stdout.strip():
+                    k_val = float(wmic_res.stdout.strip().splitlines()[0])
+                    c_val = (k_val - 2732) / 10.0
+                    if 10.0 <= c_val <= 115.0:
+                        temperature_c = round(c_val, 1)
+            except Exception:
+                pass
 
     # CPU Frequency
     freq_path = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
