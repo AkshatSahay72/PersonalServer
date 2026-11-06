@@ -91,6 +91,10 @@ class TestReliableJobLifecycle(unittest.TestCase):
         )
         cls.paths = cls.paths_ctx.__enter__()
 
+        # Ensure test server runs as authorized leader in isolated test sandbox
+        from controller.ha_helper import get_ha_manager
+        get_ha_manager(paths=cls.paths, role="leader", force_reload=True)
+
         ControllerHandler.heartbeat_timeout = 3
         ControllerHandler.default_backoff_sec = 0.0  # default fast for test suite
         cls.httpd = HTTPServer(("127.0.0.1", 0), ControllerHandler)
@@ -109,6 +113,11 @@ class TestReliableJobLifecycle(unittest.TestCase):
             pass
         try:
             cls.paths_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            from controller.ha_helper import get_ha_manager
+            get_ha_manager(force_reload=True)
         except Exception:
             pass
         shutil.rmtree(cls.test_dir, ignore_errors=True)

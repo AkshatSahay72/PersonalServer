@@ -78,6 +78,10 @@ class TestJobsCancellationAndPagination(unittest.TestCase):
         )
         cls.paths = cls.paths_ctx.__enter__()
 
+        # Ensure test server runs as authorized leader in isolated test sandbox
+        from controller.ha_helper import get_ha_manager
+        get_ha_manager(paths=cls.paths, role="leader", force_reload=True)
+
         ControllerHandler.heartbeat_timeout = 3
         ControllerHandler.default_backoff_sec = 0.0
         cls.httpd = HTTPServer(("127.0.0.1", 0), ControllerHandler)
@@ -94,6 +98,11 @@ class TestJobsCancellationAndPagination(unittest.TestCase):
             cls.httpd.server_close()
         if hasattr(cls, "paths_ctx"):
             cls.paths_ctx.__exit__(None, None, None)
+        try:
+            from controller.ha_helper import get_ha_manager
+            get_ha_manager(force_reload=True)
+        except Exception:
+            pass
         if hasattr(cls, "test_dir") and cls.test_dir.exists():
             shutil.rmtree(cls.test_dir, ignore_errors=True)
 
