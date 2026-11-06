@@ -2534,4 +2534,58 @@ input:checked + .toggle-slider:before {
   border-radius: 4px;
 }
 
+/* Leader Management Collapsible Panel */
+.leader-header-left {
+  transition: opacity 0.15s ease;
+}
+.leader-header-left:hover .section-title {
+  color: var(--text-main);
+}
+.section-collapse-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius, 4px);
+  background: transparent;
+  color: var(--text-muted, #8b949e);
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  vertical-align: middle;
+}
+.section-collapse-btn:hover,
+.leader-header-left:hover .section-collapse-btn {
+  background-color: var(--bg-hover, rgba(255, 255, 255, 0.08));
+  color: var(--text-main, #c9d1d9);
+  border-color: var(--border-subtle, rgba(255, 255, 255, 0.1));
+}
+.section-collapse-btn:focus-visible {
+  outline: 2px solid var(--accent-blue, #58a6ff);
+  outline-offset: 1px;
+}
+.collapse-chevron {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  transform: rotate(0deg);
+}
+.section-collapse-btn[aria-expanded="false"] .collapse-chevron,
+#leader-management-card.is-collapsed .collapse-chevron {
+  transform: rotate(-90deg);
+}
+.section-collapsible-body {
+  transition: opacity 0.15s ease;
+  opacity: 1;
+}
+#leader-management-card.is-collapsed .section-collapsible-body {
+  display: none;
+  opacity: 0;
+}
+#leader-management-card.is-collapsed .section-header {
+  border-bottom: none;
+}
 

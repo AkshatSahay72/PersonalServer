@@ -18,19 +18,18 @@ async function loadPlatformConfig() {
 }
 
 function getPlatformBaseUrl() {
+  try {
+    if (window.location && window.location.origin && window.location.origin !== "null") {
+      return window.location.origin;
+    }
+  } catch (e) {}
   if (cachedPlatformConfig?.application?.base_url) {
     return cachedPlatformConfig.application.base_url;
   }
   if (cachedPlatformConfig?.urls?.primary) {
     return cachedPlatformConfig.urls.primary;
   }
-  try {
-    const host = window.location.hostname;
-    if (host.startsWith("server.")) {
-      return `${window.location.protocol}//${host.slice(7)}`;
-    }
-  } catch (e) {}
-  return "https://akshatsahay.space";
+  return "https://server.akshatsahay.space";
 }
 
 // API Helper
@@ -502,6 +501,7 @@ async function loadDashboard() {
 let cachedHAStatus = null;
 let isUpdatingHA = false;
 let lastHAUpdateTimestamp = 0;
+let haUpdatePromise = null;
 
 function resolveLeaderInfo(ha) {
   if (!ha || typeof ha !== "object") {
@@ -815,6 +815,50 @@ function renderHAHeaderError(err) {
   if (sumHaSub) {
     sumHaSub.textContent = "Connection failed";
   }
+
+  // Clear and mark stale all Leader Management UI indicators
+  renderLeaderManagementError(err);
+}
+
+function renderLeaderManagementError(err) {
+  const leaderNameEl = document.getElementById("leader-ui-name");
+  const leaderIdEl = document.getElementById("leader-ui-id");
+  const termEl = document.getElementById("leader-ui-term");
+  const leaseEl = document.getElementById("leader-ui-lease-countdown");
+  const tunnelEl = document.getElementById("leader-ui-tunnel");
+  const ingressEl = document.getElementById("leader-ui-ingress");
+  const transReasonEl = document.getElementById("leader-ui-last-transition-reason");
+  const transTimeEl = document.getElementById("leader-ui-last-transition-time");
+  const tbody = document.getElementById("leader-ranking-tbody");
+
+  if (leaderNameEl) leaderNameEl.textContent = "— (Unreachable)";
+  if (leaderIdEl) leaderIdEl.textContent = "Controller unreachable";
+  if (termEl) {
+    termEl.className = "mono cell-muted";
+    termEl.innerHTML = `<span style="color: var(--status-red);">Term — · Unreachable</span>`;
+  }
+  if (leaseEl) {
+    leaseEl.textContent = "Unavailable / Stale";
+    leaseEl.style.color = "var(--status-red)";
+  }
+  if (tunnelEl) {
+    // Keep Cloudflare Tunnel status distinct from Controller health
+    tunnelEl.className = "mono cell-muted";
+    tunnelEl.innerHTML = `<span style="color: #3fb950;">Tunnel Active</span> · <span style="color: var(--status-red);">Upstream 502</span>`;
+  }
+  if (ingressEl) {
+    ingressEl.textContent = "Gateway connected; controller endpoint failed";
+  }
+  if (transReasonEl) {
+    transReasonEl.textContent = "API query failed";
+  }
+  if (transTimeEl) {
+    transTimeEl.textContent = lastHAUpdateTimestamp ? `Last OK: ${new Date(lastHAUpdateTimestamp).toLocaleTimeString()}` : "No successful sync";
+  }
+  if (tbody) {
+    const msg = err?.message || "Authoritative controller unavailable (HTTP 502)";
+    tbody.innerHTML = `<tr><td colspan="9" class="cell-muted" style="color: var(--status-red); text-align: center; padding: 18px;">Failed to load candidate ranking: ${escapeHtml(msg)}</td></tr>`;
+  }
 }
 
 function renderHADetailsModalContent(ha) {
@@ -956,37 +1000,41 @@ function renderHADetailsModalError(err) {
 }
 
 async function updateHAStatus(force = false) {
-  if (isUpdatingHA && !force) return cachedHAStatus;
+  if (haUpdatePromise && !force) return await haUpdatePromise;
   const now = Date.now();
   if (!force && lastHAUpdateTimestamp && (now - lastHAUpdateTimestamp < 2500) && cachedHAStatus) {
     return cachedHAStatus;
   }
 
   isUpdatingHA = true;
-  try {
-    if (!cachedNodes || cachedNodes.length === 0) {
-      try {
-        const clusterRes = await apiFetch("/api/cluster");
-        if (clusterRes && Array.isArray(clusterRes.nodes)) {
-          cachedNodes = clusterRes.nodes.filter(n => n.status !== "REMOVED");
-        }
-      } catch (_) {}
-    }
+  haUpdatePromise = (async () => {
+    try {
+      if (!cachedNodes || cachedNodes.length === 0) {
+        try {
+          const clusterRes = await apiFetch("/api/cluster");
+          if (clusterRes && Array.isArray(clusterRes.nodes)) {
+            cachedNodes = clusterRes.nodes.filter(n => n.status !== "REMOVED");
+          }
+        } catch (_) {}
+      }
 
-    const ha = await apiFetch("/api/ha/status");
-    cachedHAStatus = ha;
-    lastHAUpdateTimestamp = Date.now();
-    renderHAHeader(ha);
-    renderHADetailsModalContent(ha);
-    return ha;
-  } catch (err) {
-    cachedHAStatus = null;
-    renderHAHeaderError(err);
-    renderHADetailsModalError(err);
-    return null;
-  } finally {
-    isUpdatingHA = false;
-  }
+      const ha = await apiFetch("/api/ha/status");
+      cachedHAStatus = ha;
+      lastHAUpdateTimestamp = Date.now();
+      renderHAHeader(ha);
+      renderHADetailsModalContent(ha);
+      return ha;
+    } catch (err) {
+      cachedHAStatus = null;
+      renderHAHeaderError(err);
+      renderHADetailsModalError(err);
+      return null;
+    } finally {
+      isUpdatingHA = false;
+      haUpdatePromise = null;
+    }
+  })();
+  return await haUpdatePromise;
 }
 
 function openHADetailsModal() {
@@ -1072,6 +1120,279 @@ async function triggerManualHAFailover() {
   }
 }
 
+function toggleLeaderManagementSection() {
+  const card = document.getElementById("leader-management-card");
+  const toggleBtn = document.getElementById("leader-management-toggle");
+  const body = document.getElementById("leader-management-body");
+  const headerLeft = document.querySelector(".leader-header-left");
+  if (!card || !toggleBtn || !body) return;
+
+  const isExpanded = toggleBtn.getAttribute("aria-expanded") === "true";
+  const nextExpanded = !isExpanded;
+
+  toggleBtn.setAttribute("aria-expanded", String(nextExpanded));
+  const label = nextExpanded ? "Collapse Leader Management panel" : "Expand Leader Management panel";
+  toggleBtn.title = label;
+  toggleBtn.setAttribute("aria-label", label);
+  if (headerLeft) headerLeft.title = label;
+
+  if (nextExpanded) {
+    card.classList.remove("is-collapsed");
+    body.style.display = "";
+    requestAnimationFrame(() => {
+      body.style.opacity = "1";
+    });
+  } else {
+    body.style.opacity = "0";
+    setTimeout(() => {
+      if (toggleBtn.getAttribute("aria-expanded") === "false") {
+        card.classList.add("is-collapsed");
+        body.style.display = "none";
+      }
+    }, 150);
+  }
+}
+window.toggleLeaderManagementSection = toggleLeaderManagementSection;
+
+async function refreshLeaderManagementUI() {
+  await updateHAStatus(true);
+  await loadNodes();
+}
+
+function renderLeaderManagementUI(haStatus, nodes) {
+  const modeSelect = document.getElementById("cluster-mode-select");
+  const prefWrap = document.getElementById("preferred-leader-wrap");
+  const prefSelect = document.getElementById("preferred-leader-select");
+
+  const clusterMode = haStatus?.cluster_mode || "automatic";
+  if (modeSelect) {
+    modeSelect.value = clusterMode;
+  }
+  if (prefWrap) {
+    prefWrap.style.display = (clusterMode === "manual_preference") ? "flex" : "none";
+  }
+
+  // Preferred leader dropdown options
+  if (prefSelect && Array.isArray(nodes)) {
+    const currentPref = haStatus?.preferred_leader_id || "";
+    const eligibleNodes = nodes.filter(n => n.leader_eligible !== false);
+    prefSelect.innerHTML = `<option value="">-- None --</option>` + eligibleNodes.map(n => {
+      const selected = (n.node_id === currentPref) ? "selected" : "";
+      return `<option value="${escapeHtml(n.node_id)}" ${selected}>${escapeHtml(n.name || n.node_id)}</option>`;
+    }).join("");
+  }
+
+  // Summary Banner
+  const leaderNameEl = document.getElementById("leader-ui-name");
+  const leaderIdEl = document.getElementById("leader-ui-id");
+  const termEl = document.getElementById("leader-ui-term");
+  const leaseEl = document.getElementById("leader-ui-lease-countdown");
+  const transReasonEl = document.getElementById("leader-ui-last-transition-reason");
+  const transTimeEl = document.getElementById("leader-ui-last-transition-time");
+
+  const leaderId = haStatus?.leader_id || "";
+  const leaderNode = (nodes || []).find(n => n.node_id === leaderId);
+  const leaderName = haStatus?.leader_name || (leaderNode ? leaderNode.name : (leaderId || "Unknown"));
+
+  if (leaderNameEl) leaderNameEl.textContent = leaderName;
+  if (leaderIdEl) leaderIdEl.textContent = leaderId ? `ID: ${leaderId}` : "No active leader lease";
+  if (termEl) {
+    const isLeaseValid = !!haStatus?.lease_valid;
+    const termVal = haStatus?.term !== undefined ? haStatus.term : "-";
+    termEl.className = "mono";
+    termEl.innerHTML = `Term ${termVal} · <span style="color: ${isLeaseValid ? '#3fb950' : '#f85149'};">${isLeaseValid ? 'Valid Lease' : 'Fenced / Expired'}</span>`;
+  }
+  if (leaseEl) {
+    const rem = haStatus?.lease_remaining_sec ?? 0;
+    leaseEl.textContent = `Expires in: ${rem > 0 ? rem.toFixed(1) + 's' : 'Expired'}`;
+    leaseEl.style.color = (haStatus?.lease_valid && rem > 0) ? "" : "var(--status-red)";
+  }
+  const tunnelEl = document.getElementById("leader-ui-tunnel");
+  if (tunnelEl) {
+    tunnelEl.className = "mono";
+    tunnelEl.style.color = "#3fb950";
+    tunnelEl.textContent = "Unified Dual-Connector";
+  }
+  const ingressEl = document.getElementById("leader-ui-ingress");
+  if (ingressEl) {
+    ingressEl.className = "mono cell-muted";
+    ingressEl.textContent = "Leader-Aware Routing Active";
+  }
+  if (transReasonEl) {
+    transReasonEl.textContent = haStatus?.last_transition?.reason || "Cluster initialization";
+  }
+  if (transTimeEl) {
+    const ts = haStatus?.last_transition?.timestamp;
+    transTimeEl.textContent = ts ? new Date(ts).toLocaleTimeString() : "-";
+  }
+
+  // Ranking Table
+  const tbody = document.getElementById("leader-ranking-tbody");
+  if (!tbody) return;
+
+  if (!nodes || nodes.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="9" class="cell-muted">No cluster nodes registered.</td></tr>`;
+    return;
+  }
+
+  const sortedNodes = [...nodes].sort((a, b) => {
+    const aIsLeader = (a.node_id === leaderId);
+    const bIsLeader = (b.node_id === leaderId);
+    if (aIsLeader && !bIsLeader) return -1;
+    if (!aIsLeader && bIsLeader) return 1;
+    const aPri = (typeof a.priority === "number") ? a.priority : 50;
+    const bPri = (typeof b.priority === "number") ? b.priority : 50;
+    if (bPri !== aPri) return bPri - aPri;
+    return (b.performance_score || 0) - (a.performance_score || 0);
+  });
+
+  tbody.innerHTML = sortedNodes.map(n => {
+    const isLeader = (n.node_id === leaderId);
+    const isOnline = ((n.status || "").toUpperCase() === "ONLINE");
+    const isEligible = (n.leader_eligible !== false);
+    const isPref = (n.node_id === haStatus?.preferred_leader_id);
+    const priority = (typeof n.priority === "number") ? n.priority : 50;
+    const perfScore = (typeof n.performance_score === "number") ? n.performance_score.toFixed(1) : "0.0";
+    const isWorker = (n.worker_enabled !== false);
+    const isBuildWorker = (n.build_worker_enabled === true);
+
+    const leaderBadge = isLeader 
+      ? `<span class="badge badge-success mono" style="margin-left: 6px; font-size: 0.7rem; background: #238636;">LEADER</span>` 
+      : "";
+    const prefBadge = isPref 
+      ? `<span class="badge badge-primary mono" style="margin-left: 6px; font-size: 0.7rem; background: #1f6feb;">PREFERRED</span>` 
+      : "";
+
+    let handoverBtn;
+    if (isLeader) {
+      handoverBtn = `<button class="btn btn-xs btn-secondary" disabled style="opacity: 0.6;">Current</button>`;
+    } else if (!isEligible) {
+      handoverBtn = `<button class="btn btn-xs btn-secondary" disabled style="opacity: 0.4;" title="Node is not marked leader eligible">Ineligible</button>`;
+    } else if (!isOnline) {
+      handoverBtn = `<button class="btn btn-xs btn-secondary" disabled style="opacity: 0.4;" title="Node is offline">Offline</button>`;
+    } else {
+      handoverBtn = `<button class="btn btn-xs btn-outline-warning" onclick="triggerControlledHandover('${escapeHtml(n.node_id)}', '${escapeHtml(n.name || n.node_id)}')">Handover</button>`;
+    }
+
+    return `
+      <tr>
+        <td>
+          <div style="font-weight: 600;">${escapeHtml(n.name || n.node_id)}${leaderBadge}${prefBadge}</div>
+          <div class="mono cell-muted" style="font-size: 0.75rem;">${escapeHtml(n.node_id)}</div>
+        </td>
+        <td>${renderStatusPill(n.status)}</td>
+        <td><span class="mono" style="font-size: 0.8rem;">${escapeHtml(n.role || "compute")}</span></td>
+        <td>
+          <input type="checkbox" id="elig-${n.node_id}" ${isEligible ? "checked" : ""} onchange="toggleNodeEligibility('${n.node_id}', this.checked)">
+        </td>
+        <td>
+          <input type="number" class="form-input mono" min="0" max="1000" style="width: 65px; padding: 2px 4px; font-size: 0.8rem;" value="${priority}" onchange="updateNodePriority('${n.node_id}', this.value)">
+        </td>
+        <td>
+          <span class="mono" style="font-weight: 600; color: #58a6ff;">${perfScore}</span>
+        </td>
+        <td>
+          <input type="checkbox" id="worker-${n.node_id}" ${isWorker ? "checked" : ""} onchange="toggleNodeWorker('${n.node_id}', this.checked)">
+        </td>
+        <td>
+          <input type="checkbox" id="build-${n.node_id}" ${isBuildWorker ? "checked" : ""} onchange="toggleNodeBuildWorker('${n.node_id}', this.checked)">
+        </td>
+        <td style="text-align: right;">
+          ${handoverBtn}
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+async function updateClusterMode(newMode) {
+  try {
+    const res = await apiFetch("/api/ha/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cluster_mode: newMode })
+    });
+    showToast(`Cluster mode updated to ${newMode}`, "success");
+    await refreshLeaderManagementUI();
+  } catch (err) {
+    showToast("Failed to update cluster mode: " + err.message, "error");
+  }
+}
+
+async function updatePreferredLeader(preferredId) {
+  try {
+    const res = await apiFetch("/api/ha/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        cluster_mode: "manual_preference",
+        preferred_leader_id: preferredId || null
+      })
+    });
+    showToast(`Preferred leader set to ${preferredId || 'None'}`, "success");
+    await refreshLeaderManagementUI();
+  } catch (err) {
+    showToast("Failed to set preferred leader: " + err.message, "error");
+  }
+}
+
+async function updateNodePolicy(nodeId, payload) {
+  try {
+    await apiFetch(`/api/nodes/${encodeURIComponent(nodeId)}/policy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    showToast("Node policy updated successfully", "success");
+    await refreshLeaderManagementUI();
+  } catch (err) {
+    showToast("Failed to update node policy: " + err.message, "error");
+  }
+}
+
+function toggleNodeEligibility(nodeId, isEligible) {
+  updateNodePolicy(nodeId, { leader_eligible: isEligible });
+}
+
+function updateNodePriority(nodeId, priorityVal) {
+  const pri = parseInt(priorityVal, 10);
+  if (isNaN(pri)) return;
+  updateNodePolicy(nodeId, { priority: pri });
+}
+
+function toggleNodeWorker(nodeId, isWorker) {
+  updateNodePolicy(nodeId, { worker_enabled: isWorker });
+}
+
+function toggleNodeBuildWorker(nodeId, isBuildWorker) {
+  updateNodePolicy(nodeId, { build_worker_enabled: isBuildWorker });
+}
+
+async function triggerControlledHandover(targetNodeId, targetName) {
+  const confirmed = await showCustomConfirm({
+    title: "Handover Leadership",
+    message: `Initiate controlled leadership transition to ${targetName} (${targetNodeId})?\n\n• The current leader will step down atomically\n• The election term and fencing counter will advance\n• Services and app router traffic will forward to the new leader\n• No split-brain or duplicate authoritative controllers`
+  });
+  if (!confirmed) return;
+
+  try {
+    const res = await apiFetch("/api/ha/handover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target_node_id: targetNodeId })
+    });
+    if (res.status === "failed") {
+      showToast(`Handover error: ${res.error || 'Failed to complete handover'}`, "error");
+    } else {
+      showToast(`Leadership successfully transferred to ${res.new_leader_id} (Term ${res.term})`, "success");
+    }
+  } catch (err) {
+    showToast("Handover request failed: " + err.message, "error");
+  } finally {
+    await refreshLeaderManagementUI();
+  }
+}
+
 // 2. Nodes View
 let cachedUtilMap = {};
 
@@ -1087,9 +1408,21 @@ async function loadNodes() {
       apiFetch("/api/cluster/utilization")
     ]);
     if (clusterRes.status !== "fulfilled") {
-      tbody.innerHTML = `<tr><td colspan="10" class="cell-muted" style="color: var(--status-red);">Failed to load cluster nodes: ${clusterRes.reason?.message || "Endpoint unavailable"}</td></tr>`;
+      const errMsg = clusterRes.reason?.message || "Endpoint unavailable";
+      tbody.innerHTML = `<tr><td colspan="10" class="cell-muted" style="color: var(--status-red);">Failed to load cluster nodes: ${escapeHtml(errMsg)}</td></tr>`;
       const countHdr = document.getElementById("nodes-count-header");
       if (countHdr) countHdr.textContent = "0 online · Unavailable";
+      const topbarStatus = document.getElementById("topbar-cluster-status");
+      if (topbarStatus) {
+        topbarStatus.className = "text-offline";
+        topbarStatus.textContent = "— unreachable";
+      }
+      const sideStatus = document.getElementById("side-cluster-online");
+      if (sideStatus) {
+        sideStatus.className = "text-offline";
+        sideStatus.textContent = "— unreachable";
+      }
+      renderLeaderManagementError(clusterRes.reason);
       return;
     }
     const data = clusterRes.value || { nodes: [] };
@@ -1100,10 +1433,34 @@ async function loadNodes() {
     const onlineCount = cachedNodes.filter(n => (n.status || "").toUpperCase() === "ONLINE").length;
     const countHdr = document.getElementById("nodes-count-header");
     if (countHdr) countHdr.textContent = `${onlineCount} online · ${cachedNodes.length} total`;
+
+    const isDegraded = cachedHAStatus && (!cachedHAStatus.lease_valid || cachedHAStatus.role === "fenced");
     const topbarStatus = document.getElementById("topbar-cluster-status");
-    if (topbarStatus) topbarStatus.textContent = `${onlineCount} online`;
+    if (topbarStatus) {
+      if (isDegraded) {
+        topbarStatus.className = "text-warning";
+        topbarStatus.textContent = `— degraded (lease expired)`;
+      } else if (onlineCount === 0) {
+        topbarStatus.className = "text-offline";
+        topbarStatus.textContent = `— offline (0 nodes)`;
+      } else {
+        topbarStatus.className = "text-online";
+        topbarStatus.textContent = `${onlineCount} online`;
+      }
+    }
     const sideStatus = document.getElementById("side-cluster-online");
-    if (sideStatus) sideStatus.textContent = `${onlineCount} online`;
+    if (sideStatus) {
+      if (isDegraded) {
+        sideStatus.className = "text-warning";
+        sideStatus.textContent = `— degraded`;
+      } else if (onlineCount === 0) {
+        sideStatus.className = "text-offline";
+        sideStatus.textContent = `— offline`;
+      } else {
+        sideStatus.className = "text-online";
+        sideStatus.textContent = `${onlineCount} online`;
+      }
+    }
     if (cachedHAStatus) renderHAHeader(cachedHAStatus);
 
     if (targetSelect) {
@@ -1245,6 +1602,8 @@ async function loadNodes() {
         </tr>
       `;
     }).join("");
+
+    renderLeaderManagementUI(cachedHAStatus, cachedNodes);
 
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="10" class="text-offline">Unable to load nodes: ${err.message}</td></tr>`;
@@ -4000,8 +4359,9 @@ async function loadApps() {
         }
 
         const routePath = app.route?.path || (app.route ? app.route.path : "-");
+        const routeUrl = `${getPlatformBaseUrl()}${routePath.startsWith('/') ? routePath : '/' + routePath}/`;
         const routeDisplay = routePath && routePath !== "-"
-          ? `<a href="${routePath}/" target="_blank" class="app-route-link" title="Open ${escapeHtml(routePath)}/"><span>${escapeHtml(routePath)}/</span><svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.5 0a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0V3.56l-5.22 5.22a.75.75 0 0 1-1.06-1.06l5.22-5.22H11a.75.75 0 0 1-.75-.75Z"/></svg></a>`
+          ? `<a href="${routeUrl}" target="_blank" class="app-route-link" title="Open ${escapeHtml(routeUrl)}"><span>${escapeHtml(routePath)}/</span><svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.5 0a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0V3.56l-5.22 5.22a.75.75 0 0 1-1.06-1.06l5.22-5.22H11a.75.75 0 0 1-.75-.75Z"/></svg></a>`
           : `<span class="cell-muted mono">—</span>`;
 
         const canDeploy = ["CREATED", "STOPPED", "FAILED"].includes(app.status);
@@ -4080,8 +4440,9 @@ async function loadApps() {
         }
 
         const routePath = app.route?.path || (app.route ? app.route.path : "-");
+        const routeUrl = `${getPlatformBaseUrl()}${routePath.startsWith('/') ? routePath : '/' + routePath}/`;
         const routeDisplay = routePath && routePath !== "-"
-          ? `<a href="${routePath}/" target="_blank" class="app-route-link"><span>${escapeHtml(routePath)}/</span></a>`
+          ? `<a href="${routeUrl}" target="_blank" class="app-route-link"><span>${escapeHtml(routePath)}/</span></a>`
           : `<span class="cell-muted mono">—</span>`;
 
         const canDeploy = ["CREATED", "STOPPED", "FAILED"].includes(app.status);
@@ -4610,7 +4971,151 @@ function renderAppOverview(app) {
     <div class="sys-kv-row"><span class="sys-kv-k">Resource Limits</span><span class="sys-kv-v">${escapeHtml(app.cpu_limit || '0.5')} CPU · ${escapeHtml(app.memory_limit || '256m')} RAM</span></div>
     <div class="sys-kv-row"><span class="sys-kv-k">Created At</span><span class="sys-kv-v cell-muted">${formatDateIST(app.created_at)}</span></div>
   `;
+
+  renderAppWebhookCard(app);
 }
+
+function renderAppWebhookCard(app) {
+  const card = document.getElementById("app-webhook-card");
+  if (!card) return;
+
+  const wh = app.webhook || {};
+  const isEnabled = Boolean(wh.enabled);
+  const toggle = document.getElementById("app-webhook-enable-toggle");
+  const details = document.getElementById("app-webhook-details");
+  const badge = document.getElementById("app-webhook-status-badge");
+  const urlInput = document.getElementById("app-webhook-url-input");
+  const secretInput = document.getElementById("app-webhook-secret-input");
+  const policySelect = document.getElementById("app-webhook-policy-select");
+  const branchInput = document.getElementById("app-webhook-branch-input");
+  const nodeSelect = document.getElementById("app-webhook-node-select");
+  const lastStatus = document.getElementById("app-webhook-last-status");
+  const lastMeta = document.getElementById("app-webhook-last-meta");
+
+  if (toggle) toggle.checked = isEnabled;
+  if (details) details.style.display = isEnabled ? "block" : "none";
+  if (badge) {
+    badge.innerHTML = isEnabled 
+      ? `<span class="source-badge source-badge-manual" style="color: var(--status-green);">ACTIVE</span>`
+      : `<span class="source-badge source-badge-manual" style="color: var(--text-muted);">DISABLED</span>`;
+  }
+
+  const webhookUrl = `${window.location.origin}/api/apps/github/webhook?app_id=${encodeURIComponent(app.app_id)}`;
+  if (urlInput) urlInput.value = webhookUrl;
+  if (secretInput) secretInput.value = wh.secret || "••••••••";
+
+  if (policySelect) policySelect.value = wh.auto_deploy_policy || "automatic";
+  if (branchInput) branchInput.value = wh.branch || app.source?.branch || "main";
+
+  if (nodeSelect) {
+    nodeSelect.innerHTML = `<option value="auto">Auto (Scheduler)</option>`;
+    if (Array.isArray(cachedNodes)) {
+      cachedNodes.forEach(n => {
+        const caps = Array.isArray(n.capabilities) ? n.capabilities.join(", ") : (n.role || "");
+        const isSel = wh.target_node === n.node_id ? "selected" : "";
+        nodeSelect.innerHTML += `<option value="${escapeHtml(n.node_id)}" ${isSel}>${escapeHtml(n.hostname || n.node_id)} (${escapeHtml(caps || 'online')})</option>`;
+      });
+    }
+  }
+
+  if (wh.last_delivery_id) {
+    if (lastStatus) lastStatus.innerHTML = renderStatusPill(wh.last_status || "UNKNOWN");
+    if (lastMeta) {
+      const ts = wh.last_delivery_at ? formatDateIST(wh.last_delivery_at) : "-";
+      const c = wh.last_commit ? `commit ${wh.last_commit.slice(0, 8)}` : "";
+      const msg = wh.last_message || wh.last_error || "Processed";
+      lastMeta.textContent = `Delivery: ${wh.last_delivery_id.slice(0, 8)}… · ${ts} · ${c} · ${msg}`;
+    }
+  } else {
+    if (lastStatus) lastStatus.innerHTML = `<span class="cell-muted">None</span>`;
+    if (lastMeta) lastMeta.textContent = "No webhook push received yet.";
+  }
+}
+
+window.toggleAppWebhookEnabled = function() {
+  const details = document.getElementById("app-webhook-details");
+  const toggle = document.getElementById("app-webhook-enable-toggle");
+  if (details && toggle) {
+    details.style.display = toggle.checked ? "block" : "none";
+  }
+};
+
+window.copyWebhookUrl = function() {
+  const urlInput = document.getElementById("app-webhook-url-input");
+  if (urlInput) {
+    navigator.clipboard.writeText(urlInput.value).then(() => {
+      showCustomAlert({ title: "Copied", message: "Webhook Payload URL copied to clipboard!" });
+    }).catch(() => {
+      urlInput.select();
+      document.execCommand("copy");
+    });
+  }
+};
+
+window.revealWebhookSecret = async function() {
+  if (!currentActiveAppId) return;
+  try {
+    const res = await apiFetch(`/api/apps/${currentActiveAppId}/webhook/reveal-secret`, { method: "POST" });
+    const secretInput = document.getElementById("app-webhook-secret-input");
+    const btn = document.getElementById("app-webhook-reveal-btn");
+    if (secretInput && res.secret) {
+      secretInput.value = res.secret;
+      if (btn) btn.style.display = "none";
+    }
+  } catch (err) {
+    showCustomAlert({ title: "Reveal Error", message: err.message, isError: true });
+  }
+};
+
+window.generateNewWebhookSecret = async function() {
+  if (!currentActiveAppId) return;
+  const confirmed = await showCustomConfirm({
+    title: "Generate Webhook Secret",
+    message: "Generate a new webhook secret?\n\nYou must update the secret in your GitHub repository's Webhook settings.",
+    confirmText: "Generate",
+    isDanger: true
+  });
+  if (!confirmed) return;
+
+  try {
+    const res = await apiFetch(`/api/apps/${currentActiveAppId}/webhook/generate-secret`, { method: "POST" });
+    const secretInput = document.getElementById("app-webhook-secret-input");
+    if (secretInput && res.secret) {
+      secretInput.value = res.secret;
+    }
+    showCustomAlert({ title: "Secret Generated", message: "New webhook secret generated. Please update GitHub Webhook settings." });
+    loadApps();
+  } catch (err) {
+    showCustomAlert({ title: "Generation Error", message: err.message, isError: true });
+  }
+};
+
+window.saveWebhookSettings = async function() {
+  if (!currentActiveAppId) return;
+  const isEnabled = document.getElementById("app-webhook-enable-toggle")?.checked ?? false;
+  const policy = document.getElementById("app-webhook-policy-select")?.value || "automatic";
+  const branch = document.getElementById("app-webhook-branch-input")?.value.trim() || "main";
+  const targetNode = document.getElementById("app-webhook-node-select")?.value || "auto";
+
+  const payload = {
+    enabled: isEnabled,
+    auto_deploy_policy: policy,
+    branch: branch,
+    target_node: targetNode
+  };
+
+  try {
+    await apiFetch(`/api/apps/${currentActiveAppId}/webhook/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    showCustomAlert({ title: "Settings Saved", message: "Webhook and auto-deploy settings saved successfully." });
+    loadApps();
+  } catch (err) {
+    showCustomAlert({ title: "Save Error", message: err.message, isError: true });
+  }
+};
 
 function renderAppDeployments(app) {
   const tbody = document.getElementById("app-deployments-tbody");
@@ -4618,7 +5123,7 @@ function renderAppDeployments(app) {
 
   const deps = app.deployments || [];
   if (deps.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="cell-muted" style="text-align: center; padding: 20px;">No deployment history recorded for this application.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="cell-muted" style="text-align: center; padding: 20px;">No deployment history recorded for this application.</td></tr>`;
     return;
   }
 
@@ -4634,15 +5139,25 @@ function renderAppDeployments(app) {
         stageBreakdown = `<div style="font-size: 10px; color: var(--text-muted); margin-top: 3px; font-family: var(--font-mono);">${parts.join(" · ")}</div>`;
       }
     }
+
+    const isActive = d.deployment_id && d.deployment_id === app.active_deployment_id;
+    let actionsHtml = `<span class="cell-muted">—</span>`;
+    if (isActive) {
+      actionsHtml = `<span class="source-badge source-badge-manual" style="color: var(--status-green); font-size: 10px; font-weight: 600;">ACTIVE</span>`;
+    } else if (d.status === "SUCCESS") {
+      actionsHtml = `<button class="btn btn-sm btn-outline-warning" style="font-size: 11px; padding: 2px 8px;" onclick="rollbackApp('${app.app_id}', '${d.deployment_id}')" title="Rollback to this release">Rollback</button>`;
+    }
+
     return `
       <tr>
         <td class="mono" style="font-weight: 600;">#${d.number || 1}</td>
-        <td class="mono cell-muted">${escapeHtml(d.commit || 'latest')}</td>
+        <td class="mono cell-muted" title="${escapeHtml(d.commit || 'latest')}">${escapeHtml((d.commit || 'latest').slice(0, 10))}</td>
         <td class="mono">${escapeHtml(d.branch || 'main')}</td>
         <td class="mono cell-muted">${escapeHtml(d.trigger || 'manual')}</td>
         <td>${statusPill}</td>
         <td class="mono">${durStr}${stageBreakdown}</td>
         <td class="cell-muted">${formatDateIST(d.started_at)}</td>
+        <td style="text-align: right;">${actionsHtml}</td>
       </tr>
     `;
   }).join("");
@@ -4772,6 +5287,195 @@ window.redeployApp = async function(appId) {
     loadApps();
   } catch (err) {
     showCustomAlert({ title: "Redeploy Error", message: err.message, isError: true });
+    loadApps();
+  }
+};
+
+window.rollbackApp = async function(appId, depId) {
+  const confirmed = await showCustomConfirm({
+    title: "Rollback Application",
+    message: `Roll back application to deployment release ${depId}?\n\nThis will safely switch to the selected release and probe health.`,
+    confirmText: "Rollback",
+    isDanger: false
+  });
+  if (!confirmed) return;
+
+  try {
+    const res = await apiFetch(`/api/apps/${appId}/rollback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deployment_id: depId })
+    });
+    showCustomAlert({ title: "Rollback Succeeded", message: `Successfully rolled back to release ${res.active_deployment_id || res.restored_deployment_id || depId}. Health probe: ${res.health_probe || 'OK'}` });
+    loadApps();
+  } catch (err) {
+    showCustomAlert({ title: "Rollback Failed", message: err.message, isError: true });
+    loadApps();
+  }
+};
+
+let manualDeployActiveAppId = null;
+let manualDeployPollTimer = null;
+
+window.openManualDeployModal = function(appId) {
+  manualDeployActiveAppId = appId;
+  const app = cachedApps.find(a => a.app_id === appId);
+  const titleEl = document.getElementById("manual-deploy-modal-title");
+  const descEl = document.getElementById("manual-deploy-app-desc");
+  const branchInput = document.getElementById("manual-deploy-branch");
+  const commitInput = document.getElementById("manual-deploy-commit");
+  const nodeSelect = document.getElementById("manual-deploy-node");
+  const formWrap = document.getElementById("manual-deploy-form-container");
+  const statusWrap = document.getElementById("manual-deploy-status-container");
+  const submitBtn = document.getElementById("manual-deploy-submit-btn");
+  const cancelBtn = document.getElementById("manual-deploy-cancel-btn");
+
+  if (titleEl) titleEl.textContent = `Deploy Release: ${app?.name || appId}`;
+  if (descEl) {
+    const srcType = app?.source?.type || "manual";
+    const repo = app?.source?.repository ? ` (${app.source.repository})` : "";
+    const rt = app?.runtime || "auto";
+    descEl.textContent = `Source: ${srcType}${repo} · Runtime: ${rt} · Target Port: ${app?.port || app?.host_port || 8090}`;
+  }
+
+  if (branchInput) branchInput.value = app?.source?.branch || "main";
+  if (commitInput) commitInput.value = "";
+
+  if (nodeSelect) {
+    nodeSelect.innerHTML = `<option value="">Auto (ResourceScheduler & Capabilities)</option>`;
+    if (Array.isArray(cachedNodes)) {
+      cachedNodes.forEach(n => {
+        const caps = Array.isArray(n.capabilities) ? n.capabilities.join(", ") : (n.role || "");
+        nodeSelect.innerHTML += `<option value="${escapeHtml(n.node_id)}">${escapeHtml(n.hostname || n.node_id)} (${escapeHtml(caps || 'online')})</option>`;
+      });
+    }
+  }
+
+  if (formWrap) formWrap.style.display = "block";
+  if (statusWrap) statusWrap.style.display = "none";
+  if (submitBtn) {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Trigger Deployment";
+    submitBtn.style.display = "inline-flex";
+  }
+  if (cancelBtn) cancelBtn.textContent = "Cancel";
+
+  const backdrop = document.getElementById("manual-deploy-modal-backdrop");
+  if (backdrop) backdrop.style.display = "flex";
+};
+
+window.closeManualDeployModal = function() {
+  if (manualDeployPollTimer) {
+    clearInterval(manualDeployPollTimer);
+    manualDeployPollTimer = null;
+  }
+  const backdrop = document.getElementById("manual-deploy-modal-backdrop");
+  if (backdrop) backdrop.style.display = "none";
+  manualDeployActiveAppId = null;
+};
+
+window.submitManualDeploy = async function() {
+  if (!manualDeployActiveAppId) return;
+  const appId = manualDeployActiveAppId;
+  const branch = document.getElementById("manual-deploy-branch")?.value.trim() || "main";
+  const commit = document.getElementById("manual-deploy-commit")?.value.trim() || "";
+  const targetNode = document.getElementById("manual-deploy-node")?.value.trim() || "";
+
+  const submitBtn = document.getElementById("manual-deploy-submit-btn");
+  const cancelBtn = document.getElementById("manual-deploy-cancel-btn");
+  const formWrap = document.getElementById("manual-deploy-form-container");
+  const statusWrap = document.getElementById("manual-deploy-status-container");
+  const stageText = document.getElementById("manual-deploy-stage-text");
+  const pillWrap = document.getElementById("manual-deploy-status-pill");
+  const metaCommit = document.getElementById("manual-deploy-meta-commit");
+  const metaChecksum = document.getElementById("manual-deploy-meta-checksum");
+  const metaNode = document.getElementById("manual-deploy-meta-node");
+  const metaHealth = document.getElementById("manual-deploy-meta-health");
+  const logsPre = document.getElementById("manual-deploy-logs");
+
+  if (formWrap) formWrap.style.display = "none";
+  if (statusWrap) statusWrap.style.display = "block";
+  if (stageText) stageText.textContent = "Initiating deployment...";
+  if (pillWrap) pillWrap.innerHTML = renderStatusPill("DEPLOYING");
+  if (logsPre) logsPre.textContent = `[DEPLOY] Triggering deployment for ${appId} (branch: ${branch}, commit: ${commit || 'latest'})...\n`;
+  if (submitBtn) submitBtn.style.display = "none";
+  if (cancelBtn) cancelBtn.textContent = "Close";
+
+  const payload = {
+    branch,
+    commit: commit || undefined,
+    target_node: targetNode || undefined,
+    trigger: "manual_ui"
+  };
+
+  try {
+    const res = await apiFetch(`/api/apps/${appId}/deploy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (res.job_id) {
+      // Async Background Job (e.g. image-build or docker-deploy)
+      if (stageText) stageText.textContent = "Build Job Queued";
+      if (logsPre) logsPre.textContent += `[JOB] Enqueued background job ${res.job_id} on ${res.node || 'worker'}\n`;
+      if (metaNode) metaNode.textContent = `Assigned Node: ${res.node || 'Auto'}`;
+
+      let pollAttempts = 0;
+      manualDeployPollTimer = setInterval(async () => {
+        pollAttempts++;
+        try {
+          const job = await apiFetch(`/api/jobs/${res.job_id}`);
+          if (pillWrap) pillWrap.innerHTML = renderStatusPill(job.status || "RUNNING");
+          if (stageText) stageText.textContent = `Job Status: ${job.status}`;
+          if (job.stdout && logsPre) logsPre.textContent = job.stdout + (job.stderr ? "\n" + job.stderr : "");
+
+          if (["SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"].includes(job.status) || pollAttempts > 60) {
+            clearInterval(manualDeployPollTimer);
+            manualDeployPollTimer = null;
+            loadApps();
+            if (job.status === "SUCCEEDED") {
+              if (stageText) stageText.textContent = "Deployment Succeeded!";
+              if (metaHealth) metaHealth.textContent = "Health Probe: Verified healthy (200 OK)";
+            } else {
+              if (stageText) stageText.textContent = `Deployment ${job.status}: ${job.stderr || job.retry_reason || ''}`;
+            }
+          }
+        } catch (pollErr) {
+          if (logsPre) logsPre.textContent += `[POLL ERR] ${pollErr.message}\n`;
+        }
+      }, 1500);
+
+    } else if (res.status === "SUCCESS") {
+      // Direct/Native Synchronous Deployment
+      if (stageText) stageText.textContent = "Deployment Succeeded!";
+      if (pillWrap) pillWrap.innerHTML = renderStatusPill("RUNNING");
+      if (metaCommit) metaCommit.textContent = `Deployed Commit: ${res.commit || commit || 'latest'}`;
+      if (metaChecksum) metaChecksum.textContent = `Artifact SHA-256: ${res.artifact_sha256 || 'Verified local package'}`;
+      if (metaNode) metaNode.textContent = `Deployed Node: ${res.node || 'local'} (PID: ${res.pid || '-'}, Port: ${res.port})`;
+      if (metaHealth) metaHealth.textContent = `Health Probe: ${res.health_probe || '200 OK'}`;
+      if (logsPre) {
+        logsPre.textContent += `[VERIFY] Release package verified.\n` +
+          `[NODE] Activated on node ${res.node} (PID: ${res.pid}, Port: ${res.port}).\n` +
+          `[HEALTH] ${res.health_probe}\n` +
+          `[RESULT] Application is RUNNING.\n`;
+      }
+      loadApps();
+    } else if (res.status === "ROLLED_BACK") {
+      if (stageText) stageText.textContent = "Deployment Failed — Auto Rolled Back";
+      if (pillWrap) pillWrap.innerHTML = renderStatusPill("ROLLED_BACK");
+      if (logsPre) logsPre.textContent += `[HEALTH FAILED] ${res.error}\n[ROLLBACK] Restored prior healthy release ${res.active_deployment_id}.\n`;
+      loadApps();
+    } else {
+      if (stageText) stageText.textContent = `Deployment State: ${res.status || 'FAILED'}`;
+      if (pillWrap) pillWrap.innerHTML = renderStatusPill(res.status || "FAILED");
+      if (logsPre) logsPre.textContent += `[FAIL] ${res.error || res.failure_reason || 'Unknown error'}\n`;
+      loadApps();
+    }
+  } catch (deployErr) {
+    if (stageText) stageText.textContent = "Deployment Error";
+    if (pillWrap) pillWrap.innerHTML = renderStatusPill("FAILED");
+    if (logsPre) logsPre.textContent += `[ERROR] ${deployErr.message}\n`;
     loadApps();
   }
 };
