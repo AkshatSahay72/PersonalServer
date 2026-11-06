@@ -4,207 +4,163 @@
 
 ---
 
-## 1. Highlights
+## 1. What is PersonalServer?
 
-* 👑 **High Availability (HA) & Master Failover**: Self-contained, zero-dependency consensus with leader leases, term tracking, continuous state sync, and transparent worker/client failover when a master goes down.
-* ⚡ **1-Command Zero-Touch Onboarding**: Add any Android phone (via Termux), Raspberry Pi, or Linux machine to your cluster in seconds using short-lived, single-use pairing codes (`PS-XXXX-XXXX`) with automated hardware discovery.
-* 📊 **Rich Device Telemetry**: Real-time cross-platform inspection of battery percentage, charging state, WiFi/Cellular signal strength (dBm), link speed, CPU temperature, and thermal throttling.
-* 🐳 **Decoupled OCI Container Platform**: 8-stage image build, tagging with immutable `sha256:...` digests, architecture normalization (`arm64`/`amd64`), and sandboxed execution without exposing Docker sockets.
-* 📦 **Multi-Node Decentralized Storage**: Browse, upload, download, and organize files across multiple physical storage nodes with sandboxed paths and strict path-traversal defenses.
-* 🔄 **Reliable Workload Execution & Scheduling**: Resource-aware job placement, automatic lease-based failure recovery, and retries.
-* 🖥️ **Technical Operations Console**: Compact, information-dense server administration interface accessible over HTTPS via Cloudflare Zero Trust without exposing internal ports.
-* 🔒 **Private WireGuard Mesh**: All inter-node coordination, heartbeats, SSH administration (`:8022`), and Node APIs (`:8080`) run over a private Tailscale network.
+PersonalServer is a lightweight, zero-runtime-dependency distributed computing platform. It unites heterogeneous personal hardware—such as Android phones running Termux, Raspberry Pis, Linux boxes, and Windows development PCs—into a resilient personal compute cluster.
+
+The core controller, agent, consensus engine, and storage subsystems run exclusively on the **Python 3.9+ standard library** without requiring external databases, message brokers, or heavy container orchestrators.
 
 ---
 
-## 2. Architecture Overview
+## 2. What Can It Currently Do?
 
-```text
-+─────────────────────────────────────────────────────────────────────────────+
-|                                PUBLIC ACCESS                                |
-+─────────────────────────────────────────────────────────────────────────────+
-                                       │
-                                       ▼ (HTTPS Ingress)
-                      +─────────────────────────────────+
-                      |     Cloudflare Zero Trust       |
-                      +─────────────────────────────────+
-                                       │
-                                       ▼ (http://127.0.0.1:8080 or :8088)
-+─────────────────────────────────────────────────────────────────────────────+
-|                        ACTIVE CONTROLLER / MASTER NODE                      |
-|                                                                             |
-|   +───────────────────────────────────+   +─────────────────────────────+   |
-|   |   Node API & Web Operations UI    |   |     Cluster Controller      |   |
-|   |  - Real-time Cluster Summary      |   |  - Node Inventory & Health  |   |
-|   |  - Rich Telemetry (Battery/WiFi)  |   |  - Resource Scheduler       |   |
-|   |  - Workload Job Management        |   |  - Lease Sweeper            |   |
-|   |  - Storage Explorer (Multi-Node)  |   |  - Onboarding Store         |   |
-|   |  - HA Master Status & Failover    |   |  - App Registry & Deployer  |   |
-|   +───────────────────────────────────+   +──────────────┬──────────────+   |
-|                                                          │                  |
-|   +───────────────────────────────────+                  │                  |
-|   |     High Availability Manager     |◄─────────────────┘                  |
-|   |  - Leader Lease & Term Consensus  |                                     |
-|   |  - State Versioning & Snapshots   |                                     |
-|   +─────────────────┬─────────────────+                                     |
-+─────────────────────┼───────────────────────────────────────────────────────+
-                      │ Heartbeats, Sync & WireGuard Tailscale Mesh
-       ┌──────────────┴───────────────────────────────┐
-       ▼                                              ▼
-+─────────────────────────────────────────+  +────────────────────────────────+
-|        HOT STANDBY CONTROLLER           |  |       APPLICATION ROUTER       |
-|  - Passive Liveness Monitor             |  |  router/app_router.py (:8088)  |
-|  - Synchronized State (nodes/jobs/apps) |  |  - Dynamic Path-Based Routing  |
-|  - Auto-Election upon Master Crash      |  |  - SSRF & Traversal Defenses   |
-|  - Seamless Worker & Client Failover    |  |  - Container Reverse Proxy     |
-+─────────────────────────────────────────+  +────────────────────────────────+
-       │
-       ▼ WireGuard Tailscale Mesh (:8000, :8022, :8080)
-+─────────────────────────────────────────────────────────────────────────────+
-|                     HETEROGENEOUS WORKER / STORAGE NODES                    |
-|                                                                             |
-|   +─────────────────────────────────+     +─────────────────────────────+   |
-|   |     Node 01: Android (Termux)   |     |    Node 02: Raspberry Pi    |   |
-|   |  - Node Agent & Supervisor      |     |  - Docker Container Runtime |   |
-|   |  - Rich Telemetry Engine        |     |  - Multi-Arch OCI Images    |   |
-|   |    (Battery, WiFi dBm, Thermal) |     |  - High-Capacity Storage    |   |
-|   |  - Sandboxed Job Executor       |     |  - Node Agent & Worker      |   |
-|   |  - Sandboxed File Storage       |     |  - SSH Administration       |   |
-|   +─────────────────────────────────+     +─────────────────────────────+   |
-+─────────────────────────────────────────────────────────────────────────────+
-```
+* 👑 **Active-Standby High Availability (HA)**: Self-contained leader lease consensus, term tracking, state sync, and transparent worker/client failover when a master node goes down.
+* ⚡ **1-Command Zero-Touch Onboarding**: Add any Android phone (via Termux), Raspberry Pi, or Linux machine in seconds using short-lived, single-use pairing codes (`PS-XXXX-XXXX`) with automated hardware discovery.
+* 📊 **Rich Device Telemetry**: Real-time cross-platform monitoring of battery percentage, charging state, WiFi/Cellular signal strength (dBm), link speed, CPU temperature, and thermal throttling.
+* 🔄 **Reliable Workload Execution & DAG Workflows**: Resource-aware job placement, automatic lease-based failure recovery, retries, and multi-step directed acyclic graph (DAG) workflow scheduling.
+* 📦 **Cross-Worker Artifact Exchange**: Upload, verify (SHA-256), and exchange files and build bundles between workers and the controller.
+* 🐳 **Decoupled OCI Container Platform**: Image build pipeline, tagging with immutable `sha256:...` digests, architecture normalization (`arm64`/`amd64`), and sandboxed execution on container-capable nodes.
+* 🌐 **Dynamic Application Routing**: Integrated reverse proxy (`:8088`) providing path-based routing to containerized applications with traversal defenses.
+* 🖥️ **Technical Operations Console**: Information-dense web dashboard (`:8080`) providing real-time cluster health, node statuses, job queues, workflows, and multi-node storage exploration.
+* 🔒 **Private WireGuard Mesh**: All inter-node coordination, heartbeats, SSH administration, and Node APIs run over a private Tailscale network.
 
 ---
 
-## 3. Platform Capability & Support Matrix
+## 3. Supported Hardware & Operating Systems
 
-PersonalServer is designed to run across diverse, asymmetric compute nodes without requiring root privileges or uniform hardware.
+PersonalServer is designed to run across diverse, asymmetric compute nodes without requiring root privileges or uniform hardware:
 
-| Platform / Environment | Tested Role(s) | Python Workloads | Docker Containers | Storage Service | Telemetry Engine | Verification Status |
+| Platform / Environment | Tested Role(s) | Python Workloads | Containers | Storage Service | Telemetry Engine | Verification Status |
 |---|---|---|---|---|---|---|
-| **Android / Termux** (unrooted) | Worker, Controller | ✅ Native Python 3.9+ | ❌ Kernel cgroup restricted | ✅ Sandboxed | ✅ Battery, WiFi dBm, thermals | Verified on physical hardware (Vivo Y31, Realme 5 Pro) |
-| **Linux (Debian / Ubuntu / x86_64 / aarch64)** | Worker, Controller, Standby | ✅ Native Python 3.9+ | ✅ Native Docker / udocker | ✅ Sandboxed | ✅ System `/proc` & `sysfs` | Verified in CI (Ubuntu-latest) & multi-node simulator |
+| **Android / Termux** (unrooted) | Worker, Controller, Standby | ✅ Native Python 3.9+ | ❌ Kernel cgroup restricted | ✅ Sandboxed | ✅ Battery, WiFi dBm, thermals | Verified on physical hardware (Vivo Y31, Realme 5 Pro) |
+| **Linux (Debian / Ubuntu / x86_64 / aarch64)** | Worker, Controller, Standby | ✅ Native Python 3.9+ | ✅ Native Docker / udocker | ✅ Sandboxed | ✅ System `/proc` & `sysfs` | Verified in CI & multi-node simulator |
 | **Raspberry Pi OS (arm64 / armhf)** | Worker, Storage | ✅ Native Python 3.9+ | ✅ Docker engine | ✅ Sandboxed | ✅ `vcgencmd` & thermal sysfs | Architecture normalization verified in test suites |
-| **Windows 10/11 (Development PC)** | Dev Controller, Local Worker | ✅ Native via `LocalWorker` | ⚠️ Docker Desktop required | ✅ Sandboxed | ✅ Win32 GlobalMemoryStatusEx | Verified in CI (windows-latest) & `test_local_worker.py` |
+| **Windows 10/11 (Development PC)** | On-Demand Build Worker | ✅ Native via `LocalWorker` | ⚠️ Docker Desktop (when running) | ❌ Excluded (Ephemeral workspace) | ✅ Win32 GlobalMemoryStatusEx | Verified on Windows 11 host & unit test suite |
 
 > [!NOTE]
-> When a node lacks Docker capabilities (such as unrooted Android/Termux), PersonalServer advertises `container_runtime:docker: false`. The resource-aware scheduler routes container tasks only to nodes with verified Docker capability, and workers reject unsupported container jobs with clear status errors rather than crashing.
+> The Windows PC operates as an optional **on-demand build worker**, not an always-on server. When the laptop is offline, jobs requiring the `build` capability remain safely queued on the controller and are not scheduled onto phone nodes. When started via `ps-worker run` or `python agent/local_worker.py run`, the worker processes pending build jobs, uploads artifacts, and shuts down safely.
 
 ---
 
-## 4. Repository Structure & Directory Catalog
+## 4. Prerequisites
 
-```text
-PersonalServer/
-├── agent/                  # Node agent daemon, LocalWorker, and sandboxed JobExecutor
-├── common/                 # Shared, dependency-free utilities (time, crypto, arch, storage)
-├── config/                 # Centralized configuration, HA consensus manager, telemetry
-│   ├── platform.yaml       # Platform public hostnames, routing domain, scheme
-│   ├── node.example.json   # Template node identity and capability configuration
-│   └── secrets/            # Local node tokens and secrets (strictly git-ignored)
-├── controller/             # Master Controller HTTP service, scheduler, and API routes
-│   └── stores/             # Atomic JSON persistence stores (nodes, jobs, apps, onboarding)
-├── docs/                   # Architectural guides, operational runbooks, and threat models
-├── install/                # Hardware detection (`detect.sh`) and Termux setup (`termux.sh`)
-├── router/                 # Application reverse proxy and path-based router (:8088)
-├── scheduler/              # Constraint-based and resource-aware workload scheduler
-├── scripts/                # Canonical service management scripts and test runner CLI
-├── scratch/                # Development-only live hardware diagnostic scripts (non-CI)
-├── services/node-api/      # Node API web service and Web Operations Console dashboard
-├── storage/                # Node application sandbox storage and OCI image cache
-└── tests/                  # Deterministic offline unit and integration test suites
+### Core Runtime Prerequisites
+- **Python 3.9+** (Standard library only; zero third-party packages required for core services).
+- **Git** (for code checkout).
+
+### Optional / Feature-Specific Prerequisites
+- **Tailscale**: Recommended for seamless private WireGuard mesh networking between mobile/edge nodes.
+- **Docker / udocker**: Required only if you intend to run OCI container workloads on Linux or Raspberry Pi nodes.
+- **Cloudflare Zero Trust / Cloudflared**: Required only if you want public HTTPS ingress without opening firewall ports.
+- **Development & Testing**: `pip install -r requirements-dev.txt` (only needed for developer linting and test coverage tooling).
+
+---
+
+## 5. Installation and Getting Started
+
+### Step 1: Clone the Repository
+```bash
+git clone https://github.com/AkshatSahay72/PersonalServer.git
+cd PersonalServer
 ```
 
+### Step 2: Configure Environment and Secrets
+```bash
+# Copy environment configuration
+cp .env.example .env
+
+# Create secrets directory and set enrollment token
+mkdir -p config/secrets
+cp config/secrets/enrollment.token.example config/secrets/enrollment.token
+```
+
+### Step 3: Start Services
+
+#### On Linux or Android (Termux):
+```bash
+# Start Controller and Web Operations Console
+bash scripts/start.sh
+
+# Check service status
+bash scripts/status.sh
+```
+
+#### On Windows:
+```powershell
+# Start Controller in the foreground or background
+python controller/controller.py start
+
+# Verify cluster status
+python controller/controller.py nodes
+```
+
+Expected Result:
+- Controller HTTP API starts listening on port `8000` (e.g., `http://127.0.0.1:8000`).
+- Web Operations Console starts listening on port `8080` (e.g., `http://127.0.0.1:8080`).
+
 ---
 
-## 5. Canonical Service Management & Startup
+## 6. Accessing the Dashboard
 
-PersonalServer uses standardized shell scripts on Linux and Termux, and direct Python commands on Windows:
+Once the services are running, the Web Operations Console can be accessed via:
 
-| Lifecycle Action | Canonical Shell Command (Linux / Termux) | Native Windows Command |
+* **Local Network / Host Access**:
+  Open your web browser and navigate to:
+  ```text
+  http://localhost:8080
+  ```
+  *(Or replace `localhost` with your node's LAN or Tailscale IP address, e.g., `http://100.85.108.5:8080`)*
+
+* **Public Ingress (if configured via Cloudflare Tunnel)**:
+  ```text
+  https://server.akshatsahay.space
+  ```
+  *(Or your configured apex/subdomain in `config/platform.yaml`)*
+
+---
+
+## 7. Canonical Service Commands
+
+| Lifecycle Action | Shell Script (Linux / Termux) | Windows / Direct Python Command |
 |---|---|---|
 | **Start Services** | `bash scripts/start.sh` | `python controller/controller.py start` |
-| **Stop Services** | `bash scripts/stop.sh` | Terminate background process / Ctrl+C |
-| **Restart Services** | `bash scripts/restart.sh` | Restart command |
+| **Stop Services** | `bash scripts/stop.sh` | Terminate terminal process / `Ctrl+C` |
+| **Restart Services** | `bash scripts/restart.sh` | Restart process |
 | **Service Status** | `bash scripts/status.sh` | `python controller/controller.py nodes` |
-| **Health Check** | `bash scripts/health.sh` | `python controller/controller.py health` |
-| **HA Cluster Status** | `bash scripts/ha-status.sh` | `python controller/controller.py ha` |
-| **Node Telemetry** | `bash scripts/node-info.sh` | `python agent/node-agent.py status` |
+| **Health Check** | `bash scripts/health.sh` | `python scripts/doctor.py` |
+| **HA Status** | `bash scripts/ha-status.sh` | `curl -s http://127.0.0.1:8000/ha/status` |
+| **On-Demand Worker** | `python agent/local_worker.py run` | `python agent/local_worker.py run` |
 
 ---
 
-## 6. Verification & Automated Testing
+## 8. Automated Testing & Verification
 
-All automated tests run completely offline without contacting physical nodes or external network resources.
-
-### Canonical Test Commands
+All test suites run **completely offline** with isolated mock environments:
 
 ```bash
-# 1. Fast isolated unit tests (pure in-memory, < 3s)
+# Fast isolated unit tests (< 3s)
 python scripts/run_tests.py --unit
 
-# 2. Multi-node simulation, lifecycle, routing, and HA integration tests
+# Multi-node simulation, lifecycle, routing, and HA integration tests
 python scripts/run_tests.py --integration
 
-# 3. Complete automated test suite (all 29 suites, 296 tests)
+# Complete automated test suite (all 29 suites, 296 tests)
 python scripts/run_tests.py --all
 
-# 4. Standard unittest discovery (matches scripts/run_tests.py --all)
-python -m unittest discover -s tests -p "test_*.py"
-
-# 5. Static code syntax & AST lint checks
+# Code syntax and AST quality checks
 python scripts/run_tests.py --lint
-
-# 6. Web Console JavaScript syntax check
-node -c services/node-api/static/app.js
 ```
 
 ---
 
-## 7. Device Configuration Without Hardcoding
+## 9. Detailed Documentation Index
 
-PersonalServer avoids hardcoding device hostnames, Tailscale IPs, or tokens into source files. Every node dynamically resolves its configuration using:
+For in-depth operational runbooks, architecture specifications, and API guides, consult the [`docs/`](docs/README.md) directory:
 
-1. **Environment Variables**:
-   - `PERSONALSERVER_CONTROLLER_URL`: URL of the active cluster controller (e.g. `http://100.85.108.5:8000`).
-   - `PERSONALSERVER_BASE_DIR`: Base installation directory (defaults to `~/PersonalServer`).
-   - `STORAGE_INTEGRATION_URL`: Configurable target for storage UI integration tests.
-2. **Configuration Files** (git-ignored for machine-specific deployment):
-   - `config/node.json`: Auto-generated on onboarding via `detect.sh` or `node-agent.py onboard`.
-   - `config/secrets/enrollment.token`: Local enrollment authentication secret.
-   - `config/platform.yaml`: Centralized public domain and ingress routing specification.
-
----
-
-## 8. Complete Documentation
-
-Comprehensive technical guides are maintained in the [`docs/`](file:///docs/README.md) directory:
-
-### Core Architecture & HA
-* [Technical Documentation Catalog](file:///docs/README.md)
-* [System Architecture](file:///docs/architecture.md)
-* [High Availability (HA) & Master Failover](file:///docs/high_availability_failover.md)
-* [Controller Reference & API](file:///docs/controller.md)
-* [Node Agent & Telemetry Guide](file:///docs/node-agent.md)
-* [Resource-Aware Scheduling](file:///docs/scheduling.md)
-* [Multi-Node Storage Subsystem](file:///docs/storage.md)
-
-### Workloads, Reliability & Containers
-* [Job Reliability & Failure Recovery](file:///docs/reliability.md)
-* [Job Lifecycle FSM & Recovery Guide](file:///docs/job_lifecycle_recovery.md)
-* [Workload Jobs & Allowlist](file:///docs/jobs.md)
-* [OCI Image Build & Deployment Workflow](file:///docs/image_build_deploy_workflow.md)
-* [Application Routing & Gateway](file:///docs/domain_migration.md)
-
-### Setup, Security & Migration
-* [Getting Started Guide](file:///docs/getting-started.md)
-* [Node Enrollment & Onboarding](file:///docs/node-enrollment.md)
-* [Troubleshooting & Runbook](file:///docs/troubleshooting.md)
-* [Security Model & Threat Assessment](file:///docs/security.md)
-* [Networking & Ingress Architecture](file:///docs/networking.md)
-* [Hardware Migration Plan (Raspberry Pi & Android)](file:///docs/hardware_migration_plan.md)
-* [Raspberry Pi OS Deployment & FHS Mapping](file:///docs/raspberry_pi_migration.md)
-* [Multi-Node Simulation Suite](file:///docs/multi_node_simulation.md)
-* [Reproducible Development, CI & Backup](file:///docs/reproducible_setup.md)
-* [Development & Testing Guide](file:///docs/development.md)
-* [Evolution & Roadmap](file:///docs/roadmap.md)
+- **Architecture**: [System Architecture](docs/architecture.md) | [High Availability & Failover](docs/high_availability_failover.md) | [Networking & Ingress](docs/networking.md)
+- **Installation & Setup**: [Getting Started Guide](docs/getting-started.md) | [Node Enrollment & Pairing](docs/node-enrollment.md)
+- **Configuration**: [Centralized Configuration & Reproducible Setup](docs/reproducible_setup.md)
+- **Usage & Workloads**: [Workload Jobs](docs/jobs.md) | [Resource Scheduling](docs/scheduling.md) | [Multi-Node Storage](docs/storage.md)
+- **Deployment**: [Multi-App Deployment](docs/multi_app_deployment.md) | [Raspberry Pi Migration](docs/raspberry_pi_migration.md) | [Hardware Migration Plan](docs/hardware_migration_plan.md)
+- **Troubleshooting**: [Operational Troubleshooting Runbook](docs/troubleshooting.md) | [System Doctor Script](docs/doctor.md)
+- **Contribution & Development**: [Contribution Guidelines](CONTRIBUTING.md) | [Development Guide](docs/development.md)
