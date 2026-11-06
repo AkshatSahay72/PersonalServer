@@ -776,7 +776,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         req = urllib.request.Request(target_url, data=body_bytes, headers=headers, method=method)
         try:
-            with PROXY_OPENER.open(req, timeout=15) as response:
+            with PROXY_OPENER.open(req, timeout=90) as response:
                 resp_data = response.read()
                 self.send_response(response.status)
                 has_content_length = False

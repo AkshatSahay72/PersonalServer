@@ -50,11 +50,10 @@ def load_shares_db(paths: Optional[Any] = None) -> Dict[str, Any]:
 def save_shares_db(db: Dict[str, Any], paths: Optional[Any] = None) -> None:
     """Atomically persists the shares database and creates a backup."""
     curr_paths = paths or get_controller_paths()
-    with DB_LOCK:
-        curr_paths.ensure_directories()
-        shares_file = getattr(curr_paths, "shares_file", curr_paths.data_dir / "shares.json")
-        backup_file = getattr(curr_paths, "backup_shares_file", curr_paths.data_dir / "shares.json.bak")
-        atomic_save_json(shares_file, backup_file, db, lock=DB_LOCK, bump_ha=True)
+    curr_paths.ensure_directories()
+    shares_file = getattr(curr_paths, "shares_file", curr_paths.data_dir / "shares.json")
+    backup_file = getattr(curr_paths, "backup_shares_file", curr_paths.data_dir / "shares.json.bak")
+    atomic_save_json(shares_file, backup_file, db, lock=DB_LOCK, bump_ha=True)
 
 
 def get_share_by_id(share_id: str, paths: Optional[Any] = None) -> Optional[Dict[str, Any]]:
@@ -130,8 +129,8 @@ def create_share(node_id: str, rel_path: str, filename: str = "", is_dir: bool =
         }
 
         shares[share_id] = record
-        save_shares_db(db, paths)
-        return record
+    save_shares_db(db, paths)
+    return record
 
 
 def find_active_folder_share_for_path(node_id: str, rel_path: str, paths: Optional[Any] = None) -> Optional[Dict[str, Any]]:
@@ -207,7 +206,7 @@ def revoke_share(share_id_or_path: str, node_id: Optional[str] = None, paths: Op
                             s["revoked"] = True
                             revoked_any = True
 
-        if revoked_any:
-            save_shares_db(db, paths)
-        return revoked_any
+    if revoked_any:
+        save_shares_db(db, paths)
+    return revoked_any
 

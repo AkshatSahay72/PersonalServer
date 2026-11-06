@@ -43,6 +43,5 @@ def load_nodes_db(paths: Optional[Any] = None) -> Dict[str, Any]:
 def save_nodes_db(db: Dict[str, Any], paths: Optional[Any] = None) -> None:
     """Atomically persists the cluster nodes database and creates a backup."""
     curr_paths = paths or get_controller_paths()
-    with DB_LOCK:
-        curr_paths.ensure_directories()
-        atomic_save_json(curr_paths.nodes_file, curr_paths.backup_nodes_file, db, lock=DB_LOCK, bump_ha=True)
+    curr_paths.ensure_directories()
+    atomic_save_json(curr_paths.nodes_file, curr_paths.backup_nodes_file, db, lock=DB_LOCK, bump_ha=True)

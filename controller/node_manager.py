@@ -37,11 +37,17 @@ RUNTIME_CFG = get_controller_runtime_config()
 DEFAULT_HEARTBEAT_TIMEOUT = RUNTIME_CFG.heartbeat_timeout  # seconds
 
 
+from controller.leader_ranking import apply_default_leadership_metadata, calculate_node_performance_score
+
+
 def sanitize_node_record(node: Dict[str, Any], timeout_seconds: int = DEFAULT_HEARTBEAT_TIMEOUT) -> Dict[str, Any]:
     """Returns a sanitized copy of node record without credentials, with computed liveness status."""
     node_copy = dict(node)
     node_copy.pop("auth_token", None)
     node_copy["status"] = compute_node_liveness(node, timeout_seconds)
+    node_id = str(node_copy.get("node_id", ""))
+    apply_default_leadership_metadata(node_id, node_copy)
+    node_copy["performance_score"] = calculate_node_performance_score(node_copy, timeout_seconds)
     return node_copy
 
 

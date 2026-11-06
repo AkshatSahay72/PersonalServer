@@ -597,6 +597,68 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
         })
         return True
 
+    # 7. POST /nodes/<node_id>/policy or POST /api/nodes/<node_id>/policy
+    if (path.startswith("/nodes/") or path.startswith("/api/nodes/")) and path.endswith("/policy"):
+        raw_prefix = "/api/nodes/" if path.startswith("/api/nodes/") else "/nodes/"
+        node_id = path[len(raw_prefix):-7].strip()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to configure node leadership policy"})
+            return True
+
+        nodes_db = load_nodes_db()
+        node_entry = nodes_db.get("nodes", {}).get(node_id)
+        if not node_entry:
+            handler.send_json(404, {"error": f"Node '{node_id}' not found"})
+            return True
+
+        if not isinstance(body, dict):
+            handler.send_json(400, {"error": "Invalid request body: Expected JSON object"})
+            return True
+
+        from controller.leader_ranking import apply_default_leadership_metadata
+        apply_default_leadership_metadata(node_id, node_entry)
+
+        if "leader_eligible" in body:
+            node_entry["leader_eligible"] = bool(body["leader_eligible"])
+        if "priority" in body:
+            try:
+                node_entry["priority"] = max(0, min(100, int(body["priority"])))
+            except (ValueError, TypeError):
+                handler.send_json(400, {"error": "Invalid priority: Expected integer 0-100"})
+                return True
+        if "preferred_leader" in body:
+            pref = bool(body["preferred_leader"])
+            node_entry["preferred_leader"] = pref
+            if pref:
+                # Exclusive preferred leader: reset others
+                for other_id, other_node in nodes_db.get("nodes", {}).items():
+                    if other_id != node_id:
+                        other_node["preferred_leader"] = False
+        if "worker_enabled" in body:
+            node_entry["worker_enabled"] = bool(body["worker_enabled"])
+        if "build_worker_enabled" in body:
+            node_entry["build_worker_enabled"] = bool(body["build_worker_enabled"])
+
+        node_entry["policy_updated_at"] = get_current_iso_timestamp()
+        save_nodes_db(nodes_db)
+
+        sanitized = sanitize_node_record(node_entry, handler.heartbeat_timeout)
+        handler.send_json(200, {
+            "status": "ok",
+            "node_id": node_id,
+            "policy": {
+                "leader_eligible": sanitized.get("leader_eligible"),
+                "preferred_leader": sanitized.get("preferred_leader"),
+                "priority": sanitized.get("priority"),
+                "performance_score": sanitized.get("performance_score"),
+                "worker_enabled": sanitized.get("worker_enabled"),
+                "build_worker_enabled": sanitized.get("build_worker_enabled"),
+            },
+            "node": sanitized
+        })
+        return True
+
     return False
 
 

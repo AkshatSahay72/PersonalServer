@@ -20,6 +20,13 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def process_request(self, request, client_address):
+        try:
+            request.settimeout(15.0)
+        except Exception:
+            pass
+        super().process_request(request, client_address)
+
 
 from common.time_utils import get_current_iso_timestamp
 from config.platform_config import get_controller_paths, get_controller_runtime_config
@@ -732,8 +739,9 @@ def handle_app_cli(args) -> int:
     from pathlib import Path
 
     action = getattr(args, "app_action", None)
+    paths = getattr(args, "paths", None)
     if not action or action == "list":
-        db = load_apps_db()
+        db = load_apps_db(paths=paths)
         apps = db.get("apps", {})
         if not apps:
             print("No applications registered.")
@@ -753,7 +761,7 @@ def handle_app_cli(args) -> int:
         with open(spec_path, "r", encoding="utf-8") as f:
             manifest_data = json.load(f)
         try:
-            rec = DeploymentManager.register_manifest(manifest_data)
+            rec = DeploymentManager.register_manifest(manifest_data, paths=paths)
             print(f"Application registered successfully: {rec['app_id']} ({rec['name']}) at {rec['public_path']}")
             return 0
         except Exception as e:
@@ -770,7 +778,8 @@ def handle_app_cli(args) -> int:
                 app_id=app_id,
                 artifact_path=artifact_path,
                 artifact_sha256=artifact_sha256,
-                port_override=port
+                port_override=port,
+                paths=paths
             )
             print(f"Deployment succeeded: {res['deployment_id']} for '{app_id}' on {res['address']}")
             print(f"Health check: {res.get('health_probe')}")
@@ -782,7 +791,7 @@ def handle_app_cli(args) -> int:
     elif action == "status":
         app_id = args.app_id
         try:
-            st = DeploymentManager.get_application_status(app_id)
+            st = DeploymentManager.get_application_status(app_id, paths=paths)
             print(f"App ID:         {st['app_id']}")
             print(f"Name:           {st['name']}")
             print(f"Status:         {st['status']}")
@@ -825,6 +834,64 @@ def handle_app_cli(args) -> int:
             return 0
         except Exception as e:
             print(f"Rollback failed: {e}", file=sys.stderr)
+            return 1
+
+    elif action in ("deployments", "history"):
+        app_id = args.app_id
+        page = getattr(args, "page", 1)
+        limit = getattr(args, "limit", 20)
+        status_f = getattr(args, "status", None)
+        try:
+            res = DeploymentManager.list_deployments(app_id, page=page, limit=limit, status_filter=status_f, paths=paths)
+            deps = res.get("deployments", [])
+            if not deps:
+                print(f"No deployments found for application '{app_id}'.")
+                return 0
+            print(f"Deployments for '{app_id}' (Page {res.get('page')}/{res.get('pages')}, Total {res.get('total_count')}):")
+            header = f"{'DEPLOYMENT ID':<16} {'STATUS':<12} {'COMMIT':<10} {'NODE':<20} {'PORT':<8} {'ACTIVE':<8} {'TRIGGER':<12}"
+            print(header)
+            print("-" * len(header))
+            for d in deps:
+                is_act = "YES" if d.get("is_active") else "NO"
+                print(f"{d.get('deployment_id', '-'):<16} {d.get('status', '-'):<12} {d.get('commit', '-')[:8]:<10} {str(d.get('node', '-')):<20} {str(d.get('port', '-')):<8} {is_act:<8} {str(d.get('trigger', '-')):<12}")
+            return 0
+        except Exception as e:
+            print(f"Error listing deployments: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "logs":
+        app_id = args.app_id
+        dep_id = getattr(args, "deployment_id", None)
+        lines = getattr(args, "lines", 100)
+        try:
+            log_text = DeploymentManager.get_deployment_logs(app_id, deployment_id=dep_id, max_lines=lines, paths=paths)
+            print(log_text)
+            return 0
+        except Exception as e:
+            print(f"Error reading logs: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "cancel":
+        app_id = args.app_id
+        dep_id = args.deployment_id
+        reason = getattr(args, "reason", "Cancelled by CLI operator")
+        try:
+            res = DeploymentManager.cancel_deployment(app_id, dep_id, reason=reason, paths=paths)
+            print(f"Deployment cancelled: {res.get('deployment_id')} ({res.get('status')})")
+            return 0
+        except Exception as e:
+            print(f"Error cancelling deployment: {e}", file=sys.stderr)
+            return 1
+
+    elif action == "retry":
+        app_id = args.app_id
+        dep_id = args.deployment_id
+        try:
+            res = DeploymentManager.retry_deployment(app_id, dep_id, paths=paths)
+            print(f"Deployment retry initiated: {res.get('deployment_id')} on {res.get('address')}")
+            return 0
+        except Exception as e:
+            print(f"Error retrying deployment: {e}", file=sys.stderr)
             return 1
 
     return 1
@@ -953,6 +1020,36 @@ def main(args_list: Optional[list] = None) -> None:
     p_app_rb = app_sub.add_parser("rollback", help="Roll back application to a previous successful release")
     p_app_rb.add_argument("app_id", help="Application ID")
     p_app_rb.add_argument("--deployment-id", help="Optional specific prior deployment ID to restore")
+
+    # app deployments / history
+    p_app_deps = app_sub.add_parser("deployments", help="List deployment history")
+    p_app_deps.add_argument("app_id", help="Application ID")
+    p_app_deps.add_argument("--page", type=int, default=1, help="Page number")
+    p_app_deps.add_argument("--limit", type=int, default=20, help="Deployments per page")
+    p_app_deps.add_argument("--status", help="Filter by status")
+
+    p_app_hist = app_sub.add_parser("history", help="List deployment history (alias)")
+    p_app_hist.add_argument("app_id", help="Application ID")
+    p_app_hist.add_argument("--page", type=int, default=1, help="Page number")
+    p_app_hist.add_argument("--limit", type=int, default=20, help="Deployments per page")
+    p_app_hist.add_argument("--status", help="Filter by status")
+
+    # app logs
+    p_app_logs = app_sub.add_parser("logs", help="View application or deployment logs")
+    p_app_logs.add_argument("app_id", help="Application ID")
+    p_app_logs.add_argument("--deployment-id", help="Optional specific deployment ID")
+    p_app_logs.add_argument("--lines", type=int, default=100, help="Maximum log lines to retrieve")
+
+    # app cancel
+    p_app_canc = app_sub.add_parser("cancel", help="Cancel an active deployment")
+    p_app_canc.add_argument("app_id", help="Application ID")
+    p_app_canc.add_argument("deployment_id", help="Deployment ID to cancel")
+    p_app_canc.add_argument("--reason", default="Cancelled by CLI operator", help="Cancellation reason")
+
+    # app retry
+    p_app_retry = app_sub.add_parser("retry", help="Retry a failed deployment")
+    p_app_retry.add_argument("app_id", help="Application ID")
+    p_app_retry.add_argument("deployment_id", help="Deployment ID to retry")
 
     args = parser.parse_args(args_list)
 

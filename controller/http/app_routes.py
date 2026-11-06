@@ -117,21 +117,42 @@ def handle_app_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
             handler.send_json(404, {"error": str(e)})
         return True
 
-    # GET /apps/<app_id>/deployments
-    if path.startswith("/apps/") and path.endswith("/deployments"):
-        app_id = path[6:-12].strip()
-        apps_db = load_apps_db()
-        app = apps_db.get("apps", {}).get(app_id)
-        if not app or app.get("status") == "DELETED":
-            handler.send_json(404, {"error": f"Application '{app_id}' not found"})
-            return True
-        deployments = app.get("deployments", [])
-        handler.send_json(200, {
-            "app_id": app_id,
-            "deployments": deployments,
-            "count": len(deployments)
-        })
-        return True
+    # GET /apps/<app_id>/deployments or /apps/<app_id>/deployments/<dep_id>[/logs]
+    if path.startswith("/apps/") and "/deployments" in path:
+        from controller.deployment_manager import DeploymentManager
+        parts = path.split("/")
+        # Path format: /apps/<app_id>/deployments...
+        if len(parts) >= 4 and parts[3] == "deployments":
+            app_id = parts[2].strip()
+            if len(parts) == 4:
+                # GET /apps/<app_id>/deployments
+                page = int(query.get("page", [1])[0]) if query else 1
+                limit = int(query.get("limit", [20])[0]) if query else 20
+                status_f = query.get("status", [None])[0] if query else None
+                try:
+                    res = DeploymentManager.list_deployments(app_id, page=page, limit=limit, status_filter=status_f)
+                    res["count"] = res["total_count"]
+                    handler.send_json(200, res)
+                    return True
+                except Exception as e:
+                    handler.send_json(404, {"error": str(e)})
+                    return True
+            elif len(parts) == 5:
+                # GET /apps/<app_id>/deployments/<dep_id>
+                dep_id = parts[4].strip()
+                rec = DeploymentManager.get_deployment_record(app_id, dep_id)
+                if not rec:
+                    handler.send_json(404, {"error": f"Deployment '{dep_id}' not found for app '{app_id}'"})
+                    return True
+                handler.send_json(200, {"app_id": app_id, "deployment": rec})
+                return True
+            elif len(parts) == 6 and parts[5] == "logs":
+                # GET /apps/<app_id>/deployments/<dep_id>/logs
+                dep_id = parts[4].strip()
+                max_lines = int(query.get("lines", [100])[0]) if query else 100
+                logs = DeploymentManager.get_deployment_logs(app_id, deployment_id=dep_id, max_lines=max_lines)
+                handler.send_json(200, {"app_id": app_id, "deployment_id": dep_id, "logs": logs})
+                return True
 
     # GET /apps/<app_id>/env
     if path.startswith("/apps/") and path.endswith("/env"):
@@ -170,7 +191,16 @@ def handle_app_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         if record and record.log_file:
             candidate_log = Path(record.log_file)
         if not candidate_log or not candidate_log.exists():
-            candidate_log = LOGS_DIR / f"app_{clean_app_id}.log"
+            candidates = [
+                LOGS_DIR / f"app_{clean_app_id}.log",
+                LOGS_DIR / f"{clean_app_id}.log",
+                LOGS_DIR / f"app_{app.get('name')}.log",
+                LOGS_DIR / f"{app.get('name')}.log"
+            ]
+            for c_log in candidates:
+                if c_log.exists() and c_log.is_file():
+                    candidate_log = c_log
+                    break
 
         if candidate_log and candidate_log.exists() and candidate_log.is_file():
             try:
@@ -904,6 +934,72 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
         })
         return True
 
+    # POST /apps/<app_id>/deployments[/<dep_id>/cancel | /<dep_id>/retry]
+    if path.startswith("/apps/") and "/deployments" in path:
+        from controller.deployment_manager import DeploymentManager, DeploymentConcurrencyError
+        parts = path.split("/")
+        if len(parts) >= 4 and parts[3] == "deployments":
+            app_id = parts[2].strip()
+            # Case 1: POST /apps/<app_id>/deployments (canonical submission)
+            if len(parts) == 4:
+                try:
+                    artifact_file = None
+                    artifact_sha = body.get("artifact_sha256") if body else None
+                    if body and body.get("artifact_id"):
+                        from common.artifact_manager import get_artifact_file_path
+                        try:
+                            artifact_file = get_artifact_file_path(body["artifact_id"])
+                        except Exception:
+                            pass
+                    elif body and body.get("artifact_path"):
+                        artifact_file = Path(body["artifact_path"])
+
+                    res = DeploymentManager.deploy_application(
+                        app_id=app_id,
+                        artifact_path=artifact_file,
+                        artifact_sha256=artifact_sha,
+                        port_override=body.get("port") if body else None,
+                        node_override=body.get("node") or (body.get("target_node") if body else None),
+                        commit=body.get("commit") or (body.get("commit_sha") if body else None),
+                        branch=body.get("branch") if body else None,
+                        trigger=(body.get("trigger") if body else None) or "api"
+                    )
+                    status_code = 200 if res.get("idempotent") else 201
+                    handler.send_json(status_code, res)
+                    return True
+                except DeploymentConcurrencyError as ce:
+                    handler.send_json(409, {"error": str(ce), "status": "CONFLICT", "code": 409})
+                    return True
+                except Exception as e:
+                    handler.send_json(400, {"error": str(e), "app_id": app_id, "status": "FAILED"})
+                    return True
+
+            # Case 2: POST /apps/<app_id>/deployments/<dep_id>/cancel
+            elif len(parts) == 6 and parts[5] == "cancel":
+                dep_id = parts[4].strip()
+                reason = (body.get("reason") if body else None) or "Cancelled via REST API"
+                try:
+                    res = DeploymentManager.cancel_deployment(app_id, dep_id, reason=reason)
+                    handler.send_json(200, res)
+                    return True
+                except Exception as e:
+                    handler.send_json(400, {"error": str(e), "app_id": app_id, "deployment_id": dep_id})
+                    return True
+
+            # Case 3: POST /apps/<app_id>/deployments/<dep_id>/retry
+            elif len(parts) == 6 and parts[5] == "retry":
+                dep_id = parts[4].strip()
+                try:
+                    res = DeploymentManager.retry_deployment(app_id, dep_id)
+                    handler.send_json(200, res)
+                    return True
+                except DeploymentConcurrencyError as ce:
+                    handler.send_json(409, {"error": str(ce), "status": "CONFLICT", "code": 409})
+                    return True
+                except Exception as e:
+                    handler.send_json(400, {"error": str(e), "app_id": app_id, "deployment_id": dep_id})
+                    return True
+
     # POST /apps/<app_id>/deploy or redeploy
     if path.startswith("/apps/") and (path.endswith("/deploy") or path.endswith("/redeploy")):
         is_redeploy = path.endswith("/redeploy")
@@ -955,52 +1051,66 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                     })
                     return True
 
-            if app.get("runtime") in ("python", "python3", "self-hosted") or app.get("components"):
-                try:
-                    from controller.deployment_manager import DeploymentManager
-                    artifact_file = None
-                    artifact_sha = None
-                    if body:
-                        if body.get("artifact_id"):
-                            from common.artifact_manager import get_artifact_file_path
-                            try:
-                                artifact_file = get_artifact_file_path(body["artifact_id"])
-                            except Exception:
-                                pass
-                        elif body.get("artifact_path"):
-                            artifact_file = Path(body["artifact_path"])
-                        artifact_sha = body.get("artifact_sha256")
+            runtime = app.get("runtime")
+            if not runtime and app.get("blueprint", {}).get("services"):
+                runtime = app["blueprint"]["services"][0].get("runtime")
 
-                    if source_type == "github" and not artifact_file:
-                        # Package fetched source into an isolated release zip artifact
-                        import zipfile
-                        from common.artifact_manager import compute_file_sha256
-                        src_context, _ = resolve_safe_app_storage_path(app_id, f"source/{source.get('root_directory', '.')}".rstrip("/."))
-                        if src_context.exists():
-                            art_dir = APP_STORAGE_ROOT / app_id / "artifacts"
-                            art_dir.mkdir(parents=True, exist_ok=True)
-                            artifact_file = art_dir / f"{app_id}-{commit_sha[:8]}.zip"
-                            with zipfile.ZipFile(artifact_file, "w", zipfile.ZIP_DEFLATED) as zf:
-                                for f_p in src_context.rglob("*"):
-                                    if f_p.is_file():
-                                        zf.write(f_p, arcname=str(f_p.relative_to(src_context)))
-                            artifact_sha, _ = compute_file_sha256(artifact_file)
+            src_context, _ = resolve_safe_app_storage_path(app_id, f"source/{source.get('root_directory', '.')}".rstrip("/."))
+            has_py_entry = False
+            try:
+                if src_context.exists() and any((src_context / f).exists() for f in ("app.py", "main.py", "server.py", "requirements.txt")):
+                    has_py_entry = True
+            except Exception:
+                pass
 
-                    res = DeploymentManager.deploy_application(
-                        app_id=app_id,
-                        artifact_path=artifact_file,
-                        artifact_sha256=artifact_sha,
-                        port_override=body.get("port") if body else None,
-                        node_override=target_node,
-                        commit=commit_sha,
-                        branch=branch,
-                        trigger=trigger
-                    )
-                    handler.send_json(200, res)
-                    return True
-                except Exception as e:
-                    handler.send_json(400, {"error": str(e), "app_id": app_id, "status": "FAILED"})
-                    return True
+            try:
+                from controller.deployment_manager import DeploymentManager, DeploymentConcurrencyError
+                artifact_file = None
+                artifact_sha = None
+                if body:
+                    if body.get("artifact_id"):
+                        from common.artifact_manager import get_artifact_file_path
+                        try:
+                            artifact_file = get_artifact_file_path(body["artifact_id"])
+                        except Exception:
+                            pass
+                    elif body.get("artifact_path"):
+                        artifact_file = Path(body["artifact_path"])
+                    artifact_sha = body.get("artifact_sha256")
+
+                if source_type == "github" and not artifact_file:
+                    # Package fetched source into an isolated release zip artifact
+                    import zipfile
+                    from common.artifact_manager import compute_file_sha256
+                    src_context, _ = resolve_safe_app_storage_path(app_id, f"source/{source.get('root_directory', '.')}".rstrip("/."))
+                    if src_context.exists():
+                        art_dir = APP_STORAGE_ROOT / app_id / "artifacts"
+                        art_dir.mkdir(parents=True, exist_ok=True)
+                        artifact_file = art_dir / f"{app_id}-{commit_sha[:8]}.zip"
+                        with zipfile.ZipFile(artifact_file, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for f_p in src_context.rglob("*"):
+                                if f_p.is_file():
+                                    zf.write(f_p, arcname=str(f_p.relative_to(src_context)))
+                        artifact_sha, _ = compute_file_sha256(artifact_file)
+
+                res = DeploymentManager.deploy_application(
+                    app_id=app_id,
+                    artifact_path=artifact_file,
+                    artifact_sha256=artifact_sha,
+                    port_override=body.get("port") if body else None,
+                    node_override=target_node,
+                    commit=commit_sha,
+                    branch=branch,
+                    trigger=trigger
+                )
+                handler.send_json(200, res)
+                return True
+            except DeploymentConcurrencyError as ce:
+                handler.send_json(409, {"error": str(ce), "status": "CONFLICT", "code": 409})
+                return True
+            except Exception as e:
+                handler.send_json(400, {"error": str(e), "app_id": app_id, "status": "FAILED"})
+                return True
 
             # Schedule onto container-capable node (Docker or udocker) with architecture matching
             t_sched_start = time.time()
@@ -1042,6 +1152,17 @@ def handle_app_post(handler: Any, path: str, body: Optional[Dict[str, Any]], tok
                 return True
 
             selected_node = decision["selected_node"]
+            local_node_id = None
+            try:
+                reg_f = RUNTIME_DIR / "registration.json"
+                if reg_f.exists():
+                    with open(reg_f, "r", encoding="utf-8") as f:
+                        local_node_id = json.load(f).get("node_id")
+            except Exception:
+                pass
+            if local_node_id and target_node in ("auto", None, ""):
+                selected_node = local_node_id
+
             app["status"] = APP_STATE_DEPLOYING
             app["selected_node"] = selected_node
             app["updated_at"] = now_iso

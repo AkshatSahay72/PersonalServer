@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+
 try:
     from config.structured_logger import redact_sensitive_text
 except ImportError:
@@ -133,6 +135,7 @@ def probe_docker(docker_bin: Optional[str] = None, timeout: float = DEFAULT_PROB
     """
     Executes a bounded, harmless Docker smoke test.
     Checks if docker binary exists AND daemon responds via `docker info`.
+    Distinguishes genuine Docker Engine from udocker wrappers or incompatible CLIs.
     """
     now = get_current_iso_timestamp()
     resolved_bin = docker_bin or shutil.which("docker")
@@ -146,7 +149,38 @@ def probe_docker(docker_bin: Optional[str] = None, timeout: float = DEFAULT_PROB
             "timestamp": now
         }
 
+    # Reject if resolved binary is explicitly named udocker or symlinked to udocker
+    bin_name = Path(resolved_bin).name.lower()
+    if "udocker" in bin_name:
+        return {
+            "verified": False,
+            "capability": "container_runtime:docker",
+            "installed": False,
+            "version": None,
+            "error": "udocker executable cannot satisfy Docker Engine capability",
+            "timestamp": now
+        }
+
     try:
+        # Check docker version to verify CLI and detect potential udocker wrappers
+        v_res = subprocess.run(
+            [resolved_bin, "version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout
+        )
+        combined_v = (v_res.stdout + " " + v_res.stderr).lower()
+        if "udocker" in combined_v:
+            return {
+                "verified": False,
+                "capability": "container_runtime:docker",
+                "installed": False,
+                "version": None,
+                "error": "Binary is a udocker wrapper; genuine Docker Engine daemon required",
+                "timestamp": now
+            }
+
         # Run docker info to verify daemon connection
         res = subprocess.run(
             [resolved_bin, "info", "--format", "{{.ServerVersion}}"],
@@ -157,11 +191,25 @@ def probe_docker(docker_bin: Optional[str] = None, timeout: float = DEFAULT_PROB
         )
         if res.returncode == 0:
             ver = res.stdout.strip() or "available"
+            # Probe API version for compatibility checking
+            api_ver = None
+            api_res = subprocess.run(
+                [resolved_bin, "version", "--format", "{{.Server.APIVersion}}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout
+            )
+            if api_res.returncode == 0 and api_res.stdout.strip():
+                api_ver = api_res.stdout.strip()
+
             return {
                 "verified": True,
                 "capability": "container_runtime:docker",
                 "installed": True,
                 "version": ver,
+                "api_version": api_ver,
+                "runtime_type": "docker",
                 "error": None,
                 "timestamp": now
             }
@@ -279,6 +327,125 @@ def probe_udocker(udocker_bin: Optional[str] = None, timeout: float = DEFAULT_PR
         }
 
 
+def probe_nodejs(
+    node_bin: Optional[str] = None,
+    npm_bin: Optional[str] = None,
+    timeout: float = DEFAULT_PROBE_TIMEOUT
+) -> Dict[str, Any]:
+    """
+    Probes Node.js and npm availability and runtime version.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    resolved_node = node_bin or shutil.which("node") or shutil.which("nodejs")
+    resolved_npm = npm_bin or shutil.which("npm")
+    if not resolved_node:
+        return {
+            "verified": False,
+            "capability": "nodejs",
+            "installed": False,
+            "version": None,
+            "error": "Node.js executable ('node') not found on PATH",
+            "timestamp": now
+        }
+
+    try:
+        res = subprocess.run(
+            [resolved_node, "-v"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout
+        )
+        if res.returncode == 0:
+            ver_str = res.stdout.strip().lstrip("v")
+            npm_ver = None
+            if resolved_npm:
+                try:
+                    npm_res = subprocess.run(
+                        [resolved_npm, "-v"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=timeout
+                    )
+                    if npm_res.returncode == 0:
+                        npm_ver = npm_res.stdout.strip()
+                except Exception:
+                    pass
+
+            return {
+                "verified": True,
+                "capability": "nodejs",
+                "installed": True,
+                "version": ver_str,
+                "npm_installed": bool(npm_ver is not None or resolved_npm),
+                "npm_version": npm_ver,
+                "error": None,
+                "timestamp": now
+            }
+        else:
+            err_msg = res.stderr or res.stdout or f"Non-zero exit code: {res.returncode}"
+            return {
+                "verified": False,
+                "capability": "nodejs",
+                "installed": True,
+                "version": None,
+                "npm_installed": bool(resolved_npm),
+                "npm_version": None,
+                "error": _clean_error(err_msg),
+                "timestamp": now
+            }
+    except subprocess.TimeoutExpired:
+        return {
+            "verified": False,
+            "capability": "nodejs",
+            "installed": True,
+            "version": None,
+            "npm_installed": bool(resolved_npm),
+            "npm_version": None,
+            "error": f"Node.js probe timed out after {timeout}s",
+            "timestamp": now
+        }
+    except Exception as e:
+        return {
+            "verified": False,
+            "capability": "nodejs",
+            "installed": True,
+            "version": None,
+            "npm_installed": bool(resolved_npm),
+            "npm_version": None,
+            "error": _clean_error(str(e)),
+            "timestamp": now
+        }
+
+
+def probe_static(storage_path: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Probes static web serving capability by verifying local storage and filesystem readability.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        target = (storage_path or (BASE_DIR / "storage")).resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        return {
+            "verified": True,
+            "capability": "static",
+            "installed": True,
+            "version": "router-native",
+            "error": None,
+            "timestamp": now
+        }
+    except Exception as e:
+        return {
+            "verified": False,
+            "capability": "static",
+            "installed": False,
+            "version": None,
+            "error": str(e),
+            "timestamp": now
+        }
+
+
 def run_capability_probes(
     advertised_capabilities: Optional[Union[Dict[str, Any], List[str]]] = None,
     timeout: float = DEFAULT_PROBE_TIMEOUT
@@ -359,13 +526,17 @@ def run_capability_probes(
 
     # 4. Container Runtime Probes (Docker & udocker)
     # Probe Docker if advertised or if binary is detected
+    docker_verified = False
     if adv_dict.get("container_runtime:docker") is not None or shutil.which("docker"):
         docker_res = probe_docker(timeout=timeout)
         probe_results["container_runtime:docker"] = docker_res
         if docker_res["verified"]:
             verified_dict["container_runtime:docker"] = True
+            verified_dict["docker"] = True
+            docker_verified = True
         else:
             verified_dict.pop("container_runtime:docker", None)
+            verified_dict.pop("docker", None)
 
     # Probe udocker if advertised or if binary is detected
     if adv_dict.get("container_runtime:udocker") is not None or shutil.which("udocker"):
@@ -373,8 +544,32 @@ def run_capability_probes(
         probe_results["container_runtime:udocker"] = udocker_res
         if udocker_res["verified"]:
             verified_dict["container_runtime:udocker"] = True
+            # CRITICAL: Never advertise Docker capability merely because udocker exists
+            if not docker_verified:
+                verified_dict.pop("container_runtime:docker", None)
+                verified_dict.pop("docker", None)
         else:
             verified_dict.pop("container_runtime:udocker", None)
+
+    # 5. Node.js Probe
+    if adv_dict.get("nodejs") is not None or adv_dict.get("node") is not None or shutil.which("node"):
+        node_res = probe_nodejs(timeout=timeout)
+        probe_results["nodejs"] = node_res
+        if node_res["verified"]:
+            verified_dict["nodejs"] = True
+            verified_dict["node"] = True
+            if node_res.get("npm_installed"):
+                verified_dict["npm"] = True
+        else:
+            verified_dict.pop("nodejs", None)
+            verified_dict.pop("node", None)
+            verified_dict.pop("npm", None)
+
+    # 6. Static Web Serving Probe
+    static_res = probe_static()
+    probe_results["static"] = static_res
+    if static_res.get("verified"):
+        verified_dict["static"] = True
 
     return {
         "advertised_capabilities": adv_dict,

@@ -363,6 +363,21 @@ def fetch_github_source(
             blueprint = parse_and_validate_blueprint(bp_file.read_text(encoding="utf-8"))
         except Exception as e:
             raise ValueError(f"Invalid blueprint file {bp_file.name}: {e}")
+    elif (resolved_root / "app.py").exists() or (resolved_root / "main.py").exists() or (resolved_root / "server.py").exists():
+        app_name = repository.split("/")[-1].lower().replace(".", "-")
+        blueprint = {
+            "version": "1.0",
+            "services": [
+                {
+                    "type": "web",
+                    "name": app_name,
+                    "runtime": "python",
+                    "rootDir": root_directory or ".",
+                    "route": f"/{app_name}",
+                    "envVars": []
+                }
+            ]
+        }
     elif dockerfile_found:
         app_name = repository.split("/")[-1].lower().replace(".", "-")
         blueprint = {
@@ -374,21 +389,6 @@ def fetch_github_source(
                     "runtime": "docker",
                     "rootDir": root_directory or ".",
                     "dockerfile": "Dockerfile",
-                    "route": f"/{app_name}",
-                    "envVars": []
-                }
-            ]
-        }
-    elif (resolved_root / "app.py").exists() or (resolved_root / "main.py").exists() or (resolved_root / "server.py").exists():
-        app_name = repository.split("/")[-1].lower().replace(".", "-")
-        blueprint = {
-            "version": "1.0",
-            "services": [
-                {
-                    "type": "web",
-                    "name": app_name,
-                    "runtime": "python",
-                    "rootDir": root_directory or ".",
                     "route": f"/{app_name}",
                     "envVars": []
                 }

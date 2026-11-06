@@ -49,7 +49,7 @@
       <div class="sidebar-footer mono">
         <div class="sidebar-status-item">
           <span class="cell-muted">Cluster:</span>
-          <span id="side-cluster-online" class="text-online">— online</span>
+          <span id="side-cluster-online" class="cell-muted">— checking...</span>
         </div>
         <div class="sidebar-status-item">
           <span class="cell-muted">Session:</span>
@@ -81,7 +81,7 @@
           <span id="topbar-ha-status" style="display:none"></span>
           <div class="topbar-meta-item">
             <span class="cell-muted">Cluster:</span>
-            <span id="topbar-cluster-status" class="text-online">— online</span>
+            <span id="topbar-cluster-status" class="cell-muted">— checking...</span>
           </div>
           <div class="topbar-meta-item verbose">
             <span class="cell-muted">Updated:</span>
@@ -258,6 +258,96 @@
               <span class="badge badge-secondary mono" id="ha-banner-standbys">- Standbys</span>
               <button class="btn btn-sm btn-secondary" id="ha-failover-btn" onclick="triggerManualHAFailover()" title="Simulate Master failure or transfer leadership">Simulate Failover</button>
             </div>
+          </div>
+        </div>
+
+        <!-- Leader Management & Automatic Failover Controls -->
+        <div class="section-card" id="leader-management-card" style="margin-bottom: 16px;">
+          <div class="section-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div class="leader-header-left" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;" onclick="toggleLeaderManagementSection()" title="Collapse Leader Management panel">
+              <div>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <span class="section-title">Leader Management &amp; Cluster Failover</span>
+                  <button type="button" 
+                          id="leader-management-toggle" 
+                          class="section-collapse-btn" 
+                          aria-expanded="true" 
+                          aria-controls="leader-management-body" 
+                          aria-label="Toggle Leader Management section" 
+                          title="Collapse Leader Management panel"
+                          onclick="event.stopPropagation(); toggleLeaderManagementSection();">
+                    <svg class="collapse-chevron" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                      <path fill-rule="evenodd" d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/>
+                    </svg>
+                  </button>
+                </div>
+                <div class="cell-muted mono" style="font-size: 0.78rem;">Configurable per-node eligibility, ranking priority, and atomic leadership handover</div>
+              </div>
+            </div>
+            <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+              <div style="display: flex; align-items: center; gap: 6px;" class="mono">
+                <label for="cluster-mode-select" class="cell-muted" style="font-size: 0.8rem;">Mode:</label>
+                <select id="cluster-mode-select" class="form-input mono" style="padding: 2px 8px; font-size: 0.8rem;" onchange="updateClusterMode(this.value)">
+                  <option value="automatic">Automatic (Ranking-based)</option>
+                  <option value="manual_preference">Manual Preference</option>
+                </select>
+              </div>
+              <div id="preferred-leader-wrap" style="display: none; align-items: center; gap: 6px;" class="mono">
+                <label for="preferred-leader-select" class="cell-muted" style="font-size: 0.8rem;">Preferred:</label>
+                <select id="preferred-leader-select" class="form-input mono" style="padding: 2px 8px; font-size: 0.8rem;" onchange="updatePreferredLeader(this.value)">
+                  <option value="">-- None --</option>
+                </select>
+              </div>
+              <button class="btn btn-sm btn-secondary" onclick="refreshLeaderManagementUI()" title="Refresh leadership status">⟳ Refresh</button>
+            </div>
+          </div>
+
+          <div id="leader-management-body" class="section-collapsible-body" role="region" aria-labelledby="leader-management-toggle">
+          <!-- Cluster Status Banner: Leader, Lease, Fencing Term, Transition, Tunnel -->
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 14px; padding: 12px; background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid var(--border-subtle);">
+            <div>
+              <span class="summary-label">Current Leader</span>
+              <div class="mono" style="font-size: 0.95rem; font-weight: 600; color: #58a6ff;" id="leader-ui-name">-</div>
+              <div class="mono cell-muted" style="font-size: 0.75rem;" id="leader-ui-id">-</div>
+            </div>
+            <div>
+              <span class="summary-label">Leadership Term &amp; Lease</span>
+              <div class="mono cell-muted" style="font-size: 0.95rem; font-weight: 600;" id="leader-ui-term">—</div>
+              <div class="mono cell-muted" style="font-size: 0.75rem;" id="leader-ui-lease-countdown">—</div>
+            </div>
+            <div>
+              <span class="summary-label">Cloudflare Tunnel Ingress</span>
+              <div class="mono cell-muted" style="font-size: 0.95rem; font-weight: 600;" id="leader-ui-tunnel">—</div>
+              <div class="mono cell-muted" style="font-size: 0.75rem;" id="leader-ui-ingress">—</div>
+            </div>
+            <div>
+              <span class="summary-label">Last Transition</span>
+              <div class="mono cell-muted" style="font-size: 0.85rem;" id="leader-ui-last-transition-reason">—</div>
+              <div class="mono cell-muted" style="font-size: 0.75rem;" id="leader-ui-last-transition-time">-</div>
+            </div>
+          </div>
+
+          <!-- Leadership Eligibility & Ranking Table -->
+          <div class="table-container">
+            <table class="data-table" id="leader-ranking-table">
+              <thead>
+                <tr>
+                  <th>Node</th>
+                  <th>Status</th>
+                  <th>Role</th>
+                  <th>Leader Eligible</th>
+                  <th>Priority</th>
+                  <th>Performance Score</th>
+                  <th>Worker</th>
+                  <th>Build Worker</th>
+                  <th style="text-align: right;">Handover</th>
+                </tr>
+              </thead>
+              <tbody id="leader-ranking-tbody">
+                <tr><td colspan="9" class="cell-muted">Loading candidate ranking...</td></tr>
+              </tbody>
+            </table>
+          </div>
           </div>
         </div>
 
@@ -838,6 +928,7 @@
                     <label for="deploy-runtime">Runtime</label>
                     <select id="deploy-runtime" class="form-input mono">
                       <option value="auto">Auto (Docker on Node 03 / udocker on Node 02)</option>
+                      <option value="python">Python 3 / Native (Termux & Hosts)</option>
                       <option value="docker">Docker Daemon</option>
                       <option value="udocker">udocker (Userspace Container)</option>
                     </select>
@@ -947,7 +1038,8 @@
               <span id="app-panel-status-pill"></span>
             </div>
             <div style="display: flex; gap: 6px;">
-              <button class="btn btn-sm btn-primary" id="app-panel-redeploy-btn">Redeploy</button>
+              <button class="btn btn-sm btn-primary" id="app-panel-deploy-modal-btn" onclick="openManualDeployModal(currentActiveAppId)">Deploy Release</button>
+              <button class="btn btn-sm" id="app-panel-redeploy-btn">Quick Redeploy</button>
               <button class="btn btn-sm" onclick="closeAppDetails()">Close</button>
             </div>
           </div>
@@ -966,6 +1058,74 @@
             <div class="sys-kv-list mono" id="app-overview-kv">
               <div class="sys-kv-row"><span class="sys-kv-k">Loading...</span></div>
             </div>
+
+            <!-- GitHub Auto-Deploy & Webhook Settings Card -->
+            <div id="app-webhook-card" style="margin-top: 16px; background: rgba(255,255,255,0.02); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px 16px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <span style="font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">GitHub Push Detection &amp; Auto-Deploy</span>
+                  <span id="app-webhook-status-badge"></span>
+                </div>
+                <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; margin: 0;">
+                  <input type="checkbox" id="app-webhook-enable-toggle" onchange="toggleAppWebhookEnabled()">
+                  <span style="font-weight: 500;">Enable Webhook</span>
+                </label>
+              </div>
+
+              <div id="app-webhook-details" style="display: none;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+                  <div>
+                    <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">Payload URL</label>
+                    <div style="display: flex; gap: 6px;">
+                      <input type="text" id="app-webhook-url-input" class="form-input mono" readonly style="width: 100%; font-size: 11px;">
+                      <button class="btn btn-sm" onclick="copyWebhookUrl()" title="Copy URL">Copy</button>
+                    </div>
+                  </div>
+                  <div>
+                    <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">Secret (HMAC-SHA256)</label>
+                    <div style="display: flex; gap: 6px;">
+                      <input type="text" id="app-webhook-secret-input" class="form-input mono" readonly value="••••••••" style="width: 100%; font-size: 11px;">
+                      <button class="btn btn-sm" id="app-webhook-reveal-btn" onclick="revealWebhookSecret()">Reveal</button>
+                      <button class="btn btn-sm btn-outline-warning" onclick="generateNewWebhookSecret()" title="Generate fresh secret">Generate</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+                  <div>
+                    <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">Auto-Deploy Policy</label>
+                    <select id="app-webhook-policy-select" class="form-input mono" style="font-size: 11px; width: 100%;">
+                      <option value="automatic">Automatic (Build &amp; Deploy on Push)</option>
+                      <option value="manual_approval">Manual Approval (Build Only)</option>
+                      <option value="build_only">Build Only (Produce Artifact)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">Monitored Branch</label>
+                    <input type="text" id="app-webhook-branch-input" class="form-input mono" placeholder="main" style="font-size: 11px; width: 100%;">
+                  </div>
+                  <div>
+                    <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">Target Node</label>
+                    <select id="app-webhook-node-select" class="form-input mono" style="font-size: 11px; width: 100%;">
+                      <option value="auto">Auto (Scheduler)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <!-- Last Delivery Status Banner -->
+                <div id="app-webhook-delivery-card" style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 12px; font-size: 11px; margin-bottom: 12px;" class="mono">
+                  <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                    <span style="color: var(--text-muted);">Last Delivery Status:</span>
+                    <span id="app-webhook-last-status">None</span>
+                  </div>
+                  <div id="app-webhook-last-meta" class="cell-muted">No webhook push received yet.</div>
+                </div>
+
+                <div style="display: flex; justify-content: flex-end;">
+                  <button class="btn btn-sm btn-primary" onclick="saveWebhookSettings()">Save Webhook Settings</button>
+                </div>
+              </div>
+            </div>
           </div>
 
           <!-- Tab 2: Deployments History -->
@@ -974,17 +1134,18 @@
               <table class="data-table">
                 <thead>
                   <tr>
-                    <th style="width: 90px;">Deploy #</th>
-                    <th style="width: 100px;">Commit</th>
-                    <th style="width: 110px;">Branch</th>
-                    <th style="width: 100px;">Trigger</th>
-                    <th style="width: 100px;">Status</th>
+                    <th style="width: 80px;">Deploy #</th>
+                    <th style="width: 90px;">Commit</th>
+                    <th style="width: 100px;">Branch</th>
+                    <th style="width: 90px;">Trigger</th>
+                    <th style="width: 90px;">Status</th>
                     <th style="width: 90px;">Duration</th>
                     <th>Started At</th>
+                    <th style="width: 100px; text-align: right;">Actions</th>
                   </tr>
                 </thead>
                 <tbody id="app-deployments-tbody">
-                  <tr><td colspan="7" class="cell-muted">No deployment history recorded.</td></tr>
+                  <tr><td colspan="8" class="cell-muted">No deployment history recorded.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1352,7 +1513,60 @@
         <button type="button" class="btn btn-sm btn-danger" id="upload-cancel-btn" onclick="cancelFolderUpload()">Cancel</button>
         <button type="button" class="btn btn-sm btn-primary" id="upload-done-btn" onclick="closeFolderUploadModal()" style="display:none;">Done</button>
         <button type="button" class="btn btn-sm btn-warning" id="upload-retry-btn" onclick="retryFailedUploads(false)" style="display:none;">Retry Failed</button>
-        <button type="button" class="btn btn-sm btn-danger" id="upload-overwrite-retry-btn" onclick="retryFailedUploads(true)" style="display:none;">Overwrite & Retry</button>
+  <!-- Manual Release Deployment & Build Progress Modal -->
+  <div id="manual-deploy-modal-backdrop" class="modal-backdrop" style="display:none">
+    <div class="modal-frame" style="max-width: 620px; width: 92%;" role="dialog" aria-modal="true" aria-labelledby="manual-deploy-modal-title">
+      <div class="modal-header">
+        <span class="modal-title mono" id="manual-deploy-modal-title">Deploy Release</span>
+        <button type="button" class="modal-close-btn" onclick="closeManualDeployModal()" title="Close">✕</button>
+      </div>
+      <div class="modal-body" style="padding: 18px 20px;">
+        <div id="manual-deploy-form-container">
+          <div style="margin-bottom: 12px; font-size: 13px; color: var(--text-muted);" id="manual-deploy-app-desc">
+            Trigger a release deployment with specific branch, commit SHA, and node placement.
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+            <div class="form-cell">
+              <label for="manual-deploy-branch" style="font-size: 12px; font-weight: 500; display: block; margin-bottom: 4px;">Branch / Tag</label>
+              <input type="text" id="manual-deploy-branch" class="form-input mono" placeholder="main" style="width: 100%;">
+            </div>
+            <div class="form-cell">
+              <label for="manual-deploy-commit" style="font-size: 12px; font-weight: 500; display: block; margin-bottom: 4px;">Commit SHA (Optional)</label>
+              <input type="text" id="manual-deploy-commit" class="form-input mono" placeholder="Latest (or 40-char SHA)" style="width: 100%;">
+            </div>
+          </div>
+
+          <div class="form-cell" style="margin-bottom: 14px;">
+            <label for="manual-deploy-node" style="font-size: 12px; font-weight: 500; display: block; margin-bottom: 4px;">Target Node Policy</label>
+            <select id="manual-deploy-node" class="form-input mono" style="width: 100%;">
+              <option value="">Auto (ResourceScheduler &amp; Capabilities)</option>
+            </select>
+            <span class="cell-muted" style="font-size: 11px; margin-top: 4px; display: block;">Select a specific eligible node or let the scheduler choose automatically.</span>
+          </div>
+        </div>
+
+        <!-- Live Deployment Status and Logs -->
+        <div id="manual-deploy-status-container" style="display:none;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span class="mono" id="manual-deploy-stage-text" style="font-size: 13px; font-weight: 600;">Deploying...</span>
+            <span id="manual-deploy-status-pill"></span>
+          </div>
+
+          <div id="manual-deploy-meta-box" style="margin-bottom: 10px; background: rgba(255,255,255,0.02); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 10px 12px; font-size: 12px;" class="mono">
+            <div id="manual-deploy-meta-commit">Commit: -</div>
+            <div id="manual-deploy-meta-checksum" style="word-break: break-all;">Artifact SHA-256: -</div>
+            <div id="manual-deploy-meta-node">Target Node: -</div>
+            <div id="manual-deploy-meta-health">Health Probe: -</div>
+          </div>
+
+          <div style="font-size: 11px; margin-bottom: 4px; color: var(--text-muted); font-weight: 600;">DEPLOYMENT &amp; BUILD LOGS:</div>
+          <pre id="manual-deploy-logs" class="log-box mono" style="max-height: 220px; overflow-y: auto; font-size: 11px; padding: 10px; border-radius: 6px;"></pre>
+        </div>
+      </div>
+      <div class="modal-footer" style="display: flex; justify-content: flex-end; gap: 8px;">
+        <button type="button" class="btn btn-sm" id="manual-deploy-cancel-btn" onclick="closeManualDeployModal()">Cancel</button>
+        <button type="button" class="btn btn-sm btn-primary" id="manual-deploy-submit-btn" onclick="submitManualDeploy()">Trigger Deployment</button>
       </div>
     </div>
   </div>

@@ -34,6 +34,10 @@ UNIT_TEST_FILES = [
     "tests/unit/test_doctor.py",
     "tests/unit/test_worker_lifecycle_safety.py",
     "tests/unit/test_capability_probes.py",
+    "tests/unit/test_build_worker.py",
+    "tests/unit/test_app_manifest.py",
+    "tests/unit/test_process_identity_safety.py",
+    "tests/unit/test_dns_utils.py",
 ]
 
 # Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing, HA
@@ -41,6 +45,8 @@ INTEGRATION_TEST_FILES = [
     # Controller domain
     "tests/controller/test_job_lifecycle.py",
     "tests/controller/test_job_cancellation_pagination.py",
+    "tests/controller/test_job_query_routes.py",
+    "tests/controller/test_job_submission_routes.py",
     "tests/controller/test_job_deletion.py",
     "tests/controller/test_node_deboarding.py",
     "tests/controller/test_node_diagnostics.py",
@@ -54,6 +60,7 @@ INTEGRATION_TEST_FILES = [
     "tests/controller/test_controller_recovery.py",
     "tests/controller/test_operational_reliability.py",
     "tests/controller/test_cross_worker_artifact_exchange.py",
+    "tests/controller/test_standalone_job_contract.py",
     "tests/canary/test_staging_canary.py",
     # Storage domain
     "tests/storage/test_storage_explorer_api.py",
@@ -63,12 +70,17 @@ INTEGRATION_TEST_FILES = [
     # Routing domain
     "tests/routing/test_app_routing.py",
     "tests/routing/test_public_ingress_routing.py",
+    "tests/routing/test_multi_app_routing.py",
+    "tests/routing/test_portfolio_deployment.py",
     # Deployment domain
     "tests/deployment/test_docker_capabilities.py",
     "tests/deployment/test_docker_runtime.py",
     "tests/deployment/test_image_build.py",
     "tests/deployment/test_image_deployment.py",
     "tests/deployment/test_source_deployment.py",
+    "tests/deployment/test_ui_manual_deploy.py",
+    "tests/deployment/test_scheduler_backed_deployment.py",
+    "tests/deployment/test_r1_r3_rebuild_pipeline.py",
     # Security domain
     "tests/security/test_security_audit.py",
     # High Availability domain
@@ -76,9 +88,24 @@ INTEGRATION_TEST_FILES = [
     "tests/ha/test_ha_global_header.py",
     "tests/ha/test_ha_leader_identity_audit.py",
     "tests/ha/test_cluster_inventory_v18.py",
+    "tests/ha/test_lock_ordering_and_recovery.py",
+    "tests/ha/test_leader_aware_ingress.py",
+    "tests/ha/test_acceptance_e2e.py",
+    "tests/ha/test_ha_safety_corrections.py",
+    "tests/ha/test_controlled_handover.py",
+    "tests/ha/test_leader_ranking.py",
+    # Additional routing, deployment & storage suites
+    "tests/routing/test_apex_app_routing.py",
+    "tests/routing/test_deployment_port_alignment.py",
+    "tests/deployment/test_ui_manual_deploy.py",
+    "tests/deployment/test_deployment_reliability.py",
+    "tests/deployment/test_process_observability.py",
+    "tests/deployment/test_github_webhook_autodeploy.py",
+    "tests/storage/test_remote_worker_storage_auth.py",
     # Web UI domain
     "tests/ui/test_dashboard_js_syntax.py",
     "tests/ui/test_shell_layout_stability.py",
+    "tests/ui/test_workload_control_ui.py",
 ]
 
 

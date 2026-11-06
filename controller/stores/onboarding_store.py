@@ -43,6 +43,5 @@ def load_onboarding_codes_db(paths: Optional[Any] = None) -> Dict[str, Any]:
 def save_onboarding_codes_db(db: Dict[str, Any], paths: Optional[Any] = None) -> None:
     """Atomically persists the hashed onboarding codes database and creates a backup."""
     curr_paths = paths or get_controller_paths()
-    with DB_LOCK:
-        curr_paths.ensure_directories()
-        atomic_save_json(curr_paths.onboarding_codes_file, curr_paths.backup_onboarding_codes_file, db, lock=DB_LOCK, bump_ha=False)
+    curr_paths.ensure_directories()
+    atomic_save_json(curr_paths.onboarding_codes_file, curr_paths.backup_onboarding_codes_file, db, lock=DB_LOCK, bump_ha=False)
