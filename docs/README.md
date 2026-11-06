@@ -1,112 +1,61 @@
-# PersonalServer Documentation System & Canonical Index
+# PersonalServer Technical Documentation
 
 > **Project Status**: Production Ready (Milestones J1–J5, R1–R9, HA Cluster Active)  
-> **Audience**: Contributors, Operators, System Architects  
-> **Last Reviewed**: November 2026  
-> **Architecture Target**: Android (Vivo Y31 Controller, Realme 5 Pro Compute Worker) & Linux Edge
+> **Architecture Target**: Android (Vivo Y31 Controller, Realme 5 Pro Compute Worker), Linux & Edge  
+> **Last Updated**: November 2026
 
-Welcome to the canonical documentation tree for **PersonalServer** — an autonomous, self-hosted, distributed edge compute and application hosting platform designed to run 24/7 on recycled Android smartphones (via Termux) and lightweight Linux devices over a secure private mesh (Tailscale) with public ingress (Cloudflare Tunnel).
-
----
-
-## 🧭 Navigational Reading Sequence
-
-For new contributors and operators, we recommend reading documents in this exact order:
-
-```mermaid
-flowchart TD
-    A["1. Project Overview<br/>(docs/README.md)"] --> B["2. System Architecture<br/>(docs/architecture.md)"]
-    B --> C["3. Getting Started & Setup<br/>(docs/getting-started.md)"]
-    C --> D["4. Node Enrollment<br/>(docs/node-enrollment.md)"]
-    D --> E["5. Capability Registry J2<br/>(docs/capability_registry_j2.md)"]
-    E --> F["6. Universal Job Contract J1<br/>(docs/universal_job_contract_j1.md)"]
-    F --> G["7. Universal Scheduler J3<br/>(docs/universal_scheduler_j3.md)"]
-    G --> H["8. High Availability & Failover<br/>(docs/high_availability_failover.md)"]
-    H --> I["9. Deployment Architecture D0<br/>(docs/deployment_architecture_d0.md)"]
-    I --> J["10. Operations & Doctor Runbook<br/>(docs/doctor.md / troubleshooting.md)"]
-    J --> K["11. Development & Contribution<br/>(docs/development.md / CONTRIBUTING.md)"]
-```
+Welcome to PersonalServer — an autonomous, self-hosted, distributed compute cluster and edge application platform designed to run 24/7 on heterogeneous, recycled personal hardware (Android phones via Termux, Raspberry Pis, Linux servers, and Windows workstations).
 
 ---
 
-## 📚 Complete Document Catalog by Subsystem
+## 🚀 New User? Start Here
 
-### 1. Project Overview & System Architecture
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [System Architecture](file:///docs/architecture.md) | **Current** | All | System topology, Android-first edge cluster, mesh networking, and ingress planes. |
-| [Hardware Migration Plan](file:///docs/hardware_migration_plan.md) | **Historical / Reference** | Architects | Progression from Windows development to dual-Android Termux and Raspberry Pi hardware. |
-| [Raspberry Pi Migration](file:///docs/raspberry_pi_migration.md) | **Reference** | Operators | Linux Filesystem Hierarchy Standard (FHS) mapping and systemd integration. |
-| [Roadmap & Evolution](file:///docs/roadmap.md) | **Living** | All | Historical milestones (v0.1–v1.2) through modern J1–J5 and R1–R9 implementations. |
+Follow our numbered user guides in numerical order to go from a clean checkout to a fully deployed and monitored distributed server:
 
-### 2. Node Onboarding & Edge Agent
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [Getting Started](file:///docs/getting-started.md) | **Current** | Beginners / Operators | Initial cluster initialization, environment configuration, and web UI walkthrough. |
-| [Node Enrollment](file:///docs/node-enrollment.md) | **Current** | Operators | Zero-touch `PS-XXXX-XXXX` secure pairing protocol, SHA-256 token authentication. |
-| [Node Agent & Supervisor](file:///docs/node-agent.md) | **Current** | Operators / Developers | Edge node supervisor, telemetry loop, process tracking, and capability probers. |
-| [Reproducible Setup & Backups](file:///docs/reproducible_setup.md) | **Current** | Operators | Clean checkout bootstrapping, backup/recovery automation, and environment safety. |
-
-### 3. Normative Specifications (J1–J3, D0)
-> [!IMPORTANT]
-> The following documents are **normative architectural specifications**. Their design contracts, error codes, and state machines are authoritative.
-
-| Specification | Status | Normative Scope | Description |
-|---|---|---|---|
-| [Universal Job Contract (J1)](file:///docs/universal_job_contract_j1.md) | **Frozen / Authoritative** | Core Architecture | Canonical job definition, artifact declarations, environment bindings, and exit contracts. |
-| [Capability Registry (J2)](file:///docs/capability_registry_j2.md) | **Frozen / Authoritative** | Core Architecture | Static and dynamic hardware/software capability probing, namespaces, and verification. |
-| [Universal Scheduler (J3)](file:///docs/universal_scheduler_j3.md) | **Frozen / Authoritative** | Core Architecture | 8-stage eligibility pipeline, priority aging, multi-factor scoring, atomic reservations. |
-| [Deployment Architecture (D0)](file:///docs/deployment_architecture_d0.md) | **Frozen / Authoritative** | Core Architecture | Multi-runtime (Node.js, Python, Static, Docker) deployment engine, lifecycle, and rollback. |
-
-### 4. Workload Scheduling, Execution & Results (J3–J5)
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [Distributed Scheduler Guide](file:///docs/distributed_scheduler_guide.md) | **Current** | Developers / Operators | Practical guide to workload dispatch, eligibility filtering, and scoring heuristics. |
-| [Resource-Aware Scheduling Baseline](file:///docs/scheduling.md) | **Reference** | Developers | Baseline resource constraint matching and Docker requirement enforcement. |
-| [Job Lifecycle & Recovery](file:///docs/job_lifecycle_recovery.md) | **Current** | Developers | Finite State Machine (FSM), heartbeat lease sweeping, and worker disappearance recovery. |
-| [Job Reliability & Leases](file:///docs/reliability.md) | **Current** | Developers | Monotonic fencing generations, attempt isolation, and CAS state promotion. |
-| [Workloads & Allowlist](file:///docs/jobs.md) | **Current** | Developers / Operators | Execution boundaries, allowlisted workload types, and sandbox security. |
-
-### 5. High Availability & Cluster Resilience
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [High Availability & Failover](file:///docs/high_availability_failover.md) | **Current** | Operators / Architects | Two-node HA leader leases, split-brain defenses, graceful handover, and candidate ranking. |
-| [Controller Reference & API](file:///docs/controller.md) | **Current** | Developers / Operators | Authoritative controller endpoints, state stores, CLI management commands. |
-
-### 6. Application Deployment & Multi-Runtime Hosting (R1–R9)
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [Multi-App Deployment](file:///docs/multi_app_deployment.md) | **Current** | Developers / Operators | Sub-application lifecycle, port assignment, health probing, and automatic rollback. |
-| [Image Build & Deploy Workflow](file:///docs/image_build_deploy_workflow.md) | **Current** | Developers | Decoupled image building, container runtime verification, and digest checking. |
-| [App Routing & Gateway](file:///docs/domain_migration.md) | **Current** | Operators | Cloudflare ingress, reverse proxy routing, apex domain app forwarding. |
-
-### 7. Storage, Networking & Security
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [Multi-Node Storage Explorer](file:///docs/storage.md) | **Current** | Developers / Operators | Distributed storage browser, path traversal defenses, and chunked streaming. |
-| [Networking & Mesh Ingress](file:///docs/networking.md) | **Current** | Operators | Dual-plane networking: private Tailscale mesh (100.x) and public Cloudflare tunnel. |
-| [Security & Threat Model](file:///docs/security.md) | **Current** | Security / Architects | Authentication tokens, privilege separation, environment sanitization, and sandboxing. |
-
-### 8. Operations, Diagnostics & Diagnostics
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [Doctor Diagnostic Framework](file:///docs/doctor.md) | **Current** | Operators | Self-healing diagnostics (`ps doctor`), automated remediation, and circuit breakers. |
-| [Troubleshooting Runbook](file:///docs/troubleshooting.md) | **Current** | Operators | Step-by-step diagnostic procedures for node offline, lease timeouts, and proxy errors. |
-| [Multi-Node Simulation Suite](file:///docs/multi_node_simulation.md) | **Current** | QA / Developers | Mock cluster multi-worker loopback test harness for CI/CD and offline verification. |
-
-### 9. Development & Contributing
-| Document | Status | Intended Audience | Description |
-|---|---|---|---|
-| [Development & Testing Guide](file:///docs/development.md) | **Current** | Developers | Setting up virtual environment, test running (`pytest`), coding standards. |
-| [Contributor Guidelines](file:///CONTRIBUTING.md) | **Current** | Contributors | Architecture rules, PR hygiene, atomic commit standards, and hardware safety constraints. |
+| Step | Guide | Purpose | Intended Audience | Expected Outcome |
+|---|---|---|---|---|
+| **01** | [01 — Setup Guide](01_setup.md) | Platform overview, prerequisites, repository cloning, initial config | All users | Running controller & verified web dashboard |
+| **02** | [02 — Node Setup Guide](02_node_setup.md) | Prepare Android/Linux/Windows nodes, network mesh, zero-touch pairing | Operators | Enrolled cluster nodes reporting capabilities |
+| **03** | [03 — Deployment Guide](03_deployment.md) | Application manifests, packaging, deploying Node.js/Python/Static apps | Developers | Live applications running with health checks |
+| **04** | [04 — Cluster Management](04_cluster_management.md) | Managing workloads, submitting batch jobs, scheduler decisions | Operators / Users | Dispatched compute jobs with captured outputs |
+| **05** | [05 — High Availability](05_high_availability.md) | Active-standby consensus, leader leases, automated failover | Architects / Operators | Redundant cluster with zero single points of failure |
+| **06** | [06 — Storage & Artifacts](06_storage_and_artifacts.md) | Application storage, cryptographic verification, file exchange | Developers / Operators | Sandboxed storage and automated artifact collection |
+| **07** | [07 — Monitoring & Troubleshooting](07_monitoring_and_troubleshooting.md) | Self-healing doctor utility, system logs, common error recovery | Operators | Verified cluster health and diagnostic mastery |
+| **08** | [08 — Development Guide](08_development.md) | Repository structure, offline test running, contribution rules | Contributors | Configured dev environment & passing test suite |
+| **09** | [09 — Architecture Reference](09_architecture_reference.md) | Subsystem component map, data flows, normative specifications | Architects | Comprehensive understanding of cluster internals |
 
 ---
 
-## 🔒 Physical Hardware Topology
+## 🏛️ Advanced Technical Reference & Normative Specifications
+
+For in-depth protocol definitions, mathematical formulas, state machine transition tables, and error code contracts, consult the authoritative specifications in [`docs/reference/`](reference/):
+
+- **[Universal Job Contract (J1)](reference/universal_job_contract_j1.md)**: Standardized job definition, execution environment, and artifact schema.
+- **[Capability Registry (J2)](reference/capability_registry_j2.md)**: Static and dynamic hardware/software capability discovery.
+- **[Universal Scheduler (J3)](reference/universal_scheduler_j3.md)**: 8-stage eligibility pipeline, scoring formula, and atomic reservations.
+- **[Deployment Architecture (D0)](reference/deployment_architecture_d0.md)**: Universal multi-runtime application deployment lifecycle and rollback.
+- **[Hardware Migration Plan](reference/hardware_migration_plan.md)**: Roadmap transitioning from workstation development to mobile hardware.
+- **[Raspberry Pi Migration](reference/raspberry_pi_migration.md)**: Linux Filesystem Hierarchy Standard (FHS) mapping and systemd daemon units.
+- **[Multi-Node Simulation Suite](reference/multi_node_simulation.md)**: Hardware-independent multi-worker loopback test harness.
+- **[Image Build & Deploy Workflow](reference/image_build_deploy_workflow.md)**: Decoupled 8-stage image pipeline and OCI digest verification.
+
+---
+
+## 💻 Supported Hardware & Operating Systems Matrix
+
+| Platform / Environment | Supported Roles | Native Python | Native Node.js | Native Containers | Storage Explorer | Telemetry Sensors |
+|---|---|---|---|---|---|---|
+| **Android / Termux** (unrooted) | Controller, Standby, Worker | ✅ Python 3.9+ | ✅ Node.js 18+ | ❌ Kernel cgroup restricted | ✅ Sandboxed | ✅ Battery, WiFi dBm, thermals |
+| **Linux (Debian / Ubuntu / x86_64 / arm64)** | Controller, Standby, Worker | ✅ Python 3.9+ | ✅ Node.js 18+ | ✅ Docker Engine | ✅ Sandboxed | ✅ System `/proc` & `sysfs` |
+| **Raspberry Pi OS (arm64)** | Worker, Storage Host | ✅ Python 3.9+ | ✅ Node.js 18+ | ✅ Docker Engine | ✅ Sandboxed | ✅ `vcgencmd` & thermal sysfs |
+| **Windows 10/11 (Development PC)** | On-Demand Build Worker | ✅ Python 3.10+ | ✅ Node.js 18+ | ⚠️ Docker Desktop | ❌ Excluded (Ephemeral) | ✅ Win32 GlobalMemoryStatus |
+
+---
+
+## 🔒 Physical Production Hardware Topology
 
 The operational cluster runs in a dedicated physical topology:
-
 - **Primary Controller / Leader**: Vivo Y31 (Android Termux) — `100.85.108.5:8000`
 - **Compute Worker / Standby Controller**: Realme 5 Pro (Android Termux) — `100.73.52.72:8000`
-- **Operator Workstation**: Windows 11 PC — for development, test orchestration, and offline simulation.
+- **On-Demand Build Worker**: Windows 11 Workstation — `100.64.1.1`
 - **Ingress**: Cloudflare Tunnel routing public domains (`akshatsahay.space`, `server.akshatsahay.space`) directly to the cluster.
