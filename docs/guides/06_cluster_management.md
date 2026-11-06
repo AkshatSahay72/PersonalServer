@@ -1,8 +1,8 @@
-# 04 — Cluster Management Guide: Workloads, Jobs & Scheduling
+# 06 — Cluster Management Guide: Workloads, Jobs & Scheduling
 
-> **Reading Order**: **Step 4 of 9** in the PersonalServer User Guide sequence.  
-> **Previous Guide**: [03 — Deployment Guide](03_deployment.md)  
-> **Next Guide**: [05 — High Availability Guide](05_high_availability.md)  
+> **Reading Order**: **Step 6 of 12** in the PersonalServer Guide Series.  
+> **Previous Guide**: [05 — First Deployment](05_first_deployment.md)  
+> **Next Guide**: [07 — Storage & Artifacts](07_storage_and_artifacts.md)  
 > **Audience**: Cluster administrators and users running asynchronous distributed batch jobs.  
 > **Prerequisites**: A running controller and at least one enrolled worker node.
 
@@ -10,12 +10,12 @@
 
 ## 1. Workload Processing in PersonalServer
 
-In addition to long-running applications (Guide 03), PersonalServer features a powerful distributed job execution engine based on the **Universal Job Contract (J1)** and **Universal Scheduler (J3)**.
+In addition to long-running web applications (Guide 05), PersonalServer features a powerful distributed job execution engine based on the **Universal Job Contract (J1)** and **Universal Scheduler (J3)**.
 
-### Job Characteristics:
+### Key Job Characteristics:
 - **Asynchronous Execution**: Submissions return immediately with a unique `job_id`.
-- **Resource Reservations**: Workers reserve RAM and CPU shares before job dispatch to prevent Out-Of-Memory (OOM) crashes on smartphones.
-- **Process Group Isolation**: Jobs execute in dedicated attempts with strict timeouts, process trees, and stdout/stderr capture.
+- **Atomic Resource Reservations**: Workers reserve RAM and CPU shares before dispatch to prevent Out-Of-Memory (OOM) crashes on smartphones.
+- **Process Group Isolation**: Jobs execute in dedicated workspaces with strict timeouts, process trees, and stdout/stderr capture.
 - **Declared Output Artifacts**: Jobs can declare generated output files, which are hashed (SHA-256), discovered, and collected automatically into cluster storage upon completion.
 
 ---
@@ -122,8 +122,8 @@ The controller immediately notifies the assigned worker agent, which sends `SIGT
 
 ---
 
-## 6. Next Steps
+## 6. Next Step
 
-To ensure that your cluster remains operational even if the master phone battery dies or the process is stopped, configure High Availability:
+Learn how to manage storage directories, exchange artifacts, and verify cryptographic checksums:
 
-👉 **Continue to [05 — High Availability Guide](05_high_availability.md)**
+👉 **Continue to [07 — Storage & Artifacts Guide](07_storage_and_artifacts.md)**
