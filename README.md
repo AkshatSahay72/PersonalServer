@@ -155,12 +155,21 @@ python scripts/run_tests.py --lint
 
 ## 9. Detailed Documentation Index
 
-For in-depth operational runbooks, architecture specifications, and API guides, consult the [`docs/`](docs/README.md) directory:
+For in-depth operational runbooks, architecture specifications, and API guides, consult the [`docs/`](docs/README.md) directory.
 
-- **Architecture**: [System Architecture](docs/architecture.md) | [High Availability & Failover](docs/high_availability_failover.md) | [Networking & Ingress](docs/networking.md)
-- **Installation & Setup**: [Getting Started Guide](docs/getting-started.md) | [Node Enrollment & Pairing](docs/node-enrollment.md)
-- **Configuration**: [Centralized Configuration & Reproducible Setup](docs/reproducible_setup.md)
-- **Usage & Workloads**: [Workload Jobs](docs/jobs.md) | [Resource Scheduling](docs/scheduling.md) | [Multi-Node Storage](docs/storage.md)
-- **Deployment**: [Multi-App Deployment](docs/multi_app_deployment.md) | [Raspberry Pi Migration](docs/raspberry_pi_migration.md) | [Hardware Migration Plan](docs/hardware_migration_plan.md)
-- **Troubleshooting**: [Operational Troubleshooting Runbook](docs/troubleshooting.md) | [System Doctor Script](docs/doctor.md)
-- **Contribution & Development**: [Contribution Guidelines](CONTRIBUTING.md) | [Development Guide](docs/development.md)
+### User Guides (Follow in numerical order):
+1. **[01 — Setup Guide](docs/01_setup.md)**: Hardware overview, prerequisites, cloning, initial configuration, starting the controller.
+2. **[02 — Node Setup Guide](docs/02_node_setup.md)**: Preparing Android/Termux, Linux, and Windows nodes; private mesh setup; zero-touch pairing.
+3. **[03 — Deployment Guide](docs/03_deployment.md)**: Application manifests (`app.json`), packaging, deploying Node.js/Python/Static apps, auto-rollback.
+4. **[04 — Cluster Management](docs/04_cluster_management.md)**: Node roles, capability inspection, submitting batch jobs, scheduler decisions.
+5. **[05 — High Availability](docs/05_high_availability.md)**: Active-standby consensus, leader leases, automated failover, split-brain immunity.
+6. **[06 — Storage & Artifacts](docs/06_storage_and_artifacts.md)**: Sandboxed application storage, artifact transfer, SHA-256 integrity verification.
+7. **[07 — Monitoring & Troubleshooting](docs/07_monitoring_and_troubleshooting.md)**: Health checks, log streaming, automated self-healing doctor utility.
+8. **[08 — Development Guide](docs/08_development.md)**: Repository layout, running offline test suites, contribution principles.
+9. **[09 — Architecture Reference](docs/09_architecture_reference.md)**: Subsystem component map, data flows, and links to normative specifications.
+
+### Normative Specifications & Technical Reference:
+- **[Universal Job Contract (J1)](docs/reference/universal_job_contract_j1.md)**
+- **[Capability Registry (J2)](docs/reference/capability_registry_j2.md)**
+- **[Universal Scheduler (J3)](docs/reference/universal_scheduler_j3.md)**
+- **[Deployment Architecture (D0)](docs/reference/deployment_architecture_d0.md)**
