@@ -920,7 +920,10 @@ class LocalSocketTransport(BaseBridgeTransport):
                     error_code="EMPTY_RESPONSE",
                 )
 
-            return BridgeProtocol.parse_response(raw_response)
+            resp = BridgeProtocol.parse_response(raw_response)
+            resp.transport_used = "local_socket"
+            resp.fallback_used = False
+            return resp
 
         except socket.timeout:
             return BridgeProtocol.create_response(
@@ -953,29 +956,63 @@ class CompositeAndroidTransport(BaseBridgeTransport):
     """
     Tiered transport manager:
     Prefers high-performance LocalSocketTransport if native Android Bridge Service is active;
-    transparently falls back to AndroidCompanionTransport.
+    uses AndroidCompanionTransport only for supported non-native-only operations with explicit
+    fallback reporting.
     Tracks session affinity so SENSOR_READ/SENSOR_STOP route to the originating transport.
     """
+
+    NATIVE_ONLY_OPERATIONS = frozenset({
+        "PING",
+        "GET_DIAGNOSTICS",
+        "BRIDGE_DIAGNOSTICS",
+        "RECORDING_DISCOVER",
+        "START_RECORDING",
+        "RECORDING_STATUS",
+        "STOP_RECORDING",
+        "RECORDING_READ",
+        "RECORDING_CLEANUP",
+    })
 
     def __init__(
         self,
         socket_transport: Optional[BaseBridgeTransport] = None,
         companion_transport: Optional[BaseBridgeTransport] = None,
         socket_port: int = 8765,
+        allow_companion_fallback: bool = True,
+        require_native: bool = False,
     ):
         self.socket_transport = socket_transport or LocalSocketTransport(port=socket_port)
         self.companion_transport = companion_transport or AndroidCompanionTransport()
+        self.allow_companion_fallback = allow_companion_fallback
+        self.require_native = require_native
         self._session_transports: Dict[str, BaseBridgeTransport] = {}
+        self.last_transport_used: Optional[str] = None
+        self.last_fallback_used: bool = False
+        self.last_fallback_reason: Optional[str] = None
+        self.fallback_count: int = 0
 
     def is_available(self) -> bool:
+        if self.require_native or not self.allow_companion_fallback:
+            return self.socket_transport.is_available()
         return self.socket_transport.is_available() or self.companion_transport.is_available()
 
     def check_readiness(self) -> Tuple[bool, Optional[str]]:
         if self.socket_transport.is_available():
             return self.socket_transport.check_readiness()
+        if self.require_native or not self.allow_companion_fallback:
+            return False, "Native LocalSocketTransport unavailable and Termux fallback disabled"
         return self.companion_transport.check_readiness()
 
+    @staticmethod
+    def _tag_response(resp: Any, transport_used: str, fallback_used: bool, fallback_reason: Optional[str]) -> Any:
+        if isinstance(resp, AndroidBridgeResponse):
+            resp.transport_used = transport_used
+            resp.fallback_used = fallback_used
+            resp.fallback_reason = fallback_reason
+        return resp
+
     def send_request(self, request: AndroidBridgeRequest, timeout_sec: Optional[float] = None) -> AndroidBridgeResponse:
+        op_upper = str(request.operation or "").upper()
         # Route existing sensor session operations to originating transport
         if request.operation in ("SENSOR_READ", "SENSOR_STOP", "SENSOR_STATUS"):
             params = request.parameters or request.arguments or {}
@@ -984,7 +1021,13 @@ class CompositeAndroidTransport(BaseBridgeTransport):
                 target = self._session_transports[sid]
                 if target.is_available():
                     resp = target.send_request(request, timeout_sec=timeout_sec)
-                    if request.operation == "SENSOR_STOP" and resp.success:
+                    is_comp = target is self.companion_transport
+                    t_name = "termux_companion" if is_comp else "local_socket"
+                    self.last_transport_used = t_name
+                    self.last_fallback_used = is_comp
+                    self.last_fallback_reason = "session_affinity_companion" if is_comp else None
+                    self._tag_response(resp, t_name, is_comp, self.last_fallback_reason)
+                    if request.operation == "SENSOR_STOP" and (not isinstance(resp, AndroidBridgeResponse) or resp.success):
                         self._session_transports.pop(sid, None)
                     return resp
                 if request.operation == "SENSOR_STOP":
@@ -998,23 +1041,65 @@ class CompositeAndroidTransport(BaseBridgeTransport):
                     error_code="TRANSPORT_UNAVAILABLE",
                 )
 
-        chosen: BaseBridgeTransport
+        fallback_reason: Optional[str] = None
         if self.socket_transport.is_available():
             resp = self.socket_transport.send_request(request, timeout_sec=timeout_sec)
-            if resp.success:
+            resp_ok = resp.success if isinstance(resp, AndroidBridgeResponse) else True
+            if resp_ok:
+                self.last_transport_used = "local_socket"
+                self.last_fallback_used = False
+                self.last_fallback_reason = None
+                self._tag_response(resp, "local_socket", False, None)
                 if request.operation == "SENSOR_START":
                     sid = (resp.data or {}).get("session", {}).get("session_id")
                     if sid:
                         self._session_transports[sid] = self.socket_transport
                 return resp
-            # For explicit sensor errors (unsupported/rate limits), return directly unless transport itself failed
-            if resp.error_code not in ("SOCKET_ERROR", "TRANSPORT_UNAVAILABLE", "TIMEOUT", "EMPTY_RESPONSE"):
+
+            # For explicit domain errors or native-only ops / disabled fallback, return directly
+            err_code = resp.error_code if isinstance(resp, AndroidBridgeResponse) else None
+            if (
+                err_code not in ("SOCKET_ERROR", "TRANSPORT_UNAVAILABLE", "TIMEOUT", "EMPTY_RESPONSE")
+                or op_upper in self.NATIVE_ONLY_OPERATIONS
+                or self.require_native
+                or not self.allow_companion_fallback
+            ):
+                self.last_transport_used = "local_socket"
+                self.last_fallback_used = False
+                self.last_fallback_reason = None
+                self._tag_response(resp, "local_socket", False, None)
                 return resp
-            logger.debug("Socket transport returned error, falling back to companion: %s", resp.error)
+            fallback_reason = f"native_socket:{err_code}"
+            logger.warning("Native socket transport failed (%s); falling back to Termux companion for %s", err_code, request.operation)
+        else:
+            if op_upper in self.NATIVE_ONLY_OPERATIONS or self.require_native or not self.allow_companion_fallback:
+                return BridgeProtocol.create_response(
+                    request=request,
+                    success=False,
+                    status=BridgePermissionState.UNAVAILABLE.value,
+                    error=f"Native local socket transport unavailable for '{request.operation}'",
+                    error_code="TRANSPORT_UNAVAILABLE",
+                )
+            fallback_reason = "native_socket_unavailable"
+            logger.warning("Native socket transport unavailable; using Termux companion fallback for %s", request.operation)
+
+        if not self.companion_transport.is_available():
+            return BridgeProtocol.create_response(
+                request=request,
+                success=False,
+                status=BridgePermissionState.UNAVAILABLE.value,
+                error="Neither native socket transport nor Termux companion transport is available",
+                error_code="TRANSPORT_UNAVAILABLE",
+            )
 
         chosen = self.companion_transport
         resp = chosen.send_request(request, timeout_sec=timeout_sec)
-        if request.operation == "SENSOR_START" and resp.success:
+        self.last_transport_used = "termux_companion"
+        self.last_fallback_used = True
+        self.last_fallback_reason = fallback_reason
+        self.fallback_count += 1
+        self._tag_response(resp, "termux_companion", True, fallback_reason)
+        if request.operation == "SENSOR_START" and isinstance(resp, AndroidBridgeResponse) and resp.success:
             sid = (resp.data or {}).get("session", {}).get("session_id")
             if sid:
                 self._session_transports[sid] = chosen

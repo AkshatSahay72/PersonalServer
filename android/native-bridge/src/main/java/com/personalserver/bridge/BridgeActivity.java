@@ -32,6 +32,8 @@ public class BridgeActivity extends AppCompatActivity {
     private static final String TAG = "BridgeActivity";
     private static final int REQ_NOTIFICATIONS = 1001;
     private static final int REQ_RECORD_AUDIO = 1002;
+    private static final long START_FAILURE_COOLDOWN_MS = 1000L;
+    private static volatile boolean activityAlive = false;
 
     private TextView statusText;
     private TextView sensorsText;
@@ -39,7 +41,13 @@ public class BridgeActivity extends AppCompatActivity {
     private volatile boolean activityResumed = false;
     private volatile boolean pendingStartRequest = false;
     private int pendingResumeRetries = 0;
+    private volatile int consecutiveStartFailures = 0;
+    private volatile long lastStartFailureMs = 0L;
     private volatile String lastLifecycleError = null;
+
+    public static boolean isActivityAlive() {
+        return activityAlive;
+    }
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final Runnable refreshTask = new Runnable() {
         @Override
@@ -52,6 +60,7 @@ public class BridgeActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        activityAlive = true;
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -113,6 +122,7 @@ public class BridgeActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        activityAlive = false;
         uiHandler.removeCallbacks(refreshTask);
         if (activitySensorManager != null) {
             activitySensorManager.stopAll();
@@ -246,6 +256,13 @@ public class BridgeActivity extends AppCompatActivity {
             updateStatusIfInitialized();
             return;
         }
+        long nowMs = System.currentTimeMillis();
+        if (consecutiveStartFailures >= 2 && lastStartFailureMs > 0L
+                && (nowMs - lastStartFailureMs) < START_FAILURE_COOLDOWN_MS) {
+            lastLifecycleError = "Start cooldown active after repeated failures";
+            updateStatusIfInitialized();
+            return;
+        }
 
         Intent svc = new Intent(this, BridgeService.class);
         svc.setAction(BridgeService.ACTION_START);
@@ -253,8 +270,12 @@ public class BridgeActivity extends AppCompatActivity {
             launchBridgeForegroundService(svc);
             pendingStartRequest = false;
             pendingResumeRetries = 0;
+            consecutiveStartFailures = 0;
+            lastStartFailureMs = 0L;
             lastLifecycleError = null;
         } catch (RuntimeException ex) {
+            consecutiveStartFailures++;
+            lastStartFailureMs = System.currentTimeMillis();
             boolean fgsRestricted = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                     && ex instanceof ForegroundServiceStartNotAllowedException)
                     || ex instanceof IllegalStateException;

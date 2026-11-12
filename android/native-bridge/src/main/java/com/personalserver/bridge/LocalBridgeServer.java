@@ -66,6 +66,15 @@ public class LocalBridgeServer {
     private SensorBridgeManager sensorManager;
     private MicrophoneBridgeManager microphoneManager;
     private volatile MicrophoneBridgeManager.RecordingNotificationListener recordingNotificationListener = null;
+    private volatile DiagnosticStateProbe diagnosticStateProbe = null;
+
+    public interface DiagnosticStateProbe {
+        JSONObject probeExternalStates();
+    }
+
+    public void setDiagnosticStateProbe(DiagnosticStateProbe probe) {
+        this.diagnosticStateProbe = probe;
+    }
     private ExecutorService executor;
     private ServerSocket serverSocket;
     private Thread acceptThread;
@@ -561,6 +570,13 @@ public class LocalBridgeServer {
                     return buildErrorResponse(opId, capability, operation, "ERROR", "UNKNOWN_OPERATION",
                             "Unknown operation: " + operation);
                 }
+            } else if ("GET_DIAGNOSTICS".equalsIgnoreCase(operation) || "BRIDGE_DIAGNOSTICS".equalsIgnoreCase(operation)) {
+                JSONObject diag = buildDiagnosticsPayload();
+                response.put("success", true);
+                response.put("status", "READY");
+                response.put("data", diag);
+                response.put("error_code", JSONObject.NULL);
+                response.put("error_message", JSONObject.NULL);
             } else if ("ping".equalsIgnoreCase(operation) || "ping".equalsIgnoreCase(capability)) {
                 JSONObject pong = new JSONObject();
                 pong.put("status", "pong");
@@ -587,5 +603,63 @@ public class LocalBridgeServer {
         }
 
         return response;
+    }
+
+    private JSONObject buildDiagnosticsPayload() throws JSONException {
+        JSONObject states = new JSONObject();
+        boolean appActive = BridgeService.isProcessActive() || BridgeActivity.isActivityAlive();
+        states.put("ANDROID_APP_RUNNING", appActive ? "UP" : "UNKNOWN");
+        states.put("NATIVE_BRIDGE_READY", isListening() ? "UP" : "DOWN");
+        states.put("TERMUX_AVAILABLE", "UNKNOWN");
+        states.put("NODE_AGENT_AVAILABLE", "UNKNOWN");
+        states.put("NODE_API_AVAILABLE", "UNKNOWN");
+        states.put("TAILSCALE_CONNECTED", "UNKNOWN");
+        states.put("CONTROLLER_REACHABLE", "UNKNOWN");
+
+        DiagnosticStateProbe probe = this.diagnosticStateProbe;
+        if (probe != null) {
+            try {
+                JSONObject ext = probe.probeExternalStates();
+                if (ext != null) {
+                    String[] keys = new String[]{
+                            "ANDROID_APP_RUNNING",
+                            "NATIVE_BRIDGE_READY",
+                            "TERMUX_AVAILABLE",
+                            "NODE_AGENT_AVAILABLE",
+                            "NODE_API_AVAILABLE",
+                            "TAILSCALE_CONNECTED",
+                            "CONTROLLER_REACHABLE"
+                    };
+                    for (String k : keys) {
+                        if (ext.has(k)) {
+                            String v = ext.optString(k, "");
+                            if (v != null && !v.isEmpty()) {
+                                states.put(k, v);
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "External diagnostic probe failed cleanly: " + e.getMessage());
+            }
+        }
+
+        JSONObject payload = new JSONObject();
+        payload.put("states", states);
+        payload.put("loopback_only", true);
+        payload.put("host", "127.0.0.1");
+        payload.put("port", this.port);
+        payload.put("requires_termux", false);
+        payload.put("requires_python", false);
+        payload.put("requires_tailscale", false);
+        payload.put("requires_controller", false);
+
+        JSONObject activeSessions = new JSONObject();
+        activeSessions.put("microphone_recording", BridgeService.isRecordingActive());
+        String micSid = BridgeService.getActiveRecordingSessionId();
+        activeSessions.put("microphone_session_id", micSid != null ? micSid : JSONObject.NULL);
+        payload.put("active_sessions", activeSessions);
+        payload.put("timestamp", System.currentTimeMillis());
+        return payload;
     }
 }

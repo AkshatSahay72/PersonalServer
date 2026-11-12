@@ -259,6 +259,9 @@ class AndroidBridgeResponse:
     protocol_version: int = PROTOCOL_VERSION
     version: int = PROTOCOL_VERSION
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    transport_used: Optional[str] = None
+    fallback_used: bool = False
+    fallback_reason: Optional[str] = None
 
     def __post_init__(self):
         if not self.request_id and self.operation_id:
@@ -289,6 +292,9 @@ class AndroidBridgeResponse:
             "error_message": self.error_message,
             "error_code": self.error_code,
             "timestamp": self.timestamp,
+            "transport_used": self.transport_used,
+            "fallback_used": self.fallback_used,
+            "fallback_reason": self.fallback_reason,
         }
 
 

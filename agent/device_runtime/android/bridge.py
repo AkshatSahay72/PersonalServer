@@ -181,8 +181,11 @@ class NativeAndroidBridge:
         # 1. Validate permissions for requested capability.
         # Only explicit RECORDING_OPERATIONS defer live RECORD_AUDIO state sync to the bridge
         # unless permission is already explicitly DENIED locally.
+        # System diagnostic and ping operations never require Termux permissions.
+        op_upper = str(operation or "").upper()
         is_recording_op = operation in RECORDING_OPERATIONS
-        if not is_recording_op:
+        is_system_diag = op_upper in ("PING", "GET_DIAGNOSTICS", "BRIDGE_DIAGNOSTICS")
+        if not is_recording_op and not is_system_diag:
             allowed, granted_perms, missing_perms = self._permission_bridge.check_permissions(capability)
             if not allowed:
                 self._metrics["permission_denied_count"] += 1
@@ -590,6 +593,75 @@ class NativeAndroidBridge:
                 except Exception:
                     pass
             raise
+
+    def get_diagnostics(
+        self,
+        termux_probe: Optional[Any] = None,
+        node_agent_probe: Optional[Any] = None,
+        node_api_probe: Optional[Any] = None,
+        tailscale_probe: Optional[Any] = None,
+        controller_probe: Optional[Any] = None,
+        timeout: float = 2.0,
+    ) -> Dict[str, Any]:
+        """
+        Queries independent local health states without requiring a controller or Termux.
+        Each component is evaluated in isolation using UP / DOWN / UNKNOWN.
+        """
+        states: Dict[str, str] = {
+            "ANDROID_APP_RUNNING": "UNKNOWN",
+            "NATIVE_BRIDGE_READY": "DOWN",
+            "TERMUX_AVAILABLE": "UNKNOWN",
+            "NODE_AGENT_AVAILABLE": "UNKNOWN",
+            "NODE_API_AVAILABLE": "UNKNOWN",
+            "TAILSCALE_CONNECTED": "UNKNOWN",
+            "CONTROLLER_REACHABLE": "UNKNOWN",
+        }
+        native_details: Dict[str, Any] = {}
+
+        # 1. Query native bridge directly (does not depend on Termux/Tailscale/Controller)
+        try:
+            diag_resp = self.execute("system", "GET_DIAGNOSTICS", {}, timeout=timeout)
+            if diag_resp.success and isinstance(diag_resp.data, dict):
+                raw_states = diag_resp.data.get("states") or {}
+                for k in ("ANDROID_APP_RUNNING", "NATIVE_BRIDGE_READY"):
+                    if k in raw_states and raw_states[k] in ("UP", "DOWN", "UNKNOWN"):
+                        states[k] = raw_states[k]
+                if states["NATIVE_BRIDGE_READY"] == "UNKNOWN":
+                    states["NATIVE_BRIDGE_READY"] = "UP"
+                native_details = dict(diag_resp.data)
+            else:
+                ping_resp = self.execute("system", "PING", {}, timeout=timeout)
+                states["NATIVE_BRIDGE_READY"] = "UP" if ping_resp.success else "DOWN"
+        except Exception:
+            states["NATIVE_BRIDGE_READY"] = "DOWN"
+
+        # 2. Evaluate external components independently
+        def _eval_probe(probe_fn: Optional[Any]) -> str:
+            if probe_fn is None:
+                return "UNKNOWN"
+            try:
+                val = probe_fn()
+                if val is True:
+                    return "UP"
+                if val is False:
+                    return "DOWN"
+                if isinstance(val, str) and val.upper() in ("UP", "DOWN", "UNKNOWN"):
+                    return val.upper()
+                return "UNKNOWN"
+            except Exception:
+                return "DOWN"
+
+        states["TERMUX_AVAILABLE"] = _eval_probe(termux_probe)
+        states["NODE_AGENT_AVAILABLE"] = _eval_probe(node_agent_probe)
+        states["NODE_API_AVAILABLE"] = _eval_probe(node_api_probe)
+        states["TAILSCALE_CONNECTED"] = _eval_probe(tailscale_probe)
+        states["CONTROLLER_REACHABLE"] = _eval_probe(controller_probe)
+
+        return {
+            "states": states,
+            "native": native_details,
+            "requires_controller": False,
+        }
 
     def get_metrics(self) -> Dict[str, Any]:
         """Returns bridge performance and error metrics."""

@@ -31,6 +31,7 @@ public class BridgeService extends Service {
     public static final String ACTION_STOP = "com.personalserver.bridge.ACTION_STOP";
 
     private static volatile BridgeService activeInstance = null;
+    private static volatile boolean serviceCreated = false;
     private static volatile boolean running = false;
     private static volatile boolean starting = false;
     private static volatile boolean recordingActive = false;
@@ -38,6 +39,10 @@ public class BridgeService extends Service {
     private static volatile String lastStartError = null;
     private LocalBridgeServer bridgeServer;
     private PowerManager.WakeLock wakeLock;
+
+    public static boolean isProcessActive() {
+        return serviceCreated || running || activeInstance != null;
+    }
 
     public static boolean isRunning() {
         BridgeService inst = activeInstance;
@@ -115,6 +120,7 @@ public class BridgeService extends Service {
     public void onCreate() {
         super.onCreate();
         activeInstance = this;
+        serviceCreated = true;
         Log.i(TAG, "Creating PersonalServer Bridge Service...");
         createNotificationChannel();
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -191,6 +197,7 @@ public class BridgeService extends Service {
         Log.i(TAG, "Stopping PersonalServer Bridge Service...");
         starting = false;
         running = false;
+        serviceCreated = false;
         if (activeInstance == this) {
             activeInstance = null;
         }
