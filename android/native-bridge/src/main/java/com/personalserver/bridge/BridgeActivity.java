@@ -32,6 +32,7 @@ public class BridgeActivity extends AppCompatActivity {
     private static final String TAG = "BridgeActivity";
     private static final int REQ_NOTIFICATIONS = 1001;
     private static final int REQ_RECORD_AUDIO = 1002;
+    private static final int REQ_RUN_COMMAND = 1003;
     private static final long START_FAILURE_COOLDOWN_MS = 1000L;
     private static volatile boolean activityAlive = false;
 
@@ -142,6 +143,8 @@ public class BridgeActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         activityResumed = true;
+        requestNotificationPermissionIfNeeded();
+        requestRunCommandPermissionExplicit();
         if (pendingStartRequest && pendingResumeRetries > 0 && !BridgeService.isRunning()) {
             pendingResumeRetries--;
             attemptStartBridgeService(false);
@@ -179,6 +182,17 @@ public class BridgeActivity extends AppCompatActivity {
         } else {
             refreshRunningServiceCapabilities();
             updateStatusView();
+        }
+    }
+
+    protected void requestRunCommandPermissionExplicit() {
+        if (ContextCompat.checkSelfPermission(this, "com.termux.permission.RUN_COMMAND")
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                    this,
+                    new String[]{"com.termux.permission.RUN_COMMAND"},
+                    REQ_RUN_COMMAND
+            );
         }
     }
 

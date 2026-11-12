@@ -610,10 +610,15 @@ class NativeAndroidBridge:
         states: Dict[str, str] = {
             "ANDROID_APP_RUNNING": "UNKNOWN",
             "NATIVE_BRIDGE_READY": "DOWN",
+            "SUPERVISOR_RUNNING": "UNKNOWN",
+            "TERMUX_INSTALLED": "UNKNOWN",
+            "TERMUX_COMMAND_INTEGRATION_READY": "UNKNOWN",
             "TERMUX_AVAILABLE": "UNKNOWN",
-            "NODE_AGENT_AVAILABLE": "UNKNOWN",
-            "NODE_API_AVAILABLE": "UNKNOWN",
+            "TERMUX_SERVICES_HEALTHY": "UNKNOWN",
+            "TAILSCALE_INSTALLED": "UNKNOWN",
+            "TAILSCALE_VPN_AUTHORIZED": "UNKNOWN",
             "TAILSCALE_CONNECTED": "UNKNOWN",
+            "PERSONALSERVER_NETWORK_REACHABLE": "UNKNOWN",
             "CONTROLLER_REACHABLE": "UNKNOWN",
         }
         native_details: Dict[str, Any] = {}
@@ -623,9 +628,9 @@ class NativeAndroidBridge:
             diag_resp = self.execute("system", "GET_DIAGNOSTICS", {}, timeout=timeout)
             if diag_resp.success and isinstance(diag_resp.data, dict):
                 raw_states = diag_resp.data.get("states") or {}
-                for k in ("ANDROID_APP_RUNNING", "NATIVE_BRIDGE_READY"):
-                    if k in raw_states and raw_states[k] in ("UP", "DOWN", "UNKNOWN"):
-                        states[k] = raw_states[k]
+                for k, v in raw_states.items():
+                    if isinstance(v, str) and v in ("UP", "DOWN", "DEGRADED", "UNKNOWN"):
+                        states[k] = v
                 if states["NATIVE_BRIDGE_READY"] == "UNKNOWN":
                     states["NATIVE_BRIDGE_READY"] = "UP"
                 native_details = dict(diag_resp.data)
@@ -645,17 +650,22 @@ class NativeAndroidBridge:
                     return "UP"
                 if val is False:
                     return "DOWN"
-                if isinstance(val, str) and val.upper() in ("UP", "DOWN", "UNKNOWN"):
+                if isinstance(val, str) and val.upper() in ("UP", "DOWN", "DEGRADED", "UNKNOWN"):
                     return val.upper()
                 return "UNKNOWN"
             except Exception:
                 return "DOWN"
 
-        states["TERMUX_AVAILABLE"] = _eval_probe(termux_probe)
-        states["NODE_AGENT_AVAILABLE"] = _eval_probe(node_agent_probe)
-        states["NODE_API_AVAILABLE"] = _eval_probe(node_api_probe)
-        states["TAILSCALE_CONNECTED"] = _eval_probe(tailscale_probe)
-        states["CONTROLLER_REACHABLE"] = _eval_probe(controller_probe)
+        if termux_probe is not None:
+            states["TERMUX_AVAILABLE"] = _eval_probe(termux_probe)
+        if node_agent_probe is not None:
+            states["NODE_AGENT_AVAILABLE"] = _eval_probe(node_agent_probe)
+        if node_api_probe is not None:
+            states["NODE_API_AVAILABLE"] = _eval_probe(node_api_probe)
+        if tailscale_probe is not None:
+            states["TAILSCALE_CONNECTED"] = _eval_probe(tailscale_probe)
+        if controller_probe is not None:
+            states["CONTROLLER_REACHABLE"] = _eval_probe(controller_probe)
 
         return {
             "states": states,

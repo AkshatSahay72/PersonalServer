@@ -154,6 +154,9 @@ public class BridgeService extends Service {
             running = true;
             lastStartError = null;
             acquireWakeLock();
+            if (bridgeServer.getRecoveryCoordinator() != null && !bridgeServer.getRecoveryCoordinator().isRunning()) {
+                bridgeServer.getRecoveryCoordinator().start();
+            }
             Notification activeNotification = buildNotification("Loopback IPC active on 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT);
             startForegroundWithCompat(activeNotification);
             return START_STICKY;
@@ -173,6 +176,9 @@ public class BridgeService extends Service {
             running = true;
             lastStartError = null;
             acquireWakeLock();
+            if (bridgeServer.getRecoveryCoordinator() != null) {
+                bridgeServer.getRecoveryCoordinator().start();
+            }
             Notification activeNotification = buildNotification("Loopback IPC active on 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT);
             startForegroundWithCompat(activeNotification);
             Log.i(TAG, "PersonalServer Bridge Service started on 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT);
@@ -212,6 +218,9 @@ public class BridgeService extends Service {
         LocalBridgeServer server = bridgeServer;
         bridgeServer = null;
         if (server != null) {
+            if (server.getRecoveryCoordinator() != null) {
+                server.getRecoveryCoordinator().stop();
+            }
             server.stop();
         }
     }

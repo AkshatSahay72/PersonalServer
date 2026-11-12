@@ -65,6 +65,7 @@ public class LocalBridgeServer {
 
     private SensorBridgeManager sensorManager;
     private MicrophoneBridgeManager microphoneManager;
+    private RecoveryCoordinator recoveryCoordinator;
     private volatile MicrophoneBridgeManager.RecordingNotificationListener recordingNotificationListener = null;
     private volatile DiagnosticStateProbe diagnosticStateProbe = null;
 
@@ -92,6 +93,7 @@ public class LocalBridgeServer {
         this.thermalManager = new ThermalBridgeManager(this.context);
         this.sensorManager = new SensorBridgeManager(this.context);
         this.microphoneManager = new MicrophoneBridgeManager(this.context);
+        this.recoveryCoordinator = new RecoveryCoordinator(this.context);
         this.executor = Executors.newCachedThreadPool();
     }
 
@@ -100,6 +102,14 @@ public class LocalBridgeServer {
         if (this.microphoneManager != null) {
             this.microphoneManager.setRecordingNotificationListener(listener);
         }
+    }
+
+    public RecoveryCoordinator getRecoveryCoordinator() {
+        return recoveryCoordinator;
+    }
+
+    public void setRecoveryCoordinator(RecoveryCoordinator coordinator) {
+        this.recoveryCoordinator = coordinator;
     }
 
     public boolean isListening() {
@@ -577,6 +587,59 @@ public class LocalBridgeServer {
                 response.put("data", diag);
                 response.put("error_code", JSONObject.NULL);
                 response.put("error_message", JSONObject.NULL);
+            } else if ("TRIGGER_RECOVERY".equalsIgnoreCase(operation)) {
+                JSONObject recResult;
+                String target = params.optString("target", "ALL").toUpperCase();
+                String triggerSource = params.optString("trigger_source", "IPC_REQUEST");
+                if (recoveryCoordinator != null) {
+                    if ("TERMUX".equals(target)) {
+                        recResult = recoveryCoordinator.triggerTermuxRecovery(triggerSource);
+                    } else if ("TAILSCALE".equals(target)) {
+                        recResult = recoveryCoordinator.triggerTailscaleRecovery(triggerSource);
+                    } else {
+                        recResult = recoveryCoordinator.triggerCombinedRecovery(triggerSource);
+                    }
+                } else {
+                    recResult = new JSONObject();
+                    recResult.put("success", false);
+                    recResult.put("error", "RECOVERY_COORDINATOR_UNAVAILABLE");
+                }
+                response.put("success", recResult.optBoolean("success", true));
+                response.put("status", "READY");
+                response.put("data", recResult);
+                response.put("error_code", JSONObject.NULL);
+                response.put("error_message", JSONObject.NULL);
+            } else if ("RECOVERY_HISTORY".equalsIgnoreCase(operation)) {
+                JSONArray history = (recoveryCoordinator != null) ? recoveryCoordinator.getRecoveryHistory() : new JSONArray();
+                JSONObject histData = new JSONObject();
+                histData.put("events", history);
+                histData.put("total_events", history.length());
+                response.put("success", true);
+                response.put("status", "READY");
+                response.put("data", histData);
+                response.put("error_code", JSONObject.NULL);
+                response.put("error_message", JSONObject.NULL);
+            } else if ("RECOVERY_CONFIG".equalsIgnoreCase(operation)) {
+                JSONObject confData = new JSONObject();
+                if (recoveryCoordinator != null) {
+                    if (params.has("enabled")) {
+                        recoveryCoordinator.setRecoveryEnabled(params.optBoolean("enabled", true));
+                    }
+                    if (params.has("max_retries")) {
+                        recoveryCoordinator.setMaxRetryCount(params.optInt("max_retries", RecoveryCoordinator.DEFAULT_MAX_RETRY));
+                    }
+                    if (params.has("cooldown_sec")) {
+                        recoveryCoordinator.setCooldownSec(params.optInt("cooldown_sec", RecoveryCoordinator.DEFAULT_COOLDOWN_SEC));
+                    }
+                    confData.put("enabled", recoveryCoordinator.isRecoveryEnabled());
+                    confData.put("max_retries", recoveryCoordinator.getMaxRetryCount());
+                    confData.put("cooldown_sec", recoveryCoordinator.getCooldownSec());
+                }
+                response.put("success", true);
+                response.put("status", "READY");
+                response.put("data", confData);
+                response.put("error_code", JSONObject.NULL);
+                response.put("error_message", JSONObject.NULL);
             } else if ("ping".equalsIgnoreCase(operation) || "ping".equalsIgnoreCase(capability)) {
                 JSONObject pong = new JSONObject();
                 pong.put("status", "pong");
@@ -606,35 +669,63 @@ public class LocalBridgeServer {
     }
 
     private JSONObject buildDiagnosticsPayload() throws JSONException {
-        JSONObject states = new JSONObject();
-        boolean appActive = BridgeService.isProcessActive() || BridgeActivity.isActivityAlive();
-        states.put("ANDROID_APP_RUNNING", appActive ? "UP" : "UNKNOWN");
-        states.put("NATIVE_BRIDGE_READY", isListening() ? "UP" : "DOWN");
-        states.put("TERMUX_AVAILABLE", "UNKNOWN");
-        states.put("NODE_AGENT_AVAILABLE", "UNKNOWN");
-        states.put("NODE_API_AVAILABLE", "UNKNOWN");
-        states.put("TAILSCALE_CONNECTED", "UNKNOWN");
-        states.put("CONTROLLER_REACHABLE", "UNKNOWN");
+        JSONObject payload = new JSONObject();
+        if (recoveryCoordinator != null) {
+            try {
+                JSONObject superStates = recoveryCoordinator.evaluateAllStates();
+                payload.put("states", superStates.optJSONObject("states"));
+                payload.put("boot_recovery", superStates.optJSONObject("boot_recovery"));
+                payload.put("retry_counters", superStates.optJSONObject("retry_counters"));
+            } catch (Exception e) {
+                Log.w(TAG, "Error evaluating supervisor states: " + e.getMessage());
+            }
+        }
+
+        if (!payload.has("states")) {
+            JSONObject states = new JSONObject();
+            boolean appActive = BridgeService.isProcessActive() || BridgeActivity.isActivityAlive();
+            states.put("ANDROID_APP_RUNNING", appActive ? "UP" : "UNKNOWN");
+            states.put("NATIVE_BRIDGE_READY", isListening() ? "UP" : "DOWN");
+            states.put("SUPERVISOR_RUNNING", (recoveryCoordinator != null && recoveryCoordinator.isRunning()) ? "UP" : "DOWN");
+            states.put("TERMUX_INSTALLED", "UNKNOWN");
+            states.put("TERMUX_COMMAND_INTEGRATION_READY", "UNKNOWN");
+            states.put("TERMUX_AVAILABLE", "UNKNOWN");
+            states.put("TERMUX_SERVICES_HEALTHY", "UNKNOWN");
+            states.put("TAILSCALE_INSTALLED", "UNKNOWN");
+            states.put("TAILSCALE_VPN_AUTHORIZED", "UNKNOWN");
+            states.put("TAILSCALE_CONNECTED", "UNKNOWN");
+            states.put("PERSONALSERVER_NETWORK_REACHABLE", "UNKNOWN");
+            states.put("CONTROLLER_REACHABLE", "UNKNOWN");
+            payload.put("states", states);
+        }
 
         DiagnosticStateProbe probe = this.diagnosticStateProbe;
         if (probe != null) {
             try {
                 JSONObject ext = probe.probeExternalStates();
                 if (ext != null) {
-                    String[] keys = new String[]{
-                            "ANDROID_APP_RUNNING",
-                            "NATIVE_BRIDGE_READY",
-                            "TERMUX_AVAILABLE",
-                            "NODE_AGENT_AVAILABLE",
-                            "NODE_API_AVAILABLE",
-                            "TAILSCALE_CONNECTED",
-                            "CONTROLLER_REACHABLE"
-                    };
-                    for (String k : keys) {
-                        if (ext.has(k)) {
-                            String v = ext.optString(k, "");
-                            if (v != null && !v.isEmpty()) {
-                                states.put(k, v);
+                    JSONObject states = payload.optJSONObject("states");
+                    if (states != null) {
+                        String[] keys = new String[]{
+                                "ANDROID_APP_RUNNING",
+                                "NATIVE_BRIDGE_READY",
+                                "SUPERVISOR_RUNNING",
+                                "TERMUX_INSTALLED",
+                                "TERMUX_COMMAND_INTEGRATION_READY",
+                                "TERMUX_AVAILABLE",
+                                "TERMUX_SERVICES_HEALTHY",
+                                "TAILSCALE_INSTALLED",
+                                "TAILSCALE_VPN_AUTHORIZED",
+                                "TAILSCALE_CONNECTED",
+                                "PERSONALSERVER_NETWORK_REACHABLE",
+                                "CONTROLLER_REACHABLE"
+                        };
+                        for (String k : keys) {
+                            if (ext.has(k)) {
+                                String v = ext.optString(k, "");
+                                if (v != null && !v.isEmpty()) {
+                                    states.put(k, v);
+                                }
                             }
                         }
                     }
@@ -644,8 +735,6 @@ public class LocalBridgeServer {
             }
         }
 
-        JSONObject payload = new JSONObject();
-        payload.put("states", states);
         payload.put("loopback_only", true);
         payload.put("host", "127.0.0.1");
         payload.put("port", this.port);

@@ -344,6 +344,8 @@ public class Context {
     public static final String POWER_SERVICE = "power";
     public static final String SENSOR_SERVICE = "sensor";
     public static final String BATTERY_SERVICE = "batterymanager";
+    public static final String CONNECTIVITY_SERVICE = "connectivity";
+    public static final int MODE_PRIVATE = 0;
     private final PowerManager pm = new PowerManager();
     private final PackageManager pkgMgr = new PackageManager();
     public Context getApplicationContext() { return this; }
@@ -351,11 +353,33 @@ public class Context {
     public File getCacheDir() { return new File(System.getProperty("java.io.tmpdir"), "bridge_test_cache"); }
     public Object getSystemService(String name) {
         if (POWER_SERVICE.equals(name)) return pm;
+        if (CONNECTIVITY_SERVICE.equals(name)) return new android.net.ConnectivityManager();
         return null;
     }
     public <T> T getSystemService(Class<T> serviceClass) { return null; }
     public Intent registerReceiver(Object r, IntentFilter f) { return null; }
     public int checkSelfPermission(String perm) { return 0; }
+    public int checkCallingOrSelfPermission(String p) { return 0; }
+    public void startActivity(Intent i) {}
+    public void startService(Intent i) {}
+    public SharedPreferences getSharedPreferences(String name, int mode) {
+        return new SharedPreferences() {
+            @Override public boolean getBoolean(String k, boolean d) { return d; }
+            @Override public String getString(String k, String d) { return d; }
+            @Override public int getInt(String k, int d) { return d; }
+            @Override public long getLong(String k, long d) { return d; }
+            @Override public Editor edit() {
+                return new Editor() {
+                    @Override public Editor putBoolean(String k, boolean v) { return this; }
+                    @Override public Editor putString(String k, String v) { return this; }
+                    @Override public Editor putInt(String k, int v) { return this; }
+                    @Override public Editor putLong(String k, long v) { return this; }
+                    @Override public void apply() {}
+                    @Override public boolean commit() { return true; }
+                };
+            }
+        };
+    }
 }
 """,
     "android/content/Intent.java": """
@@ -363,25 +387,101 @@ package android.content;
 import java.util.*;
 public class Intent {
     public static final String ACTION_BATTERY_CHANGED = "android.intent.action.BATTERY_CHANGED";
+    public static final String ACTION_BOOT_COMPLETED = "android.intent.action.BOOT_COMPLETED";
+    public static final int FLAG_ACTIVITY_NEW_TASK = 268435456;
+    public static final int FLAG_ACTIVITY_SINGLE_TOP = 536870912;
     private String action;
     private final Map<String, Object> extras = new HashMap<>();
     public Intent() {}
+    public Intent(String a) { this.action = a; }
     public Intent(Context ctx, Class<?> cls) {}
     public Intent setAction(String a) { this.action = a; return this; }
     public String getAction() { return action; }
+    public Intent setClassName(String p, String c) { return this; }
+    public Intent addFlags(int f) { return this; }
     public Intent putExtra(String k, String v) { extras.put(k, v); return this; }
+    public Intent putExtra(String k, String[] v) { extras.put(k, v); return this; }
+    public Intent putExtra(String k, boolean v) { extras.put(k, v); return this; }
     public String getStringExtra(String k) { Object v = extras.get(k); return v instanceof String ? (String) v : null; }
     public int getIntExtra(String k, int def) { return def; }
     public boolean getBooleanExtra(String k, boolean def) { return def; }
 }
 """,
     "android/content/IntentFilter.java": "package android.content; public class IntentFilter { public IntentFilter(String a) {} }",
+    "androidx/core/content/ContextCompat.java": """
+package androidx.core.content;
+import android.content.Context;
+import android.content.Intent;
+public class ContextCompat {
+    public static int checkSelfPermission(Context c, String p) { return 0; }
+    public static void startForegroundService(Context c, Intent i) {}
+}
+""",
+    "android/os/Build.java": """
+package android.os;
+public class Build {
+    public static class VERSION {
+        public static final int SDK_INT = 34;
+        public static final String RELEASE = "14";
+    }
+    public static class VERSION_CODES {
+        public static final int LOLLIPOP = 21;
+        public static final int M = 23;
+        public static final int N = 24;
+        public static final int O = 26;
+        public static final int Q = 29;
+        public static final int R = 30;
+        public static final int S = 31;
+        public static final int TIRAMISU = 33;
+        public static final int UPSIDE_DOWN_CAKE = 34;
+    }
+}
+""",
     "android/content/pm/PackageManager.java": """
 package android.content.pm;
 public class PackageManager {
     public static final int PERMISSION_GRANTED = 0;
     public static final String FEATURE_MICROPHONE = "android.hardware.microphone";
+    public static class NameNotFoundException extends Exception {}
     public boolean hasSystemFeature(String name) { return FEATURE_MICROPHONE.equals(name); }
+    public PackageInfo getPackageInfo(String pkg, int flags) throws NameNotFoundException { return new PackageInfo(); }
+}
+""",
+    "android/content/pm/PackageInfo.java": "package android.content.pm; public class PackageInfo {}",
+    "android/content/BroadcastReceiver.java": "package android.content; public abstract class BroadcastReceiver { public abstract void onReceive(Context context, Intent intent); }",
+    "android/content/SharedPreferences.java": """
+package android.content;
+import java.util.*;
+public interface SharedPreferences {
+    interface Editor {
+        Editor putBoolean(String key, boolean val);
+        Editor putString(String key, String val);
+        Editor putInt(String key, int val);
+        Editor putLong(String key, long val);
+        void apply();
+        boolean commit();
+    }
+    boolean getBoolean(String key, boolean def);
+    String getString(String key, String def);
+    int getInt(String key, int def);
+    long getLong(String key, long def);
+    Editor edit();
+}
+""",
+    "android/net/ConnectivityManager.java": """
+package android.net;
+public class ConnectivityManager {
+    public Network getActiveNetwork() { return new Network(); }
+    public Network[] getAllNetworks() { return new Network[]{new Network()}; }
+    public NetworkCapabilities getNetworkCapabilities(Network n) { return new NetworkCapabilities(); }
+}
+""",
+    "android/net/Network.java": "package android.net; public class Network {}",
+    "android/net/NetworkCapabilities.java": """
+package android.net;
+public class NetworkCapabilities {
+    public static final int TRANSPORT_VPN = 4;
+    public boolean hasTransport(int t) { return t == TRANSPORT_VPN; }
 }
 """,
     "android/content/pm/ServiceInfo.java": "package android.content.pm; public class ServiceInfo { public static final int FOREGROUND_SERVICE_TYPE_SPECIAL_USE = 1073741824; public static final int FOREGROUND_SERVICE_TYPE_MICROPHONE = 128; }",
@@ -500,7 +600,7 @@ public class NotificationCompat {
     }
 }
 """,
-    "androidx/core/content/ContextCompat.java": "package androidx.core.content; import android.content.Context; public class ContextCompat { public static int checkSelfPermission(Context c, String p) { return 0; } }",
+    "androidx/core/content/ContextCompat.java": "package androidx.core.content; import android.content.*; public class ContextCompat { public static int checkSelfPermission(Context c, String p) { return 0; } public static void startForegroundService(Context c, Intent i) {} }",
     "androidx/appcompat/app/AppCompatActivity.java": """
 package androidx.appcompat.app;
 import android.content.*;
@@ -517,7 +617,7 @@ public class AppCompatActivity extends Context {
     public Intent getIntent() { return new Intent(); }
     public void setIntent(Intent i) {}
     public Object startForegroundService(Intent i) { return null; }
-    public Object startService(Intent i) { return null; }
+    public void startService(Intent i) {}
     public boolean stopService(Intent i) { return true; }
 }
 """,
