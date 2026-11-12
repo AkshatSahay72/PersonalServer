@@ -24,7 +24,7 @@ import androidx.core.content.ContextCompat;
 public class BridgeService extends Service {
 
     private static final String TAG = "BridgeService";
-    private static final String CHANNEL_ID = "PersonalServer_Native_Bridge_Channel";
+    public static final String CHANNEL_ID = "PersonalServer_Native_Bridge_Channel";
     private static final int NOTIFICATION_ID = 8765;
 
     public static final String ACTION_START = "com.personalserver.bridge.ACTION_START";

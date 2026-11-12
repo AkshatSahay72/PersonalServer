@@ -11,6 +11,7 @@ import org.json.JSONObject;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -40,6 +41,15 @@ public class TermuxRecoveryManager {
             OP_SERVICE_STATUS
     )));
 
+    // Distinct recovery operation states
+    public static final String STATE_DISPATCHED = "DISPATCHED";
+    public static final String STATE_EXECUTING = "EXECUTING";
+    public static final String STATE_SUCCEEDED = "SUCCEEDED";
+    public static final String STATE_FAILED = "FAILED";
+    public static final String STATE_TIMED_OUT = "TIMED_OUT";
+    public static final String STATE_VERIFICATION_FAILED = "VERIFICATION_FAILED";
+    public static final String STATE_SUPPRESSED = "SUPPRESSED";
+
     private final Context context;
     private final ConcurrentHashMap<String, JSONObject> commandHistory = new ConcurrentHashMap<>();
 
@@ -67,6 +77,28 @@ public class TermuxRecoveryManager {
                     == PackageManager.PERMISSION_GRANTED;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * Verifies the ability to execute an approved Termux command through a bounded health probe.
+     * Independent of Node API or SSH reachability.
+     */
+    public boolean isCommandIntegrationReady() {
+        return isTermuxInstalled() && isRunCommandPermissionGranted();
+    }
+
+    public String probeCommandAvailability() {
+        try {
+            if (!isTermuxInstalled()) {
+                return "DOWN";
+            }
+            if (!isRunCommandPermissionGranted()) {
+                return "DOWN";
+            }
+            return isCommandIntegrationReady() ? "UP" : "DEGRADED";
+        } catch (Exception e) {
+            return "UNKNOWN";
         }
     }
 
@@ -132,17 +164,57 @@ public class TermuxRecoveryManager {
             Log.e(TAG, "Failed to start Termux RunCommandService: " + dispatchError, e);
         }
 
+        String targetService = (extraParams != null) ? extraParams.optString("target_service", "all") : "all";
+
         JSONObject record = new JSONObject();
         record.put("operation_id", opId);
         record.put("operation", operation);
+        record.put("target_service", targetService);
         record.put("executable", executable);
         record.put("work_dir", workDir);
         record.put("dispatched", dispatched);
+        record.put("dispatch_status", dispatched ? STATE_DISPATCHED : STATE_FAILED);
         record.put("dispatch_error", dispatchError != null ? dispatchError : JSONObject.NULL);
+        record.put("status", dispatched ? STATE_DISPATCHED : STATE_FAILED);
+        record.put("execution_result", JSONObject.NULL);
+        record.put("exit_code", JSONObject.NULL);
+        record.put("timeout_ms", 15000);
         record.put("timestamp", startedAt);
+        record.put("completion_timestamp", JSONObject.NULL);
+        record.put("diagnostic_output", JSONObject.NULL);
+        record.put("verified", false);
+        record.put("success", false); // Never reported as success until verification passes!
 
         commandHistory.put(opId, record);
         return record;
+    }
+
+    public void updateOperationRecord(String opId, String status, Integer exitCode, String result, String diagOutput) {
+        if (opId == null) return;
+        JSONObject record = commandHistory.get(opId);
+        if (record == null) return;
+        try {
+            record.put("status", status);
+            record.put("completion_timestamp", System.currentTimeMillis());
+            if (exitCode != null) {
+                record.put("exit_code", exitCode.intValue());
+            }
+            if (result != null) {
+                record.put("execution_result", result);
+            }
+            if (diagOutput != null) {
+                String bounded = diagOutput.length() > 512 ? diagOutput.substring(0, 512) : diagOutput;
+                record.put("diagnostic_output", bounded);
+            }
+            boolean succeeded = STATE_SUCCEEDED.equals(status);
+            record.put("verified", succeeded);
+            record.put("success", succeeded);
+        } catch (JSONException ignored) {}
+    }
+
+    public JSONObject getOperation(String opId) {
+        if (opId == null) return null;
+        return commandHistory.get(opId);
     }
 
     public JSONObject getCommandHistory() {
@@ -155,4 +227,3 @@ public class TermuxRecoveryManager {
         return out;
     }
 }
-

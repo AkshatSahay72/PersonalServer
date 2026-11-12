@@ -51,6 +51,7 @@ public class Intent {
     public Intent(String action) { this.action = action; }
     public Intent(Context ctx, Class<?> cls) {}
     public Intent setAction(String action) { this.action = action; return this; }
+    public Intent setPackage(String pkg) { return this; }
     public String getAction() { return action; }
     public Intent setClassName(String pkg, String cls) { return this; }
     public Intent addFlags(int flags) { return this; }
@@ -118,11 +119,13 @@ public class Context {
     public static final String SENSOR_SERVICE = "sensor";
     public static final String BATTERY_SERVICE = "batterymanager";
     public static final String CONNECTIVITY_SERVICE = "connectivity";
+    public static final String NOTIFICATION_SERVICE = "notification";
     public static final int MODE_PRIVATE = 0;
     private final android.os.PowerManager pm = new android.os.PowerManager();
     private final android.hardware.SensorManager sm = new android.hardware.SensorManager();
     private final android.os.BatteryManager bm = new android.os.BatteryManager();
     private final android.net.ConnectivityManager cm = new android.net.ConnectivityManager();
+    private final android.app.NotificationManager nm = new android.app.NotificationManager();
     private final Map<String, SharedPreferences> prefsMap = new HashMap<>();
     private File cacheDir = new File(System.getProperty("java.io.tmpdir"), "e06_bridge_cache");
     public Context getApplicationContext() { return this; }
@@ -131,6 +134,7 @@ public class Context {
         if (SENSOR_SERVICE.equals(name)) return sm;
         if (BATTERY_SERVICE.equals(name)) return bm;
         if (CONNECTIVITY_SERVICE.equals(name)) return cm;
+        if (NOTIFICATION_SERVICE.equals(name)) return nm;
         return null;
     }
     public <T> T getSystemService(Class<T> cls) { return null; }
@@ -185,8 +189,18 @@ public class ComponentName {}
 package android.content.pm;
 public class PackageInfo {}
 """,
+    "android/R.java": """
+package android;
+public class R {
+    public static class drawable {
+        public static final int ic_menu_info_details = 1;
+        public static final int ic_dialog_alert = 2;
+    }
+}
+""",
     "android/content/pm/PackageManager.java": """
 package android.content.pm;
+import android.content.Intent;
 public abstract class PackageManager {
     public static final int PERMISSION_GRANTED = 0;
     public static final int PERMISSION_DENIED = -1;
@@ -195,6 +209,9 @@ public abstract class PackageManager {
     public abstract boolean hasSystemFeature(String name);
     public PackageInfo getPackageInfo(String pkg, int flags) throws NameNotFoundException {
         return new PackageInfo();
+    }
+    public Intent getLaunchIntentForPackage(String packageName) {
+        return new Intent("android.intent.action.MAIN").setPackage(packageName);
     }
 }
 """,

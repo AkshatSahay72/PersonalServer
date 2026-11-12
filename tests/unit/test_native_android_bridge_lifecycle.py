@@ -218,7 +218,7 @@ public class JSONArray {
 }
 """,
     "android/Manifest.java": "package android; public class Manifest { public static class permission { public static final String POST_NOTIFICATIONS = \"android.permission.POST_NOTIFICATIONS\"; public static final String RECORD_AUDIO = \"android.permission.RECORD_AUDIO\"; } }",
-    "android/R.java": "package android; public class R { public static class drawable { public static final int ic_menu_info_details = 1; } }",
+    "android/R.java": "package android; public class R { public static class drawable { public static final int ic_menu_info_details = 1; public static final int ic_dialog_alert = 2; } }",
     "android/annotation/SuppressLint.java": "package android.annotation; public @interface SuppressLint { String[] value(); }",
     "android/util/Base64.java": """
 package android.util;
@@ -345,15 +345,18 @@ public class Context {
     public static final String SENSOR_SERVICE = "sensor";
     public static final String BATTERY_SERVICE = "batterymanager";
     public static final String CONNECTIVITY_SERVICE = "connectivity";
+    public static final String NOTIFICATION_SERVICE = "notification";
     public static final int MODE_PRIVATE = 0;
     private final PowerManager pm = new PowerManager();
     private final PackageManager pkgMgr = new PackageManager();
+    private final android.app.NotificationManager nm = new android.app.NotificationManager();
     public Context getApplicationContext() { return this; }
     public PackageManager getPackageManager() { return pkgMgr; }
     public File getCacheDir() { return new File(System.getProperty("java.io.tmpdir"), "bridge_test_cache"); }
     public Object getSystemService(String name) {
         if (POWER_SERVICE.equals(name)) return pm;
         if (CONNECTIVITY_SERVICE.equals(name)) return new android.net.ConnectivityManager();
+        if (NOTIFICATION_SERVICE.equals(name)) return nm;
         return null;
     }
     public <T> T getSystemService(Class<T> serviceClass) { return null; }
@@ -439,12 +442,14 @@ public class Build {
 """,
     "android/content/pm/PackageManager.java": """
 package android.content.pm;
+import android.content.Intent;
 public class PackageManager {
     public static final int PERMISSION_GRANTED = 0;
     public static final String FEATURE_MICROPHONE = "android.hardware.microphone";
     public static class NameNotFoundException extends Exception {}
     public boolean hasSystemFeature(String name) { return FEATURE_MICROPHONE.equals(name); }
     public PackageInfo getPackageInfo(String pkg, int flags) throws NameNotFoundException { return new PackageInfo(); }
+    public Intent getLaunchIntentForPackage(String pkg) { return new Intent("android.intent.action.MAIN"); }
 }
 """,
     "android/content/pm/PackageInfo.java": "package android.content.pm; public class PackageInfo {}",
@@ -549,7 +554,7 @@ public class SensorManager {
 """,
     "android/app/Notification.java": "package android.app; public class Notification {}",
     "android/app/NotificationChannel.java": "package android.app; public class NotificationChannel { public NotificationChannel(String id, CharSequence name, int imp) {} public void setDescription(String d) {} }",
-    "android/app/NotificationManager.java": "package android.app; public class NotificationManager { public static final int IMPORTANCE_LOW = 2; public void createNotificationChannel(NotificationChannel c) {} public void notify(int id, Notification n) {} }",
+    "android/app/NotificationManager.java": "package android.app; public class NotificationManager { public static final int IMPORTANCE_LOW = 2; public void createNotificationChannel(NotificationChannel c) {} public void notify(int id, Notification n) {} public void cancel(int id) {} }",
     "android/app/PendingIntent.java": "package android.app; import android.content.*; public class PendingIntent { public static final int FLAG_IMMUTABLE = 1; public static final int FLAG_UPDATE_CURRENT = 2; public static PendingIntent getActivity(Context c, int r, Intent i, int f) { return new PendingIntent(); } }",
     "android/app/ForegroundServiceStartNotAllowedException.java": "package android.app; public class ForegroundServiceStartNotAllowedException extends IllegalStateException { public ForegroundServiceStartNotAllowedException(String msg) { super(msg); } }",
     "android/app/Service.java": """
@@ -588,6 +593,7 @@ import android.app.*;
 import android.content.Context;
 public class NotificationCompat {
     public static final int PRIORITY_LOW = -1;
+    public static final int PRIORITY_HIGH = 1;
     public static class Builder {
         public Builder(Context c, String ch) {}
         public Builder setContentTitle(CharSequence t) { return this; }
@@ -596,6 +602,7 @@ public class NotificationCompat {
         public Builder setContentIntent(PendingIntent pi) { return this; }
         public Builder setOngoing(boolean b) { return this; }
         public Builder setPriority(int p) { return this; }
+        public Builder setAutoCancel(boolean b) { return this; }
         public Notification build() { return new Notification(); }
     }
 }

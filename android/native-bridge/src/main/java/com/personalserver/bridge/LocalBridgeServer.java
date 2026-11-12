@@ -594,6 +594,10 @@ public class LocalBridgeServer {
                 if (recoveryCoordinator != null) {
                     if ("TERMUX".equals(target)) {
                         recResult = recoveryCoordinator.triggerTermuxRecovery(triggerSource);
+                    } else if ("NODE_API".equals(target) || "NODE-API".equals(target)) {
+                        recResult = recoveryCoordinator.triggerTargetedRecovery("node-api", triggerSource);
+                    } else if ("SSHD".equals(target) || "SSH".equals(target)) {
+                        recResult = recoveryCoordinator.triggerTargetedRecovery("sshd", triggerSource);
                     } else if ("TAILSCALE".equals(target)) {
                         recResult = recoveryCoordinator.triggerTailscaleRecovery(triggerSource);
                     } else {
@@ -604,11 +608,12 @@ public class LocalBridgeServer {
                     recResult.put("success", false);
                     recResult.put("error", "RECOVERY_COORDINATOR_UNAVAILABLE");
                 }
-                response.put("success", recResult.optBoolean("success", true));
-                response.put("status", "READY");
+                boolean opSuccess = recResult.optBoolean("success", false);
+                response.put("success", opSuccess);
+                response.put("status", opSuccess ? "READY" : "ERROR");
                 response.put("data", recResult);
-                response.put("error_code", JSONObject.NULL);
-                response.put("error_message", JSONObject.NULL);
+                response.put("error_code", opSuccess ? JSONObject.NULL : "RECOVERY_UNVERIFIED");
+                response.put("error_message", opSuccess ? JSONObject.NULL : recResult.optString("status", "Recovery unverified or failed"));
             } else if ("RECOVERY_HISTORY".equalsIgnoreCase(operation)) {
                 JSONArray history = (recoveryCoordinator != null) ? recoveryCoordinator.getRecoveryHistory() : new JSONArray();
                 JSONObject histData = new JSONObject();
@@ -674,6 +679,7 @@ public class LocalBridgeServer {
             try {
                 JSONObject superStates = recoveryCoordinator.evaluateAllStates();
                 payload.put("states", superStates.optJSONObject("states"));
+                payload.put("services", superStates.optJSONObject("services"));
                 payload.put("boot_recovery", superStates.optJSONObject("boot_recovery"));
                 payload.put("retry_counters", superStates.optJSONObject("retry_counters"));
             } catch (Exception e) {
