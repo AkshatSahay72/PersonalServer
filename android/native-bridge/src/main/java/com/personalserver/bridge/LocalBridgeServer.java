@@ -65,8 +65,10 @@ public class LocalBridgeServer {
 
     private SensorBridgeManager sensorManager;
     private MicrophoneBridgeManager microphoneManager;
+    private LiveMediaBridgeManager liveMediaManager;
     private RecoveryCoordinator recoveryCoordinator;
     private volatile MicrophoneBridgeManager.RecordingNotificationListener recordingNotificationListener = null;
+    private volatile LiveMediaBridgeManager.LiveCallNotificationListener liveCallNotificationListener = null;
     private volatile DiagnosticStateProbe diagnosticStateProbe = null;
 
     public interface DiagnosticStateProbe {
@@ -93,6 +95,7 @@ public class LocalBridgeServer {
         this.thermalManager = new ThermalBridgeManager(this.context);
         this.sensorManager = new SensorBridgeManager(this.context);
         this.microphoneManager = new MicrophoneBridgeManager(this.context);
+        this.liveMediaManager = new LiveMediaBridgeManager(this.context);
         this.recoveryCoordinator = new RecoveryCoordinator(this.context);
         this.executor = Executors.newCachedThreadPool();
     }
@@ -102,6 +105,21 @@ public class LocalBridgeServer {
         if (this.microphoneManager != null) {
             this.microphoneManager.setRecordingNotificationListener(listener);
         }
+    }
+
+    public void setLiveCallNotificationListener(LiveMediaBridgeManager.LiveCallNotificationListener listener) {
+        this.liveCallNotificationListener = listener;
+        if (this.liveMediaManager != null) {
+            this.liveMediaManager.setNotificationListener(listener);
+        }
+    }
+
+    public LiveMediaBridgeManager getLiveMediaManager() {
+        return liveMediaManager;
+    }
+
+    public void setLiveMediaManager(LiveMediaBridgeManager manager) {
+        this.liveMediaManager = manager;
     }
 
     public RecoveryCoordinator getRecoveryCoordinator() {
@@ -552,6 +570,40 @@ public class LocalBridgeServer {
                 response.put("data", micOut);
                 response.put("error_code", JSONObject.NULL);
                 response.put("error_message", JSONObject.NULL);
+                return response;
+            }
+
+            // Dispatch Live Media / Call Operations (E07)
+            if ("live_call".equalsIgnoreCase(capability)
+                    || "live_media".equalsIgnoreCase(capability)
+                    || "media".equalsIgnoreCase(capability)
+                    || "START_LIVE_CALL".equals(operation)
+                    || "STOP_LIVE_CALL".equals(operation)
+                    || "GET_LIVE_CALL_STATUS".equals(operation)
+                    || "GET_LIVE_CALL_CAPABILITIES".equals(operation)
+                    || "UPDATE_LIVE_CALL".equals(operation)) {
+                JSONObject callOut;
+                if ("GET_LIVE_CALL_CAPABILITIES".equals(operation)) {
+                    callOut = liveMediaManager.getCapabilities();
+                } else if ("START_LIVE_CALL".equals(operation)) {
+                    callOut = liveMediaManager.startLiveCall(params);
+                } else if ("STOP_LIVE_CALL".equals(operation)) {
+                    String reason = params.optString("reason", "Requested stop");
+                    callOut = liveMediaManager.stopLiveCall(reason);
+                } else if ("GET_LIVE_CALL_STATUS".equals(operation)) {
+                    callOut = liveMediaManager.getLiveCallStatus();
+                } else if ("UPDATE_LIVE_CALL".equals(operation)) {
+                    callOut = liveMediaManager.updateLiveCall(params);
+                } else {
+                    return buildErrorResponse(opId, capability, operation, "ERROR", "UNKNOWN_OPERATION",
+                            "Unknown live call operation: " + operation);
+                }
+                boolean ok = callOut.optBoolean("success", true);
+                response.put("success", ok);
+                response.put("status", ok ? "READY" : "ERROR");
+                response.put("data", callOut);
+                response.put("error_code", ok ? JSONObject.NULL : callOut.optString("error_code", "CALL_ERROR"));
+                response.put("error_message", ok ? JSONObject.NULL : callOut.optString("error", "Operation failed"));
                 return response;
             }
 

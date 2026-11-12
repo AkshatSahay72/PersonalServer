@@ -65,6 +65,16 @@ public class JSONObject {
 
     public boolean has(String k) { return map.containsKey(k); }
     public Iterator<String> keys() { return map.keySet().iterator(); }
+    public boolean getBoolean(String k) throws JSONException {
+        Object v = map.get(k);
+        if (v instanceof Boolean) return (Boolean) v;
+        throw new JSONException("Key " + k + " is not a boolean");
+    }
+    public String getString(String k) throws JSONException {
+        Object v = map.get(k);
+        if (v != null && v != NULL) return String.valueOf(v);
+        throw new JSONException("Key " + k + " is missing or null");
+    }
     public JSONObject put(String k, Object v) throws JSONException { map.put(k, v == null ? NULL : v); return this; }
     public JSONObject put(String k, int v) throws JSONException { map.put(k, v); return this; }
     public JSONObject put(String k, long v) throws JSONException { map.put(k, v); return this; }
@@ -217,7 +227,7 @@ public class JSONArray {
     }
 }
 """,
-    "android/Manifest.java": "package android; public class Manifest { public static class permission { public static final String POST_NOTIFICATIONS = \"android.permission.POST_NOTIFICATIONS\"; public static final String RECORD_AUDIO = \"android.permission.RECORD_AUDIO\"; } }",
+    "android/Manifest.java": "package android; public class Manifest { public static class permission { public static final String POST_NOTIFICATIONS = \"android.permission.POST_NOTIFICATIONS\"; public static final String RECORD_AUDIO = \"android.permission.RECORD_AUDIO\"; public static final String CAMERA = \"android.permission.CAMERA\"; } }",
     "android/R.java": "package android; public class R { public static class drawable { public static final int ic_menu_info_details = 1; public static final int ic_dialog_alert = 2; } }",
     "android/annotation/SuppressLint.java": "package android.annotation; public @interface SuppressLint { String[] value(); }",
     "android/util/Base64.java": """
@@ -232,6 +242,8 @@ public class Base64 {
     "android/util/Log.java": """
 package android.util;
 public class Log {
+    public static int d(String tag, String msg) { return 0; }
+    public static int d(String tag, String msg, Throwable t) { return 0; }
     public static int i(String tag, String msg) { return 0; }
     public static int w(String tag, String msg) { return 0; }
     public static int e(String tag, String msg) { return 0; }
@@ -346,6 +358,8 @@ public class Context {
     public static final String BATTERY_SERVICE = "batterymanager";
     public static final String CONNECTIVITY_SERVICE = "connectivity";
     public static final String NOTIFICATION_SERVICE = "notification";
+    public static final String CAMERA_SERVICE = "camera";
+    public static final String AUDIO_SERVICE = "audio";
     public static final int MODE_PRIVATE = 0;
     private final PowerManager pm = new PowerManager();
     private final PackageManager pkgMgr = new PackageManager();
@@ -357,6 +371,8 @@ public class Context {
         if (POWER_SERVICE.equals(name)) return pm;
         if (CONNECTIVITY_SERVICE.equals(name)) return new android.net.ConnectivityManager();
         if (NOTIFICATION_SERVICE.equals(name)) return nm;
+        if (CAMERA_SERVICE.equals(name)) return new android.hardware.camera2.CameraManager();
+        if (AUDIO_SERVICE.equals(name)) return new android.media.AudioManager();
         return null;
     }
     public <T> T getSystemService(Class<T> serviceClass) { return null; }
@@ -446,8 +462,10 @@ import android.content.Intent;
 public class PackageManager {
     public static final int PERMISSION_GRANTED = 0;
     public static final String FEATURE_MICROPHONE = "android.hardware.microphone";
+    public static final String FEATURE_CAMERA_ANY = "android.hardware.camera.any";
+    public static final String FEATURE_CAMERA_FRONT = "android.hardware.camera.front";
     public static class NameNotFoundException extends Exception {}
-    public boolean hasSystemFeature(String name) { return FEATURE_MICROPHONE.equals(name); }
+    public boolean hasSystemFeature(String name) { return true; }
     public PackageInfo getPackageInfo(String pkg, int flags) throws NameNotFoundException { return new PackageInfo(); }
     public Intent getLaunchIntentForPackage(String pkg) { return new Intent("android.intent.action.MAIN"); }
 }
@@ -489,12 +507,13 @@ public class NetworkCapabilities {
     public boolean hasTransport(int t) { return t == TRANSPORT_VPN; }
 }
 """,
-    "android/content/pm/ServiceInfo.java": "package android.content.pm; public class ServiceInfo { public static final int FOREGROUND_SERVICE_TYPE_SPECIAL_USE = 1073741824; public static final int FOREGROUND_SERVICE_TYPE_MICROPHONE = 128; }",
+    "android/content/pm/ServiceInfo.java": "package android.content.pm; public class ServiceInfo { public static final int FOREGROUND_SERVICE_TYPE_SPECIAL_USE = 1073741824; public static final int FOREGROUND_SERVICE_TYPE_MICROPHONE = 128; public static final int FOREGROUND_SERVICE_TYPE_CAMERA = 64; }",
     "android/media/MediaRecorder.java": """
 package android.media;
 public class MediaRecorder {
     public static class AudioSource {
         public static final int MIC = 1;
+        public static final int VOICE_COMMUNICATION = 7;
     }
 }
 """,
@@ -502,7 +521,212 @@ public class MediaRecorder {
 package android.media;
 public class AudioFormat {
     public static final int CHANNEL_IN_MONO = 16;
+    public static final int CHANNEL_OUT_MONO = 4;
     public static final int ENCODING_PCM_16BIT = 2;
+    public static class Builder {
+        public Builder setEncoding(int encoding) { return this; }
+        public Builder setSampleRate(int rate) { return this; }
+        public Builder setChannelMask(int mask) { return this; }
+        public AudioFormat build() { return new AudioFormat(); }
+    }
+}
+""",
+    "android/graphics/ImageFormat.java": """
+package android.graphics;
+public class ImageFormat {
+    public static final int JPEG = 256;
+    public static final int YUV_420_888 = 35;
+}
+""",
+    "android/util/Size.java": """
+package android.util;
+public class Size {
+    private final int width;
+    private final int height;
+    public Size(int w, int h) { this.width = w; this.height = h; }
+    public int getWidth() { return width; }
+    public int getHeight() { return height; }
+}
+""",
+    "android/view/Surface.java": "package android.view; public class Surface {}",
+    "android/media/Image.java": """
+package android.media;
+import java.nio.ByteBuffer;
+public class Image implements AutoCloseable {
+    public static class Plane {
+        public ByteBuffer getBuffer() { return ByteBuffer.allocate(0); }
+        public int getPixelStride() { return 1; }
+        public int getRowStride() { return 1; }
+    }
+    public Plane[] getPlanes() { return new Plane[0]; }
+    public int getWidth() { return 0; }
+    public int getHeight() { return 0; }
+    public int getFormat() { return 256; }
+    @Override public void close() {}
+}
+""",
+    "android/media/ImageReader.java": """
+package android.media;
+import android.os.Handler;
+import android.view.Surface;
+public class ImageReader implements AutoCloseable {
+    public interface OnImageAvailableListener {
+        void onImageAvailable(ImageReader reader);
+    }
+    public static ImageReader newInstance(int width, int height, int format, int maxImages) {
+        return new ImageReader();
+    }
+    public Surface getSurface() { return new Surface(); }
+    public Image acquireLatestImage() { return null; }
+    public void setOnImageAvailableListener(OnImageAvailableListener listener, Handler handler) {}
+    @Override public void close() {}
+}
+""",
+    "android/media/AudioAttributes.java": """
+package android.media;
+public class AudioAttributes {
+    public static final int USAGE_VOICE_COMMUNICATION = 2;
+    public static final int CONTENT_TYPE_SPEECH = 1;
+    public static class Builder {
+        public Builder setUsage(int usage) { return this; }
+        public Builder setContentType(int type) { return this; }
+        public AudioAttributes build() { return new AudioAttributes(); }
+    }
+}
+""",
+    "android/media/AudioManager.java": """
+package android.media;
+public class AudioManager {
+    public static final int STREAM_VOICE_CALL = 0;
+    public static final int STREAM_MUSIC = 3;
+    public static final int AUDIO_SESSION_ID_GENERATE = 0;
+    public static final int MODE_IN_COMMUNICATION = 3;
+    public static final int MODE_NORMAL = 0;
+    public void setMode(int mode) {}
+    public void setSpeakerphoneOn(boolean on) {}
+    public boolean isSpeakerphoneOn() { return true; }
+}
+""",
+    "android/media/AudioTrack.java": """
+package android.media;
+public class AudioTrack {
+    public static final int MODE_STREAM = 1;
+    public static final int STATE_INITIALIZED = 1;
+    public static final int PLAYSTATE_PLAYING = 3;
+    public static final int PLAYSTATE_STOPPED = 1;
+    public static class Builder {
+        public Builder setAudioAttributes(AudioAttributes attributes) { return this; }
+        public Builder setAudioFormat(AudioFormat format) { return this; }
+        public Builder setBufferSizeInBytes(int bufferSizeInBytes) { return this; }
+        public Builder setTransferMode(int mode) { return this; }
+        public Builder setSessionId(int sessionId) { return this; }
+        public AudioTrack build() { return new AudioTrack(0, 0, 0, 0, 0, 0); }
+    }
+    public AudioTrack(int streamType, int sampleRateInHz, int channelConfig, int audioFormat, int bufferSizeInBytes, int mode) {}
+    public AudioTrack(AudioAttributes attributes, AudioFormat format, int bufferSizeInBytes, int mode, int sessionId) {}
+    public static int getMinBufferSize(int sampleRateInHz, int channelConfig, int audioFormat) { return 4096; }
+    public int getState() { return STATE_INITIALIZED; }
+    public void play() {}
+    public void stop() {}
+    public void release() {}
+    public int write(byte[] audioData, int offsetInBytes, int sizeInBytes) { return sizeInBytes; }
+}
+""",
+    "android/hardware/camera2/CameraAccessException.java": """
+package android.hardware.camera2;
+public class CameraAccessException extends Exception {
+    public CameraAccessException(String msg) { super(msg); }
+}
+""",
+    "android/hardware/camera2/CameraCharacteristics.java": """
+package android.hardware.camera2;
+import android.hardware.camera2.params.StreamConfigurationMap;
+public class CameraCharacteristics {
+    public static class Key<T> {}
+    public static final Key<Integer> LENS_FACING = new Key<>();
+    public static final Key<StreamConfigurationMap> SCALER_STREAM_CONFIGURATION_MAP = new Key<>();
+    public static final int LENS_FACING_FRONT = 0;
+    public static final int LENS_FACING_BACK = 1;
+    public <T> T get(Key<T> key) { return null; }
+}
+""",
+    "android/hardware/camera2/params/StreamConfigurationMap.java": """
+package android.hardware.camera2.params;
+import android.util.Size;
+public class StreamConfigurationMap {
+    public Size[] getOutputSizes(int format) {
+        return new Size[] { new Size(640, 480), new Size(1280, 720) };
+    }
+    public Size[] getOutputSizes(Class<?> klass) {
+        return new Size[] { new Size(640, 480), new Size(1280, 720) };
+    }
+}
+""",
+    "android/hardware/camera2/CameraDevice.java": """
+package android.hardware.camera2;
+import android.os.Handler;
+import android.view.Surface;
+import java.util.List;
+public class CameraDevice implements AutoCloseable {
+    public static final int TEMPLATE_PREVIEW = 1;
+    public static final int TEMPLATE_RECORD = 3;
+    public static abstract class StateCallback {
+        public abstract void onOpened(CameraDevice camera);
+        public abstract void onDisconnected(CameraDevice camera);
+        public abstract void onError(CameraDevice camera, int error);
+    }
+    public CaptureRequest.Builder createCaptureRequest(int templateType) throws CameraAccessException {
+        return new CaptureRequest.Builder();
+    }
+    public void createCaptureSession(List<Surface> outputs, CameraCaptureSession.StateCallback callback, Handler handler) throws CameraAccessException {
+        if (callback != null) callback.onConfigured(new CameraCaptureSession());
+    }
+    @Override public void close() {}
+}
+""",
+    "android/hardware/camera2/CaptureRequest.java": """
+package android.hardware.camera2;
+import android.view.Surface;
+public class CaptureRequest {
+    public static class Key<T> {}
+    public static final Key<Integer> CONTROL_AF_MODE = new Key<>();
+    public static final int CONTROL_AF_MODE_CONTINUOUS_PICTURE = 4;
+    public static class Builder {
+        public void addTarget(Surface outputTarget) {}
+        public <T> void set(Key<T> key, T value) {}
+        public CaptureRequest build() { return new CaptureRequest(); }
+    }
+}
+""",
+    "android/hardware/camera2/CameraCaptureSession.java": """
+package android.hardware.camera2;
+import android.os.Handler;
+public class CameraCaptureSession implements AutoCloseable {
+    public static abstract class StateCallback {
+        public abstract void onConfigured(CameraCaptureSession session);
+        public abstract void onConfigureFailed(CameraCaptureSession session);
+    }
+    public static abstract class CaptureCallback {}
+    public void setRepeatingRequest(CaptureRequest request, CaptureCallback listener, Handler handler) throws CameraAccessException {}
+    public void stopRepeating() throws CameraAccessException {}
+    @Override public void close() {}
+}
+""",
+    "android/hardware/camera2/CameraManager.java": """
+package android.hardware.camera2;
+import android.os.Handler;
+public class CameraManager {
+    public static abstract class AvailabilityCallback {}
+    public String[] getCameraIdList() throws CameraAccessException {
+        return new String[] { "0", "1" };
+    }
+    public CameraCharacteristics getCameraCharacteristics(String cameraId) throws CameraAccessException {
+        return new CameraCharacteristics();
+    }
+    public void openCamera(String cameraId, CameraDevice.StateCallback callback, Handler handler) throws CameraAccessException {
+        if (callback != null) callback.onOpened(new CameraDevice());
+    }
+    public void registerAvailabilityCallback(AvailabilityCallback callback, Handler handler) {}
 }
 """,
     "android/media/AudioRecord.java": """

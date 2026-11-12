@@ -33,6 +33,7 @@ public class BridgeActivity extends AppCompatActivity {
     private static final int REQ_NOTIFICATIONS = 1001;
     private static final int REQ_RECORD_AUDIO = 1002;
     private static final int REQ_RUN_COMMAND = 1003;
+    private static final int REQ_CAMERA = 1004;
     private static final long START_FAILURE_COOLDOWN_MS = 1000L;
     private static volatile boolean activityAlive = false;
 
@@ -101,8 +102,11 @@ public class BridgeActivity extends AppCompatActivity {
         root.addView(buttonRow);
 
         Button micPermBtn = new Button(this);
-        micPermBtn.setText("Grant Mic Permission");
-        micPermBtn.setOnClickListener(v -> requestMicrophonePermissionExplicit());
+        micPermBtn.setText("Grant Camera & Mic");
+        micPermBtn.setOnClickListener(v -> {
+            requestMicrophonePermissionExplicit();
+            requestCameraPermissionExplicit();
+        });
         root.addView(micPermBtn);
 
         sensorsText = new TextView(this);
@@ -178,6 +182,20 @@ public class BridgeActivity extends AppCompatActivity {
                     this,
                     new String[]{Manifest.permission.RECORD_AUDIO},
                     REQ_RECORD_AUDIO
+            );
+        } else {
+            refreshRunningServiceCapabilities();
+            updateStatusView();
+        }
+    }
+
+    protected void requestCameraPermissionExplicit() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                    this,
+                    new String[]{Manifest.permission.CAMERA},
+                    REQ_CAMERA
             );
         } else {
             refreshRunningServiceCapabilities();
@@ -354,14 +372,18 @@ public class BridgeActivity extends AppCompatActivity {
                 == PackageManager.PERMISSION_GRANTED;
         boolean micGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 == PackageManager.PERMISSION_GRANTED;
+        boolean cameraGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED;
         boolean micRecording = BridgeService.isRecordingActive();
         String micSessionId = BridgeService.getActiveRecordingSessionId();
 
         statusText.setText(
                 "Service State: " + stateLabel + "\n"
                         + "Loopback IPC: 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT + "\n"
+                        + "Media Stream: 127.0.0.1:" + MediaStreamServer.DEFAULT_MEDIA_PORT + "\n"
                         + "Protocol Version: v" + LocalBridgeServer.PROTOCOL_VERSION + "\n"
                         + "Notifications Permission: " + (notifGranted ? "GRANTED" : "NOT GRANTED") + "\n"
+                        + "Camera Permission: " + (cameraGranted ? "GRANTED" : "NOT GRANTED") + "\n"
                         + "Microphone Permission: " + (micGranted ? "GRANTED" : "NOT GRANTED") + "\n"
                         + "Microphone Capture: " + (micRecording ? ("RECORDING (" + micSessionId + ")") : "IDLE") + "\n"
                         + "Android API: " + Build.VERSION.SDK_INT + " (Release " + Build.VERSION.RELEASE + ")"

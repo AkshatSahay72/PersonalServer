@@ -1086,6 +1086,37 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed to retrieve recording: {e}"})
                 return
 
+        # 3b3. On-Demand Live Call Video Frame (E07): GET /hardware/live-call/frame or /stream
+        if path in ("/hardware/live-call/frame", "/api/hardware/live-call/frame", "/hardware/live-call/stream", "/api/hardware/live-call/stream"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                sess = mgr.live_call.current_session
+                if not sess or sess.state.value != "ACTIVE":
+                    self.send_json(404, {"error": "No active live call session"})
+                    return
+                frame = mgr.live_call.get_latest_frame()
+                if not frame:
+                    self.send_json(503, {"error": "No video frame available yet"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(frame)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try:
+                    self.wfile.write(frame)
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed retrieving live call frame: {e}"})
+                return
+
         # 3c. Continuous Live Camera Streaming: GET /live-camera or /api/live-camera
         if path in ("/live-camera", "/api/live-camera"):
             if not self.check_auth():
@@ -2143,6 +2174,27 @@ document.getElementById('cmd-box').textContent = code
                 return
             except Exception as e:
                 self.send_json(500, {"error": f"Failed to execute hardware operation: {e}"})
+                return
+
+        # 0a3. On-Demand Live Call Speaker Audio (Browser -> Phone Speaker) (E07): POST /hardware/live-call/speak
+        if path in ("/hardware/live-call/speak", "/api/hardware/live-call/speak"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            body = self.read_json_body()
+            pcm_b64 = (body or {}).get("pcm_base64", "")
+            sr = int((body or {}).get("sample_rate", 16000))
+            ch = int((body or {}).get("channels", 1))
+            try:
+                import base64
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                raw_pcm = base64.b64decode(pcm_b64) if pcm_b64 else b""
+                ok = mgr.live_call.send_speaker_audio(raw_pcm, sample_rate=sr, channels=ch)
+                self.send_json(200, {"success": ok})
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed writing to speaker: {e}"})
                 return
 
         # 0a2. Continuous Live Camera Streaming: POST /live-camera or /api/live-camera

@@ -17,6 +17,7 @@ from agent.hardware.base import SessionState, HardwareSession
 from agent.hardware.camera import CameraProvider
 from agent.hardware.microphone import MicrophoneProvider
 from agent.hardware.speaker import SpeakerProvider
+from agent.hardware.live_call import LiveCallProvider
 
 logger = logging.getLogger("agent.hardware.manager")
 
@@ -42,6 +43,7 @@ class HardwareCapabilityManager:
         self.camera = CameraProvider(storage_dir=self.storage_dir / "camera")
         self.microphone = MicrophoneProvider(storage_dir=self.storage_dir / "audio")
         self.speaker = SpeakerProvider()
+        self.live_call = LiveCallProvider()
         self._lock = threading.RLock()
         self._watchdog_active = True
         self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True, name="HardwareWatchdog")
@@ -67,6 +69,11 @@ class HardwareCapabilityManager:
                 if self.microphone.current_session and self.microphone.current_session.is_expired():
                     logger.info("Watchdog cleaning up expired microphone session: %s", self.microphone.current_session.session_id)
                     self.microphone.stop_session("Session timeout reached")
+
+                # Live call expiration check (E07)
+                if self.live_call.current_session and self.live_call.current_session.is_expired():
+                    logger.info("Watchdog cleaning up expired live call session: %s", self.live_call.current_session.session_id)
+                    self.live_call.stop_session("Session timeout reached")
 
                 # Speaker expiration check
                 if self.speaker.current_session and self.speaker.current_session.is_expired():
@@ -186,6 +193,33 @@ class HardwareCapabilityManager:
             )
             return {"operation": op, "success": res.get("success", False), "result": res}
 
+        # Unified On-Demand Live Call Operations (E07)
+        elif op == "START_LIVE_CALL":
+            ok, res = self.live_call.start_session(parameters=params, timeout_sec=timeout_sec)
+            return {"operation": op, "success": ok, "result": res}
+
+        elif op == "STOP_LIVE_CALL":
+            reason = str(params.get("reason", "Requested by controller"))
+            res = self.live_call.stop_session(reason=reason)
+            return {"operation": op, "success": True, "result": res}
+
+        elif op == "GET_LIVE_CALL_STATUS":
+            res = self.live_call.get_status()
+            return {"operation": op, "success": True, "status": res}
+
+        elif op == "UPDATE_LIVE_CALL":
+            res = self.live_call.update_session(parameters=params)
+            return {"operation": op, "success": res.get("success", False), "result": res}
+
+        elif op == "LIVE_CALL_SPEAK":
+            pcm_b64 = params.get("pcm_base64", "")
+            import base64
+            pcm_data = base64.b64decode(pcm_b64) if pcm_b64 else b""
+            sr = int(params.get("sample_rate", 16000))
+            ch = int(params.get("channels", 1))
+            ok = self.live_call.send_speaker_audio(pcm_data, sample_rate=sr, channels=ch)
+            return {"operation": op, "success": ok}
+
         else:
             return {
                 "operation": op,
@@ -199,7 +233,8 @@ class HardwareCapabilityManager:
             "timestamp": time.time(),
             "camera": self.camera.get_status(),
             "microphone": self.microphone.get_status(),
-            "speaker": self.speaker.get_status()
+            "speaker": self.speaker.get_status(),
+            "live_call": self.live_call.get_status()
         }
 
     def stop_all(self, reason: str = "Controller connection lost or agent shutdown"):
@@ -210,3 +245,4 @@ class HardwareCapabilityManager:
             self.microphone.stop_session(reason)
             self.microphone.cleanup_native(reason)
             self.speaker.stop_session(reason)
+            self.live_call.stop_session(reason)

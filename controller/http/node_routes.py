@@ -619,6 +619,104 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         handler.send_json(404, {"error": f"Node '{node_id}' has no reachable IP."})
         return True
 
+    # GET /nodes/<node_id>/live-call/frame or /status (E07)
+    if "/live-call/" in norm_path:
+        is_frame = norm_path.endswith("/live-call/frame") or norm_path.endswith("/live-call/stream")
+        is_status = norm_path.endswith("/live-call/status")
+        if is_frame or is_status:
+            prefix = "/api/nodes/" if norm_path.startswith("/api/nodes/") else "/nodes/"
+            suffix = "/live-call/frame" if norm_path.endswith("/live-call/frame") else ("/live-call/stream" if norm_path.endswith("/live-call/stream") else "/live-call/status")
+            node_id = norm_path[len(prefix):-len(suffix)].strip("/")
+
+            token = handler.parse_auth_token()
+            enrollment_token = get_or_create_enrollment_token()
+            if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                handler.send_json(401, {"error": "Unauthorized: Authentication required for live call access"})
+                return True
+
+            nodes_db = load_nodes_db()
+            node = nodes_db.get("nodes", {}).get(node_id)
+            is_local = (node_id in ("local", "self") or (node and node.get("ip") in ("127.0.0.1", "localhost", "::1")))
+
+            if is_local:
+                try:
+                    from agent.hardware.manager import HardwareCapabilityManager
+                    mgr = HardwareCapabilityManager.get_instance()
+                    if is_status:
+                        handler.send_json(200, {"node_id": node_id, "status": mgr.live_call.get_status()})
+                        return True
+                    else:
+                        frame = mgr.live_call.get_latest_frame()
+                        if not frame:
+                            handler.send_json(503, {"error": "No video frame available yet"})
+                            return True
+                        handler.send_response(200)
+                        handler.send_header("Content-Type", "image/jpeg")
+                        handler.send_header("Content-Length", str(len(frame)))
+                        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                        handler.send_header("Access-Control-Allow-Origin", "*")
+                        handler.end_headers()
+                        try:
+                            handler.wfile.write(frame)
+                        except Exception:
+                            pass
+                        return True
+                except Exception as e:
+                    handler.send_json(500, {"error": f"Local live call error: {e}"})
+                    return True
+
+            if not node:
+                handler.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return True
+
+            node_ip = node.get("ip")
+            if not node_ip:
+                handler.send_json(502, {"error": f"Node '{node_id}' has no reachable IP"})
+                return True
+
+            remote_path = f"http://{node_ip}:8080/hardware/live-call/frame" if is_frame else f"http://{node_ip}:8080/hardware"
+            try:
+                if is_status:
+                    req_data = json.dumps({"operation": "GET_LIVE_CALL_STATUS", "params": {}}).encode("utf-8")
+                    req = urllib.request.Request(
+                        remote_path,
+                        data=req_data,
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "PersonalServer-Controller/1.0",
+                            "Authorization": f"Bearer {token or ''}"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=3.5) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        handler.send_json(200, {"node_id": node_id, **data})
+                        return True
+                else:
+                    req = urllib.request.Request(
+                        remote_path,
+                        headers={
+                            "User-Agent": "PersonalServer-Controller/1.0",
+                            "Authorization": f"Bearer {token or ''}"
+                        }
+                    )
+                    with urllib.request.urlopen(req, timeout=3.5) as resp:
+                        raw_frame = resp.read()
+                        handler.send_response(200)
+                        handler.send_header("Content-Type", "image/jpeg")
+                        handler.send_header("Content-Length", str(len(raw_frame)))
+                        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                        handler.send_header("Access-Control-Allow-Origin", "*")
+                        handler.end_headers()
+                        try:
+                            handler.wfile.write(raw_frame)
+                        except Exception:
+                            pass
+                        return True
+            except Exception as e:
+                handler.send_json(503, {"error": f"Failed reaching live call on node '{node_id}': {e}"})
+                return True
+
     # GET /nodes/<node_id>
     if norm_path.startswith("/nodes/") or norm_path.startswith("/api/nodes/"):
         prefix_len = 11 if norm_path.startswith("/api/nodes/") else 7
@@ -1632,6 +1730,104 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
                 "node_id": node_id
             })
             return True
+
+    # 10. POST /nodes/<node_id>/live-call/<action> (E07 Live Call Communication)
+    if "/live-call/" in norm_path:
+        prefix = "/api/nodes/" if norm_path.startswith("/api/nodes/") else "/nodes/"
+        sub = norm_path[len(prefix):]
+        if "/live-call/" in sub:
+            parts = sub.split("/live-call/", 1)
+            node_id = parts[0].strip("/")
+            action = parts[1].strip("/").lower()
+            enrollment_token = get_or_create_enrollment_token()
+            if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+                handler.send_json(401, {"error": "Unauthorized: Authentication required for live call"})
+                return True
+
+            if action == "ice":
+                handler.send_json(200, {"success": True, "node_id": node_id, "ack": True})
+                return True
+
+            op_map = {
+                "start": "START_LIVE_CALL",
+                "stop": "STOP_LIVE_CALL",
+                "update": "UPDATE_LIVE_CALL",
+                "speak": "LIVE_CALL_SPEAK"
+            }
+            op_name = op_map.get(action)
+            if not op_name:
+                handler.send_json(400, {"error": f"Unknown live call action: '{action}'"})
+                return True
+
+            nodes_db = load_nodes_db()
+            node = nodes_db.get("nodes", {}).get(node_id)
+            is_local = (node_id in ("local", "self") or (node and node.get("ip") in ("127.0.0.1", "localhost", "::1")))
+
+            if is_local:
+                try:
+                    from agent.hardware.manager import HardwareCapabilityManager
+                    mgr = HardwareCapabilityManager.get_instance()
+                    res = mgr.execute_operation(op_name, parameters=body)
+                    status_code = 200 if res.get("success") else 400
+                    handler.send_json(status_code, {"node_id": node_id, **res})
+                    return True
+                except Exception as e:
+                    handler.send_json(500, {"error": f"Local live call execution error: {e}"})
+                    return True
+
+            if not node:
+                handler.send_json(404, {"error": f"Node '{node_id}' not found"})
+                return True
+
+            node_status = (node.get("status") or "").upper()
+            if node_status == "OFFLINE":
+                handler.send_json(503, {
+                    "error": f"Cannot execute live call: Node '{node_id}' is OFFLINE.",
+                    "node_id": node_id,
+                    "action": action
+                })
+                return True
+
+            node_ip = node.get("ip")
+            if not node_ip:
+                handler.send_json(502, {"error": f"Node '{node_id}' has no reachable IP recorded."})
+                return True
+
+            try:
+                if action == "speak":
+                    remote_url = f"http://{node_ip}:8080/hardware/live-call/speak"
+                    req_data = json.dumps(body).encode("utf-8")
+                else:
+                    remote_url = f"http://{node_ip}:8080/hardware"
+                    req_data = json.dumps({"operation": op_name, "params": body}).encode("utf-8")
+
+                req = urllib.request.Request(
+                    remote_url,
+                    data=req_data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "PersonalServer-Controller/1.0",
+                        "Authorization": f"Bearer {token or ''}"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    handler.send_json(resp.status, {"node_id": node_id, **data})
+                    return True
+            except urllib.error.HTTPError as e:
+                try:
+                    err_data = json.loads(e.read().decode("utf-8"))
+                except Exception:
+                    err_data = {"error": f"Node returned HTTP {e.code}: {e.reason}"}
+                handler.send_json(e.code, {"node_id": node_id, **err_data})
+                return True
+            except Exception as e:
+                handler.send_json(503, {
+                    "error": f"Failed dispatching live call action '{action}' to node '{node_id}': {e}",
+                    "node_id": node_id
+                })
+                return True
 
     return False
 

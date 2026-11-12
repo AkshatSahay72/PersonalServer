@@ -36,6 +36,8 @@ public class BridgeService extends Service {
     private static volatile boolean starting = false;
     private static volatile boolean recordingActive = false;
     private static volatile String activeRecordingSessionId = null;
+    private static volatile boolean liveCallActive = false;
+    private static volatile String activeLiveCallSessionId = null;
     private static volatile String lastStartError = null;
     private LocalBridgeServer bridgeServer;
     private PowerManager.WakeLock wakeLock;
@@ -77,14 +79,39 @@ public class BridgeService extends Service {
             if (micGranted) {
                 fgsTypes |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
             }
+            boolean cameraGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                    == PackageManager.PERMISSION_GRANTED;
+            if (cameraGranted) {
+                fgsTypes |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
+            }
             try {
                 startForeground(NOTIFICATION_ID, notification, fgsTypes);
-            } catch (SecurityException micFgsEx) {
-                Log.w(TAG, "Microphone FGS type unavailable cleanly falling back to SPECIAL_USE: " + micFgsEx.getMessage());
+            } catch (SecurityException fgsEx) {
+                Log.w(TAG, "Microphone/Camera FGS type unavailable cleanly falling back to SPECIAL_USE: " + fgsEx.getMessage());
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
             }
         } else {
             startForeground(NOTIFICATION_ID, notification);
+        }
+    }
+
+    private void onLiveCallNotificationUpdate(boolean active, String sessionId, String details) {
+        liveCallActive = active;
+        activeLiveCallSessionId = active ? sessionId : null;
+        if (!running || bridgeServer == null || !bridgeServer.isListening()) {
+            return;
+        }
+        String text = active
+                ? ("Live Call Active (" + sessionId + "): " + details)
+                : ("Loopback IPC active on 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT);
+        try {
+            Notification n = buildNotification(text);
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null) {
+                nm.notify(NOTIFICATION_ID, n);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed updating live call notification: " + e.getMessage());
         }
     }
 
@@ -169,6 +196,7 @@ public class BridgeService extends Service {
         if (bridgeServer == null) {
             bridgeServer = createBridgeServer();
             bridgeServer.setRecordingNotificationListener(this::onRecordingNotificationUpdate);
+            bridgeServer.setLiveCallNotificationListener(this::onLiveCallNotificationUpdate);
         }
         boolean bound = bridgeServer.startAndAwaitBind(LocalBridgeServer.DEFAULT_START_TIMEOUT_MS);
         if (bound && bridgeServer != null && bridgeServer.isListening()) {
@@ -214,10 +242,17 @@ public class BridgeService extends Service {
     private void stopServiceResources() {
         recordingActive = false;
         activeRecordingSessionId = null;
+        liveCallActive = false;
+        activeLiveCallSessionId = null;
         releaseWakeLock();
         LocalBridgeServer server = bridgeServer;
         bridgeServer = null;
         if (server != null) {
+            if (server.getLiveMediaManager() != null && server.getLiveMediaManager().isSessionActive()) {
+                try {
+                    server.getLiveMediaManager().stopLiveCall("Service shutdown");
+                } catch (Exception ignored) {}
+            }
             if (server.getRecoveryCoordinator() != null) {
                 server.getRecoveryCoordinator().stop();
             }

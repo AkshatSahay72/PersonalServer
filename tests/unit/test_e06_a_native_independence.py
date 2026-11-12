@@ -120,6 +120,8 @@ public class Context {
     public static final String BATTERY_SERVICE = "batterymanager";
     public static final String CONNECTIVITY_SERVICE = "connectivity";
     public static final String NOTIFICATION_SERVICE = "notification";
+    public static final String CAMERA_SERVICE = "camera";
+    public static final String AUDIO_SERVICE = "audio";
     public static final int MODE_PRIVATE = 0;
     private final android.os.PowerManager pm = new android.os.PowerManager();
     private final android.hardware.SensorManager sm = new android.hardware.SensorManager();
@@ -135,6 +137,8 @@ public class Context {
         if (BATTERY_SERVICE.equals(name)) return bm;
         if (CONNECTIVITY_SERVICE.equals(name)) return cm;
         if (NOTIFICATION_SERVICE.equals(name)) return nm;
+        if (CAMERA_SERVICE.equals(name)) return new android.hardware.camera2.CameraManager();
+        if (AUDIO_SERVICE.equals(name)) return new android.media.AudioManager();
         return null;
     }
     public <T> T getSystemService(Class<T> cls) { return null; }
@@ -205,6 +209,8 @@ public abstract class PackageManager {
     public static final int PERMISSION_GRANTED = 0;
     public static final int PERMISSION_DENIED = -1;
     public static final String FEATURE_MICROPHONE = "android.hardware.microphone";
+    public static final String FEATURE_CAMERA_ANY = "android.hardware.camera.any";
+    public static final String FEATURE_CAMERA_FRONT = "android.hardware.camera.front";
     public static class NameNotFoundException extends Exception {}
     public abstract boolean hasSystemFeature(String name);
     public PackageInfo getPackageInfo(String pkg, int flags) throws NameNotFoundException {
@@ -337,7 +343,14 @@ public class SensorManager {
 package android.media;
 public class AudioFormat {
     public static final int CHANNEL_IN_MONO = 16;
+    public static final int CHANNEL_OUT_MONO = 4;
     public static final int ENCODING_PCM_16BIT = 2;
+    public static class Builder {
+        public Builder setEncoding(int encoding) { return this; }
+        public Builder setSampleRate(int rate) { return this; }
+        public Builder setChannelMask(int mask) { return this; }
+        public AudioFormat build() { return new AudioFormat(); }
+    }
 }
 """,
     "android/media/AudioRecord.java": """
@@ -369,6 +382,7 @@ package android.media;
 public class MediaRecorder {
     public static class AudioSource {
         public static final int MIC = 1;
+        public static final int VOICE_COMMUNICATION = 7;
     }
 }
 """,

@@ -7,15 +7,20 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Termux RunCommand execution permission -->
     <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
 
-    <!-- Explicit runtime-gated hardware capture -->
+    <!-- Explicit runtime-gated hardware capture & audio controls -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <!-- Private local loopback communication & network state inspection -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -50,7 +55,7 @@
             android:name=".BridgeService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="specialUse|microphone">
+            android:foregroundServiceType="specialUse|microphone|camera">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Local loopback IPC service for device telemetry and sensor acquisition" />

@@ -40,6 +40,10 @@
           <span class="nav-icon mono">[]</span>
           <span>Applications</span>
         </a>
+        <a href="#live-call" class="nav-link" data-page="live-call">
+          <span class="nav-icon mono">◎</span>
+          <span>Live Call</span>
+        </a>
         <a href="#settings" class="nav-link" data-page="settings">
           <span class="nav-icon mono">%</span>
           <span>Settings</span>
@@ -1283,6 +1287,89 @@
                 <span class="sys-kv-k">Public Gateway</span>
                 <span class="sys-kv-v">Cloudflare Zero Trust Access & Tunnel</span>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 7. LIVE CALL VIEW (E07) -->
+      <section id="view-live-call" class="page-view">
+        <div class="section-card live-call-card">
+          <div class="section-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span class="section-title">Live Video & Two-Way Audio Communication</span>
+              <span id="call-status-badge" class="badge badge-secondary mono">IDLE</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <label for="call-device-select" class="mono cell-muted" style="font-size: 12px;">Target Device:</label>
+              <select id="call-device-select" class="form-input mono" style="font-size: 12px; min-width: 200px;">
+                <option value="">Select Android Device...</option>
+              </select>
+              <button id="call-refresh-devices-btn" class="btn btn-sm" onclick="populateCallDevices()" title="Refresh Nodes">⟳</button>
+            </div>
+          </div>
+
+          <!-- Video & Live Call Viewport -->
+          <div class="live-call-container">
+            <div class="live-call-viewport-wrap">
+              <div class="live-call-viewport" id="call-viewport">
+                <!-- Video display elements -->
+                <img id="call-video-stream" src="" alt="Live Camera Feed" style="display: none; width: 100%; height: 100%; object-fit: contain; background: #000;">
+                <video id="call-video-webrtc" autoplay playsinline muted style="display: none; width: 100%; height: 100%; object-fit: contain; background: #000;"></video>
+                <div id="call-placeholder" class="call-placeholder">
+                  <div class="call-placeholder-icon">📹</div>
+                  <div class="call-placeholder-title">No Active Session</div>
+                  <div class="call-placeholder-sub cell-muted mono">Select a registered Android node and click "Start Live Call"</div>
+                </div>
+
+                <!-- Live Stream Overlays -->
+                <div id="call-telemetry-overlay" class="call-telemetry-overlay mono" style="display: none;">
+                  <span id="call-fps-badge" class="telemetry-pill">0 FPS</span>
+                  <span id="call-res-badge" class="telemetry-pill">-</span>
+                  <span id="call-latency-badge" class="telemetry-pill">- ms</span>
+                  <span id="call-duration-badge" class="telemetry-pill">00:00</span>
+                </div>
+
+                <div id="call-hardware-pills" class="call-hardware-pills mono" style="display: none;">
+                  <span id="pill-cam-state" class="hw-pill pill-active">● Camera (Active)</span>
+                  <span id="pill-mic-state" class="hw-pill pill-active">● Mic (Active)</span>
+                  <span id="pill-spk-state" class="hw-pill pill-active">● Speaker (Active)</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Call Controls Strip -->
+            <div class="live-call-controls-strip">
+              <div class="call-controls-left">
+                <button id="call-start-btn" class="btn btn-primary" onclick="startLiveCallSession()">
+                  <span>📞 Start Live Call</span>
+                </button>
+                <button id="call-end-btn" class="btn btn-danger" onclick="endLiveCallSession()" style="display: none;">
+                  <span>✕ End Call</span>
+                </button>
+                <button id="call-switch-cam-btn" class="btn btn-secondary" onclick="switchCallCamera()" style="display: none;" title="Switch between Front and Back Camera">
+                  <span>🔄 Switch Camera</span>
+                </button>
+              </div>
+
+              <div class="call-controls-center">
+                <button id="call-toggle-mic-btn" class="btn btn-secondary" onclick="toggleNodeMic()" style="display: none;">
+                  <span id="call-toggle-mic-label">🔊 Mute Phone Mic</span>
+                </button>
+                <button id="call-talk-btn" class="btn btn-secondary" onmousedown="startPushToTalk()" onmouseup="stopPushToTalk()" ontouchstart="startPushToTalk()" ontouchend="stopPushToTalk()" style="display: none;" title="Hold to speak through phone speaker">
+                  <span id="call-talk-label">🎙️ Push to Talk</span>
+                </button>
+              </div>
+
+              <div class="call-controls-right mono cell-muted" id="call-session-meta">
+                <span id="call-target-node-text">Device: None</span>
+              </div>
+            </div>
+
+            <!-- Live Call Status / Error Banners -->
+            <div id="call-error-banner" class="modal-error mono" style="display: none; margin-top: 14px;"></div>
+            <div id="call-permission-warning" class="warning-banner mono" style="display: none; margin-top: 14px; background: rgba(210, 153, 34, 0.15); border: 1px solid var(--status-yellow); padding: 10px 14px; border-radius: 4px; color: #eac54f;">
+              ⚠️ <strong>Permission Required:</strong> Camera or Microphone permission has not been granted on the target device. Please open the PersonalServer Bridge app on the phone and tap "Grant Camera & Mic".
             </div>
           </div>
         </div>
