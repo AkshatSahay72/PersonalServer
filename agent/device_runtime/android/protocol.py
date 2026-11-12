@@ -18,6 +18,13 @@ from agent.device_runtime.android.models import (
     SENSOR_DEFAULT_INTERVAL_MS,
     SENSOR_MAX_SESSION_DURATION_SEC,
     SENSOR_MAX_BUFFER_SAMPLES,
+    MIC_MIN_DURATION_SEC,
+    MIC_MAX_DURATION_SEC,
+    MIC_DEFAULT_DURATION_SEC,
+    MIC_SUPPORTED_SAMPLE_RATES_HZ,
+    MIC_DEFAULT_SAMPLE_RATE_HZ,
+    MIC_MAX_FILE_BYTES,
+    MIC_MAX_CHUNK_BYTES,
     SensorType,
     AndroidBridgeRequest,
     AndroidBridgeResponse,
@@ -30,6 +37,15 @@ SENSOR_OPERATIONS = frozenset({
     "SENSOR_READ",
     "SENSOR_STOP",
     "SENSOR_STATUS",
+})
+
+RECORDING_OPERATIONS = frozenset({
+    "RECORDING_DISCOVER",
+    "START_RECORDING",
+    "RECORDING_STATUS",
+    "STOP_RECORDING",
+    "RECORDING_READ",
+    "RECORDING_CLEANUP",
 })
 
 VALID_SENSOR_TYPES = frozenset(st.value for st in SensorType)
@@ -354,6 +370,106 @@ class BridgeProtocol:
             session_id = params.get("session_id")
             if session_id is not None and not isinstance(session_id, str):
                 raise ProtocolError("'session_id' must be a string when provided")
+            return params
+
+        return params
+
+    @staticmethod
+    def validate_recording_request(
+        operation: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Validates parameters for protocol v1 native microphone recording operations (D4-E02).
+        Enforces explicit user authorization ('authorized': True), bounded duration/size,
+        valid sample rates, and safe chunk/session bounds.
+        Raises ProtocolError on invalid or unauthorized input.
+        """
+        if operation not in RECORDING_OPERATIONS:
+            raise ProtocolError(f"Unsupported recording operation: {operation}")
+
+        params = dict(parameters or {})
+
+        if operation in ("RECORDING_DISCOVER", "RECORDING_STATUS"):
+            session_id = params.get("session_id")
+            if session_id is not None and not isinstance(session_id, str):
+                raise ProtocolError("'session_id' must be a string when provided")
+            return params
+
+        if operation == "START_RECORDING":
+            if params.get("authorized") is not True:
+                raise ProtocolError(
+                    "START_RECORDING requires explicit user authorization ('authorized': True)"
+                )
+
+            raw_dur = params.get("duration_sec", MIC_DEFAULT_DURATION_SEC)
+            try:
+                dur = int(round(float(raw_dur)))
+            except (TypeError, ValueError) as e:
+                raise ProtocolError(f"Invalid duration_sec: {raw_dur}") from e
+
+            if dur < int(MIC_MIN_DURATION_SEC) or dur > int(MIC_MAX_DURATION_SEC):
+                raise ProtocolError(
+                    f"duration_sec ({dur}) out of bounds ({int(MIC_MIN_DURATION_SEC)}..{int(MIC_MAX_DURATION_SEC)} s)"
+                )
+            params["duration_sec"] = dur
+
+            raw_rate = params.get("sample_rate_hz", MIC_DEFAULT_SAMPLE_RATE_HZ)
+            try:
+                rate = int(raw_rate)
+            except (TypeError, ValueError) as e:
+                raise ProtocolError(f"Invalid sample_rate_hz: {raw_rate}") from e
+
+            if rate not in MIC_SUPPORTED_SAMPLE_RATES_HZ:
+                raise ProtocolError(
+                    f"Unsupported sample_rate_hz ({rate}); supported: {MIC_SUPPORTED_SAMPLE_RATES_HZ}"
+                )
+            params["sample_rate_hz"] = rate
+
+            sid = params.get("session_id")
+            if sid is not None:
+                if not isinstance(sid, str) or not sid.strip() or "/" in sid or "\\" in sid or ".." in sid:
+                    raise ProtocolError("Invalid 'session_id' format")
+                params["session_id"] = sid.strip()
+
+            return params
+
+        if operation == "STOP_RECORDING":
+            sid = params.get("session_id")
+            if sid is not None and not isinstance(sid, str):
+                raise ProtocolError("'session_id' must be a string when provided")
+            return params
+
+        if operation == "RECORDING_READ":
+            sid = params.get("session_id")
+            if not sid or not isinstance(sid, str) or "/" in sid or "\\" in sid or ".." in sid:
+                raise ProtocolError("RECORDING_READ requires a valid 'session_id'")
+            params["session_id"] = sid.strip()
+
+            raw_offset = params.get("offset", 0)
+            try:
+                offset = int(raw_offset)
+            except (TypeError, ValueError) as e:
+                raise ProtocolError(f"Invalid offset: {raw_offset}") from e
+            if offset < 0 or offset > MIC_MAX_FILE_BYTES:
+                raise ProtocolError(f"offset ({offset}) out of valid bounds (0..{MIC_MAX_FILE_BYTES})")
+            params["offset"] = offset
+
+            raw_len = params.get("length", MIC_MAX_CHUNK_BYTES)
+            try:
+                length = int(raw_len)
+            except (TypeError, ValueError) as e:
+                raise ProtocolError(f"Invalid length: {raw_len}") from e
+            if length <= 0:
+                raise ProtocolError("Chunk length must be positive")
+            params["length"] = min(length, MIC_MAX_CHUNK_BYTES)
+            return params
+
+        if operation == "RECORDING_CLEANUP":
+            sid = params.get("session_id")
+            if not sid or not isinstance(sid, str) or "/" in sid or "\\" in sid or ".." in sid:
+                raise ProtocolError("RECORDING_CLEANUP requires a valid 'session_id'")
+            params["session_id"] = sid.strip()
             return params
 
         return params

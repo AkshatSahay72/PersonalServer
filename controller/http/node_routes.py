@@ -430,6 +430,124 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         })
         return True
 
+    # GET /nodes/<node_id>/hardware/microphone/recording or /api/nodes/<node_id>/hardware/microphone/recording
+    is_mic_rec = False
+    mic_rec_node_id = None
+    if norm_path.endswith("/hardware/microphone/recording"):
+        if norm_path.startswith("/api/nodes/"):
+            mic_rec_node_id = norm_path[11:-len("/hardware/microphone/recording")].strip("/")
+            is_mic_rec = True
+        elif norm_path.startswith("/nodes/"):
+            mic_rec_node_id = norm_path[7:-len("/hardware/microphone/recording")].strip("/")
+            is_mic_rec = True
+
+    if is_mic_rec and mic_rec_node_id:
+        token = handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required for recording download"})
+            return True
+
+        session_id = (query.get("session_id", [""])[0] or "").strip()
+        if session_id and not re.match(r"^[A-Za-z0-9_-]{4,64}$", session_id):
+            handler.send_json(400, {"error": "Invalid 'session_id' parameter"})
+            return True
+        download_flag = query.get("download", ["0"])[0] == "1"
+
+        node_id = mic_rec_node_id
+        nodes_db = load_nodes_db()
+        node = nodes_db.get("nodes", {}).get(node_id)
+        is_local = (node_id in ("local", "self") or (node and node.get("ip") in ("127.0.0.1", "localhost", "::1")))
+
+        if is_local:
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                from agent.device_runtime.android.models import MIC_MAX_FILE_BYTES
+                mgr = HardwareCapabilityManager.get_instance()
+                wav_path, meta = mgr.microphone.get_recording_file(session_id or None)
+                if not wav_path or not wav_path.exists():
+                    handler.send_json(404, {"error": "Completed recording not found or expired"})
+                    return True
+                raw_bytes = wav_path.read_bytes()
+                if len(raw_bytes) > MIC_MAX_FILE_BYTES:
+                    handler.send_json(413, {"error": "Recording exceeds maximum transfer size bound"})
+                    return True
+                disp = "attachment" if download_flag else "inline"
+                fname = (meta or {}).get("file_name") or wav_path.name
+                handler.send_response(200)
+                handler.send_header("Content-Type", "audio/wav")
+                handler.send_header("Content-Length", str(len(raw_bytes)))
+                handler.send_header("Content-Disposition", f'{disp}; filename="{fname}"')
+                if meta and meta.get("sha256"):
+                    handler.send_header("X-Recording-Sha256", str(meta["sha256"]))
+                handler.send_header("Cache-Control", "no-store")
+                handler.send_header("Access-Control-Allow-Origin", "*")
+                handler.end_headers()
+                handler.wfile.write(raw_bytes)
+                return True
+            except Exception as e:
+                handler.send_json(500, {"error": f"Local recording retrieval error: {e}"})
+                return True
+
+        if not node:
+            handler.send_json(404, {"error": f"Node '{node_id}' not found"})
+            return True
+        if (node.get("status") or "").upper() == "OFFLINE":
+            handler.send_json(503, {"error": f"Node '{node_id}' is OFFLINE. Recording download unavailable."})
+            return True
+        node_ip = node.get("ip")
+        if not node_ip:
+            handler.send_json(502, {"error": f"Node '{node_id}' has no reachable IP address."})
+            return True
+
+        try:
+            from agent.device_runtime.android.models import MIC_MAX_FILE_BYTES
+            q_params = {}
+            if session_id:
+                q_params["session_id"] = session_id
+            if download_flag:
+                q_params["download"] = "1"
+            q_str = urllib.parse.urlencode(q_params)
+            remote_url = f"http://{node_ip}:8080/hardware/microphone/recording" + (f"?{q_str}" if q_str else "")
+            req = urllib.request.Request(
+                remote_url,
+                headers={
+                    "User-Agent": "PersonalServer-Controller/1.0",
+                    "Authorization": f"Bearer {token or ''}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw_bytes = resp.read(MIC_MAX_FILE_BYTES + 1024)
+                if len(raw_bytes) > MIC_MAX_FILE_BYTES:
+                    handler.send_json(413, {"error": "Remote recording exceeds maximum transfer size bound"})
+                    return True
+                if len(raw_bytes) < 12 or raw_bytes[:4] != b"RIFF" or raw_bytes[8:12] != b"WAVE":
+                    handler.send_json(502, {"error": "Remote audio failed RIFF/WAVE container verification"})
+                    return True
+                handler.send_response(200)
+                handler.send_header("Content-Type", resp.headers.get("Content-Type", "audio/wav"))
+                handler.send_header("Content-Length", str(len(raw_bytes)))
+                cd = resp.headers.get("Content-Disposition") or f'inline; filename="mic_{session_id or "latest"}.wav"'
+                handler.send_header("Content-Disposition", cd)
+                sha_hdr = resp.headers.get("X-Recording-Sha256")
+                if sha_hdr:
+                    handler.send_header("X-Recording-Sha256", sha_hdr)
+                handler.send_header("Cache-Control", "no-store")
+                handler.send_header("Access-Control-Allow-Origin", "*")
+                handler.end_headers()
+                handler.wfile.write(raw_bytes)
+                return True
+        except urllib.error.HTTPError as e:
+            try:
+                err_data = json.loads(e.read().decode("utf-8"))
+            except Exception:
+                err_data = {"error": f"Node returned HTTP {e.code}: {e.reason}"}
+            handler.send_json(e.code, {"node_id": node_id, **err_data})
+            return True
+        except Exception as e:
+            handler.send_json(503, {"error": f"Failed to retrieve recording from node '{node_id}': {e}"})
+            return True
+
     # GET /nodes/<node_id>/live-camera or /api/nodes/<node_id>/live-camera
     is_live_cam = False
     live_cam_node_id = None
@@ -1351,6 +1469,27 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
         nodes_db = load_nodes_db()
         node = nodes_db.get("nodes", {}).get(node_id)
         is_local = (node_id in ("local", "self") or (node and node.get("ip") in ("127.0.0.1", "localhost", "::1")))
+
+        op_upper = str(operation).upper().strip()
+        if op_upper in ("START_RECORDING", "START_MIC"):
+            if node and isinstance(node.get("capability_permissions"), dict):
+                mic_perm = node["capability_permissions"].get("microphone")
+                if mic_perm is not None:
+                    perm_str = mic_perm.get("status") if isinstance(mic_perm, dict) else str(mic_perm)
+                    if str(perm_str).upper() != "APPROVED":
+                        handler.send_json(403, {
+                            "error": f"Microphone capability permission is '{perm_str}'; explicit owner approval is required first.",
+                            "code": "CAPABILITY_NOT_APPROVED",
+                            "node_id": node_id,
+                        })
+                        return True
+            if op_upper == "START_RECORDING" and (not isinstance(params, dict) or params.get("authorized") is not True):
+                handler.send_json(400, {
+                    "error": "Explicit user authorization ('authorized': true) is required to start microphone recording",
+                    "code": "UNAUTHORIZED",
+                    "node_id": node_id,
+                })
+                return True
 
         if is_local:
             try:

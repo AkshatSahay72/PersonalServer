@@ -79,9 +79,10 @@ class DeviceRuntime:
         self.register_provider(ConnectivityProvider())
         self.register_provider(PowerProvider())
 
-        # D3 Native Android Sensor providers (discovery only; never auto-activated)
+        # D3 Native Android Sensor providers & D4-E02 Microphone provider (discovery only; never auto-activated)
         try:
             from agent.device_runtime.android.providers.sensors import create_all_sensor_providers
+            from agent.device_runtime.android.providers.microphone import AndroidMicrophoneProvider
             from agent.device_runtime.android.bridge import NativeAndroidBridge
             bridge = NativeAndroidBridge.get_instance()
             termux_perm = self.permissions.get("termux.api")
@@ -89,17 +90,31 @@ class DeviceRuntime:
                 self.register_provider(sp)
                 if termux_perm and sp.capability_id not in termux_perm.required_for:
                     termux_perm.required_for.append(sp.capability_id)
+            self.register_provider(AndroidMicrophoneProvider(bridge=bridge))
             # Sync bridge permission status into DeviceRuntime PermissionManager
             if bridge.permissions.is_granted("termux.api"):
                 self.permissions.set_status("termux.api", PermissionStatus.GRANTED)
+            if bridge.permissions.is_granted("android.permission.RECORD_AUDIO"):
+                self.permissions.set_status("android.permission.RECORD_AUDIO", PermissionStatus.GRANTED)
         except Exception as e:
-            logger.debug("Optional Android sensor providers not loaded: %s", e)
+            logger.debug("Optional Android hardware providers not loaded: %s", e)
 
     def register_provider(self, provider: BaseDeviceProvider) -> None:
         """Registers a device provider and executes discovery."""
         self._providers[provider.capability_id] = provider
         desc = provider.discover()
         self.registry.register(desc)
+
+    def _sync_android_permissions(self) -> None:
+        try:
+            from agent.device_runtime.android.bridge import NativeAndroidBridge
+            bridge = NativeAndroidBridge.get_instance()
+            if bridge.permissions.is_granted("termux.api"):
+                self.permissions.set_status("termux.api", PermissionStatus.GRANTED)
+            if bridge.permissions.is_granted("android.permission.RECORD_AUDIO"):
+                self.permissions.set_status("android.permission.RECORD_AUDIO", PermissionStatus.GRANTED)
+        except Exception:
+            pass
 
     def discover_all(self) -> Dict[str, CapabilityDescriptor]:
         """Runs discovery across all registered providers."""
@@ -108,6 +123,7 @@ class DeviceRuntime:
             desc = provider.discover()
             self.registry.register(desc)
             results[cid] = desc
+        self._sync_android_permissions()
         return results
 
     def get_provider(self, capability_id: str) -> Optional[BaseDeviceProvider]:

@@ -5,6 +5,7 @@ Native Android Bridge Providers (D2 & D3)
 
 from agent.device_runtime.android.providers.battery import AndroidBatteryProvider
 from agent.device_runtime.android.providers.thermal import AndroidThermalProvider
+from agent.device_runtime.android.providers.microphone import AndroidMicrophoneProvider, validate_wav_file
 from agent.device_runtime.android.providers.sensors import (
     BaseAndroidSensorProvider,
     AccelerometerProvider,
@@ -19,6 +20,8 @@ from agent.device_runtime.android.providers.sensors import (
 __all__ = [
     "AndroidBatteryProvider",
     "AndroidThermalProvider",
+    "AndroidMicrophoneProvider",
+    "validate_wav_file",
     "BaseAndroidSensorProvider",
     "AccelerometerProvider",
     "GyroscopeProvider",

@@ -712,6 +712,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 sha_hdr = response.headers.get("X-Artifact-Sha256")
                 if sha_hdr:
                     self.send_header("X-Artifact-Sha256", sha_hdr)
+                rec_sha_hdr = response.headers.get("X-Recording-Sha256")
+                if rec_sha_hdr:
+                    self.send_header("X-Recording-Sha256", rec_sha_hdr)
+                cache_hdr = response.headers.get("Cache-Control")
+                if cache_hdr:
+                    self.send_header("Cache-Control", cache_hdr)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 try:
@@ -1036,6 +1042,48 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 return
             except Exception as e:
                 self.send_json(500, {"error": f"Failed to retrieve hardware status: {e}"})
+                return
+
+        # 3b2. Authenticated, bounded microphone recording retrieval: GET /hardware/microphone/recording
+        if path in ("/hardware/microphone/recording", "/api/hardware/microphone/recording"):
+            if not self.check_auth(require_explicit=True):
+                self.send_json(401, {"error": "Unauthorized: Explicit authentication required to download audio"})
+                return
+            session_id = (query.get("session_id", [""])[0] or "").strip()
+            if session_id and not re.match(r"^[A-Za-z0-9_-]{4,64}$", session_id):
+                self.send_json(400, {"error": "Invalid 'session_id' parameter"})
+                return
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                from agent.device_runtime.android.models import MIC_MAX_FILE_BYTES
+                mgr = HardwareCapabilityManager.get_instance()
+                wav_path, meta = mgr.microphone.get_recording_file(session_id or None)
+                if not wav_path or not wav_path.exists():
+                    self.send_json(404, {"error": "Completed recording not found or expired"})
+                    return
+                raw_bytes = wav_path.read_bytes()
+                if len(raw_bytes) > MIC_MAX_FILE_BYTES:
+                    self.send_json(413, {"error": "Recording exceeds maximum transfer size bound"})
+                    return
+                download_flag = query.get("download", ["0"])[0] == "1"
+                disp = "attachment" if download_flag else "inline"
+                fname = (meta or {}).get("file_name") or wav_path.name
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(raw_bytes)))
+                self.send_header("Content-Disposition", f'{disp}; filename="{fname}"')
+                if meta and meta.get("sha256"):
+                    self.send_header("X-Recording-Sha256", str(meta["sha256"]))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try:
+                    self.wfile.write(raw_bytes)
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to retrieve recording: {e}"})
                 return
 
         # 3c. Continuous Live Camera Streaming: GET /live-camera or /api/live-camera
@@ -2070,6 +2118,12 @@ document.getElementById('cmd-box').textContent = code
                 self.send_json(400, {"error": "Missing required field 'operation'"})
                 return
 
+            op_upper = str(operation).upper().strip()
+            if op_upper in ("START_RECORDING", "STOP_RECORDING", "RECORDING_STATUS", "RECORDING_DISCOVER"):
+                if not self.check_auth(require_explicit=True):
+                    self.send_json(401, {"error": "Unauthorized: Explicit authentication required for microphone capture"})
+                    return
+
             params = body.get("params", body)
             if isinstance(params, dict) and "operation" in params and params is body:
                 params = {k: v for k, v in params.items() if k != "operation"}
@@ -2078,7 +2132,13 @@ document.getElementById('cmd-box').textContent = code
                 from agent.hardware.manager import HardwareCapabilityManager
                 mgr = HardwareCapabilityManager.get_instance()
                 res = mgr.execute_operation(operation, parameters=params)
-                status_code = 200 if res.get("success") else 400
+                err_code = str((res.get("result") or {}).get("error_code") or "").upper()
+                if res.get("success"):
+                    status_code = 200
+                elif err_code in ("PERMISSION_DENIED", "UNAUTHORIZED"):
+                    status_code = 403
+                else:
+                    status_code = 400
                 self.send_json(status_code, res)
                 return
             except Exception as e:

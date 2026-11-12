@@ -23,6 +23,15 @@ SENSOR_MAX_SESSION_DURATION_SEC = 300.0
 SENSOR_MAX_BUFFER_SAMPLES = 32
 SENSOR_MAX_CONCURRENT_SESSIONS = 4
 
+# Native Microphone Capture Protocol Constants & Limits (D4-E02)
+MIC_MIN_DURATION_SEC = 1.0
+MIC_MAX_DURATION_SEC = 60.0
+MIC_DEFAULT_DURATION_SEC = 15.0
+MIC_SUPPORTED_SAMPLE_RATES_HZ = (16000, 22050, 44100)
+MIC_DEFAULT_SAMPLE_RATE_HZ = 16000
+MIC_MAX_FILE_BYTES = 8 * 1024 * 1024  # 8 MB hard cap
+MIC_MAX_CHUNK_BYTES = 24576           # 24 KB raw chunk (< 64 KB Base64 IPC frame)
+
 
 class SensorType(str, Enum):
     """Canonical sensor categories supported by the Native Android Sensor Runtime."""

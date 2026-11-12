@@ -8,6 +8,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
@@ -15,8 +16,10 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Local IPC server hosting the PersonalServer Protocol v1.
@@ -28,15 +31,50 @@ public class LocalBridgeServer {
     public static final int DEFAULT_PORT = 8765;
     public static final int PROTOCOL_VERSION = 1;
     public static final int MAX_PAYLOAD_BYTES = 65536;
+    public static final long DEFAULT_START_TIMEOUT_MS = 2500L;
+
+    private enum LifecycleState {
+        STOPPED,
+        STARTING,
+        LISTENING
+    }
+
+    private static final class StartupAttempt {
+        final CountDownLatch latch = new CountDownLatch(1);
+        volatile boolean succeeded = false;
+        volatile String error = null;
+
+        void succeed() {
+            succeeded = true;
+            error = null;
+            latch.countDown();
+        }
+
+        void fail(String message) {
+            succeeded = false;
+            error = message;
+            latch.countDown();
+        }
+    }
 
     private final Context context;
     private final int port;
     private final BatteryBridgeManager batteryManager;
     private final ThermalBridgeManager thermalManager;
-    private final SensorBridgeManager sensorManager;
-    private final ExecutorService executor;
+    private final Object lifecycleLock = new Object();
+
+    private SensorBridgeManager sensorManager;
+    private MicrophoneBridgeManager microphoneManager;
+    private volatile MicrophoneBridgeManager.RecordingNotificationListener recordingNotificationListener = null;
+    private ExecutorService executor;
     private ServerSocket serverSocket;
+    private Thread acceptThread;
+    private StartupAttempt inFlightStartup;
+    private volatile LifecycleState state = LifecycleState.STOPPED;
     private volatile boolean isRunning = false;
+    private volatile boolean stopRequested = false;
+    private volatile boolean stoppedOnce = false;
+    private volatile String lastError = null;
 
     public LocalBridgeServer(Context context, int port) {
         this.context = context.getApplicationContext();
@@ -44,68 +82,258 @@ public class LocalBridgeServer {
         this.batteryManager = new BatteryBridgeManager(this.context);
         this.thermalManager = new ThermalBridgeManager(this.context);
         this.sensorManager = new SensorBridgeManager(this.context);
+        this.microphoneManager = new MicrophoneBridgeManager(this.context);
         this.executor = Executors.newCachedThreadPool();
     }
 
+    public void setRecordingNotificationListener(MicrophoneBridgeManager.RecordingNotificationListener listener) {
+        this.recordingNotificationListener = listener;
+        if (this.microphoneManager != null) {
+            this.microphoneManager.setRecordingNotificationListener(listener);
+        }
+    }
+
     public boolean isListening() {
-        return isRunning && serverSocket != null && !serverSocket.isClosed();
+        ServerSocket sock = this.serverSocket;
+        return state == LifecycleState.LISTENING
+                && isRunning
+                && sock != null
+                && sock.isBound()
+                && !sock.isClosed();
     }
 
-    public synchronized void start() {
-        if (isRunning) return;
-        isRunning = true;
+    public String getLastError() {
+        return lastError;
+    }
 
-        executor.execute(() -> {
-            try {
-                // Strict loopback binding: 127.0.0.1 only, with SO_REUSEADDR for fast service restarts
-                serverSocket = new ServerSocket();
-                serverSocket.setReuseAddress(true);
-                serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 16);
-                Log.i(TAG, "Bridge Server listening on 127.0.0.1:" + port);
+    protected ServerSocket createServerSocket() throws IOException {
+        return new ServerSocket();
+    }
 
-                while (isRunning && !serverSocket.isClosed()) {
-                    Socket client = null;
-                    try {
-                        client = serverSocket.accept();
-                        final Socket accepted = client;
-                        accepted.setSoTimeout(5000);
-                        executor.execute(() -> handleClient(accepted));
-                    } catch (Exception acceptErr) {
-                        if (client != null) {
-                            try {
-                                client.close();
-                            } catch (Exception ignored) {}
-                        }
-                        if (!isRunning || serverSocket == null || serverSocket.isClosed()) {
-                            break;
-                        }
-                        Log.w(TAG, "Transient client accept/setup error (continuing): " + acceptErr.getMessage());
-                    }
+    protected void bindServerSocket(ServerSocket sock) throws IOException {
+        // Strict loopback binding: 127.0.0.1 only, with SO_REUSEADDR for fast service restarts
+        sock.setReuseAddress(true);
+        sock.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 16);
+    }
+
+    public void start() {
+        startAndAwaitBind(DEFAULT_START_TIMEOUT_MS);
+    }
+
+    public boolean startAndAwaitBind(long timeoutMs) {
+        final StartupAttempt attempt;
+        final boolean initiateNewStart;
+        final ExecutorService targetExecutor;
+
+        synchronized (lifecycleLock) {
+            if (isListening()) {
+                return true;
+            }
+            if (state == LifecycleState.STARTING && inFlightStartup != null) {
+                attempt = inFlightStartup;
+                initiateNewStart = false;
+                targetExecutor = this.executor;
+            } else {
+                if (executor == null || executor.isShutdown() || executor.isTerminated()) {
+                    executor = Executors.newCachedThreadPool();
                 }
-            } catch (Exception e) {
-                if (isRunning) {
-                    Log.e(TAG, "Server socket fatal error: " + e.getMessage());
+                if (stoppedOnce) {
+                    sensorManager = new SensorBridgeManager(this.context);
+                    microphoneManager = new MicrophoneBridgeManager(this.context);
+                    microphoneManager.setRecordingNotificationListener(recordingNotificationListener);
+                    stoppedOnce = false;
                 }
-            } finally {
+                stopRequested = false;
                 isRunning = false;
-                try {
-                    if (serverSocket != null && !serverSocket.isClosed()) {
-                        serverSocket.close();
-                    }
-                } catch (Exception ignored) {}
+                lastError = null;
+                state = LifecycleState.STARTING;
+                attempt = new StartupAttempt();
+                inFlightStartup = attempt;
+                initiateNewStart = true;
+                targetExecutor = this.executor;
             }
-        });
+        }
+
+        if (initiateNewStart) {
+            try {
+                targetExecutor.execute(() -> runAcceptLoop(attempt, targetExecutor));
+            } catch (RuntimeException submitErr) {
+                synchronized (lifecycleLock) {
+                    if (inFlightStartup == attempt) {
+                        inFlightStartup = null;
+                        state = LifecycleState.STOPPED;
+                    }
+                    isRunning = false;
+                    lastError = "Failed to launch server accept loop: " + submitErr.getMessage();
+                }
+                attempt.fail(lastError);
+                return false;
+            }
+        }
+
+        long waitMs = Math.max(1L, timeoutMs);
+        boolean completed;
+        try {
+            completed = attempt.latch.await(waitMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            lastError = "Interrupted waiting for bridge socket bind";
+            stop();
+            return false;
+        }
+
+        if (!completed) {
+            lastError = "Timed out waiting for loopback bind on 127.0.0.1:" + port + " after " + waitMs + "ms";
+            Log.e(TAG, lastError);
+            stop();
+            return false;
+        }
+
+        if (!attempt.succeeded && attempt.error != null) {
+            lastError = attempt.error;
+        }
+        return attempt.succeeded && isListening();
     }
 
-    public synchronized void stop() {
-        isRunning = false;
-        sensorManager.stopAll();
+    private void runAcceptLoop(StartupAttempt attempt, ExecutorService ownExecutor) {
+        ServerSocket sock = null;
+        synchronized (lifecycleLock) {
+            acceptThread = Thread.currentThread();
+        }
         try {
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
+            synchronized (lifecycleLock) {
+                if (stopRequested || inFlightStartup != attempt) {
+                    attempt.fail("Bridge startup cancelled before socket creation");
+                    return;
+                }
+                sock = createServerSocket();
+                serverSocket = sock;
             }
-        } catch (Exception ignored) {}
-        executor.shutdownNow();
+
+            bindServerSocket(sock);
+
+            synchronized (lifecycleLock) {
+                if (stopRequested || inFlightStartup != attempt || sock.isClosed() || !sock.isBound()) {
+                    safeClose(sock);
+                    if (serverSocket == sock) {
+                        serverSocket = null;
+                    }
+                    state = LifecycleState.STOPPED;
+                    isRunning = false;
+                    attempt.fail("Bridge stopped during socket bind");
+                    return;
+                }
+                state = LifecycleState.LISTENING;
+                isRunning = true;
+                lastError = null;
+                inFlightStartup = null;
+                attempt.succeed();
+            }
+
+            Log.i(TAG, "Bridge Server listening on 127.0.0.1:" + sock.getLocalPort());
+
+            while (isRunning && !stopRequested && !sock.isClosed()) {
+                Socket client = null;
+                try {
+                    client = sock.accept();
+                    final Socket accepted = client;
+                    accepted.setSoTimeout(5000);
+                    ownExecutor.execute(() -> handleClient(accepted));
+                } catch (Exception acceptErr) {
+                    if (client != null) {
+                        try {
+                            client.close();
+                        } catch (Exception ignored) {}
+                    }
+                    if (!isRunning || stopRequested || sock.isClosed()) {
+                        break;
+                    }
+                    Log.w(TAG, "Transient client accept/setup error (continuing): " + acceptErr.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            String msg = "Server socket bind/loop failed on 127.0.0.1:" + port + ": " + e.getMessage();
+            synchronized (lifecycleLock) {
+                if (!stopRequested) {
+                    lastError = msg;
+                    Log.e(TAG, msg);
+                }
+                if (inFlightStartup == attempt) {
+                    inFlightStartup = null;
+                    attempt.fail(msg);
+                }
+            }
+        } finally {
+            synchronized (lifecycleLock) {
+                if (serverSocket == sock) {
+                    serverSocket = null;
+                    isRunning = false;
+                    state = LifecycleState.STOPPED;
+                }
+                if (acceptThread == Thread.currentThread()) {
+                    acceptThread = null;
+                }
+                if (inFlightStartup == attempt) {
+                    inFlightStartup = null;
+                    attempt.fail(lastError != null ? lastError : "Bridge server exited before bind");
+                }
+            }
+            safeClose(sock);
+        }
+    }
+
+    private static void safeClose(ServerSocket sock) {
+        if (sock != null) {
+            try {
+                if (!sock.isClosed()) {
+                    sock.close();
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
+    public void stop() {
+        final StartupAttempt pending;
+        final ServerSocket sockToClose;
+        final Thread threadToInterrupt;
+        final ExecutorService execToShutdown;
+        final SensorBridgeManager sensorsToStop;
+        final MicrophoneBridgeManager micToStop;
+
+        synchronized (lifecycleLock) {
+            stopRequested = true;
+            isRunning = false;
+            stoppedOnce = true;
+            state = LifecycleState.STOPPED;
+
+            pending = inFlightStartup;
+            inFlightStartup = null;
+
+            sockToClose = serverSocket;
+            serverSocket = null;
+
+            threadToInterrupt = acceptThread;
+            acceptThread = null;
+
+            execToShutdown = executor;
+            sensorsToStop = sensorManager;
+            micToStop = microphoneManager;
+        }
+
+        if (pending != null) {
+            pending.fail("Bridge stopped during startup");
+        }
+        sensorsToStop.stopAll();
+        if (micToStop != null) {
+            micToStop.stopAll();
+        }
+        safeClose(sockToClose);
+        if (threadToInterrupt != null) {
+            threadToInterrupt.interrupt();
+        }
+        if (execToShutdown != null) {
+            execToShutdown.shutdownNow();
+        }
     }
 
     private void handleClient(Socket socket) {
@@ -266,6 +494,43 @@ public class LocalBridgeServer {
                 response.put("success", true);
                 response.put("status", "READY");
                 response.put("data", sensorOut);
+                response.put("error_code", JSONObject.NULL);
+                response.put("error_message", JSONObject.NULL);
+                return response;
+            }
+
+            // Dispatch Native Microphone Capture Operations (D4-E02)
+            if ("microphone".equalsIgnoreCase(capability)
+                    || "START_RECORDING".equals(operation)
+                    || "RECORDING_STATUS".equals(operation)
+                    || "STOP_RECORDING".equals(operation)
+                    || "RECORDING_DISCOVER".equals(operation)
+                    || "RECORDING_READ".equals(operation)
+                    || "RECORDING_CLEANUP".equals(operation)) {
+                JSONObject micOut;
+                if ("RECORDING_DISCOVER".equals(operation) || "RECORDING_STATUS".equals(operation)) {
+                    String sid = params.optString("session_id", "");
+                    micOut = microphoneManager.getRecordingStatus(sid);
+                } else if ("START_RECORDING".equals(operation)) {
+                    micOut = microphoneManager.startRecording(params);
+                } else if ("STOP_RECORDING".equals(operation)) {
+                    String reason = params.optString("reason", "Requested stop");
+                    micOut = microphoneManager.stopRecording(reason);
+                } else if ("RECORDING_READ".equals(operation)) {
+                    String sid = params.optString("session_id", "");
+                    long offset = params.optLong("offset", 0L);
+                    int length = params.optInt("length", MicrophoneBridgeManager.MAX_TRANSFER_CHUNK_BYTES);
+                    micOut = microphoneManager.readRecordingChunk(sid, offset, length);
+                } else if ("RECORDING_CLEANUP".equals(operation)) {
+                    String sid = params.optString("session_id", "");
+                    micOut = microphoneManager.deleteRecording(sid);
+                } else {
+                    return buildErrorResponse(opId, capability, operation, "ERROR", "UNKNOWN_OPERATION",
+                            "Unknown microphone operation: " + operation);
+                }
+                response.put("success", true);
+                response.put("status", "READY");
+                response.put("data", micOut);
                 response.put("error_code", JSONObject.NULL);
                 response.put("error_message", JSONObject.NULL);
                 return response;

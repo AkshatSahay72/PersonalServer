@@ -18,6 +18,7 @@ from agent.device_runtime.android.models import (
 )
 from agent.device_runtime.android.providers.battery import AndroidBatteryProvider
 from agent.device_runtime.android.providers.thermal import AndroidThermalProvider
+from agent.device_runtime.android.providers.microphone import AndroidMicrophoneProvider
 from agent.device_runtime.android.providers.sensors import (
     BaseAndroidSensorProvider,
     create_all_sensor_providers,
@@ -36,6 +37,7 @@ class AndroidRuntimeBridge:
         self._bridge = bridge or NativeAndroidBridge.get_instance()
         self._battery_provider = AndroidBatteryProvider(self._bridge)
         self._thermal_provider = AndroidThermalProvider(self._bridge)
+        self._microphone_provider = AndroidMicrophoneProvider(self._bridge)
         self._sensor_providers: Dict[str, BaseAndroidSensorProvider] = {
             p.sensor_type: p for p in create_all_sensor_providers(self._bridge)
         }
@@ -53,6 +55,10 @@ class AndroidRuntimeBridge:
         return self._thermal_provider
 
     @property
+    def microphone(self) -> AndroidMicrophoneProvider:
+        return self._microphone_provider
+
+    @property
     def sensors(self) -> Dict[str, BaseAndroidSensorProvider]:
         return self._sensor_providers
 
@@ -61,7 +67,11 @@ class AndroidRuntimeBridge:
         return self._bridge.initialize()
 
     def shutdown(self) -> None:
-        """Shuts down all active sensor sessions and the underlying bridge."""
+        """Shuts down all active sensor & microphone sessions and the underlying bridge."""
+        try:
+            self._microphone_provider.cleanup_all(reason="AndroidRuntimeBridge shutdown")
+        except Exception:
+            pass
         for sp in self._sensor_providers.values():
             try:
                 if sp.active_session_id:
@@ -99,5 +109,6 @@ class AndroidRuntimeBridge:
             "is_ready": self._bridge.is_ready(),
             "metrics": self._bridge.get_metrics(),
             "permissions": self._bridge.permissions.to_dict(),
+            "microphone": self._microphone_provider.get_recording_status(),
             "sensors": {st: sp.get_status() for st, sp in self._sensor_providers.items()},
         }
