@@ -198,13 +198,10 @@ class LeaderLease:
         )
 
     def save_to_file(self, file_path: Path):
-        """Atomically saves lease metadata to disk."""
+        """Atomically saves lease metadata to disk with fsync durability."""
         try:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = file_path.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.to_dict(), f, indent=2)
-            tmp.replace(file_path)
+            from controller.stores.base import atomic_write_json_file
+            atomic_write_json_file(file_path, self.to_dict())
         except Exception as e:
             controller_logger.warning("Failed to persist leader lease to %s: %s", file_path, e)
 
@@ -641,17 +638,15 @@ class HAManager:
         try:
             p = getattr(self, "paths", None) or get_controller_paths()
             p.ensure_directories()
-            for key, target_path in [
-                ("nodes", p.nodes_file),
-                ("jobs", p.jobs_file),
-                ("apps", p.apps_file),
-                ("onboarding_codes", p.onboarding_codes_file)
+            from controller.stores.base import atomic_save_json
+            for key, target_path, backup_path in [
+                ("nodes", p.nodes_file, p.backup_nodes_file),
+                ("jobs", p.jobs_file, p.backup_jobs_file),
+                ("apps", p.apps_file, p.backup_apps_file),
+                ("onboarding_codes", p.onboarding_codes_file, p.backup_onboarding_codes_file),
             ]:
                 if key in payload and payload[key] is not None:
-                    tmp = target_path.with_suffix(".tmp")
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(payload[key], f, indent=2)
-                    tmp.replace(target_path)
+                    atomic_save_json(target_path, backup_path, payload[key], bump_ha=False)
 
             self.state_version = remote_version
             self.last_sync_timestamp = get_current_iso_timestamp()
@@ -1338,6 +1333,7 @@ def find_active_leader(
     Probes candidate URLs to find the active cluster LEADER.
     Returns (leader_url, status_dict) or (None, None).
     """
+    ha_responded = set()
     for raw_url in candidate_urls:
         url = raw_url.rstrip("/")
         if exclude_url and url == exclude_url.rstrip("/"):
@@ -1348,16 +1344,18 @@ def find_active_leader(
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
+                    ha_responded.add(url)
                     data = json.loads(resp.read().decode("utf-8"))
                     if data.get("role") == HAState.LEADER and data.get("lease_valid", True):
                         return url, data
         except Exception:
             pass
 
-    # Fallback: check /health endpoint on candidates if /ha/status is not yet answering
+    # Fallback: check /health ONLY on candidates whose /ha/status did not answer (legacy non-HA controller).
+    # Never promote a controller whose /ha/status explicitly reported STANDBY/non-leader.
     for raw_url in candidate_urls:
         url = raw_url.rstrip("/")
-        if exclude_url and url == exclude_url.rstrip("/"):
+        if (exclude_url and url == exclude_url.rstrip("/")) or url in ha_responded:
             continue
         try:
             req = urllib.request.Request(f"{url}/health", headers={"User-Agent": "PersonalServer-HAFinder/1.0"})

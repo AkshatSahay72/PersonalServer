@@ -1,3 +1,25 @@
+_TERMUX_API_FAIL_UNTIL = 0.0
+
+
+def _run_termux_api_cmd(cmd_list, timeout=2):
+    """Safely runs a termux-api CLI command with a circuit breaker to avoid zombie process leaks."""
+    global _TERMUX_API_FAIL_UNTIL
+    if time.time() < _TERMUX_API_FAIL_UNTIL:
+        return None
+    try:
+        res = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout
+    except subprocess.TimeoutExpired:
+        _TERMUX_API_FAIL_UNTIL = time.time() + 300.0
+        try:
+            subprocess.run(["pkill", "-9", "-f", "termux-api"], capture_output=True, timeout=1)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
 """
 PersonalServer Node Telemetry & Hardware Diagnostics
 ====================================================
@@ -48,15 +70,10 @@ def collect_battery_info():
 
     # Method A: Termux / Android via termux-battery-status
     if shutil.which("termux-battery-status"):
-        try:
-            res = subprocess.run(
-                ["termux-battery-status"],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                data = json.loads(res.stdout)
+        stdout = _run_termux_api_cmd(["termux-battery-status"], timeout=2)
+        if stdout:
+            try:
+                data = json.loads(stdout)
                 battery["percentage"] = int(data.get("percentage", 0))
                 battery["status"] = str(data.get("status", "UNKNOWN")).upper()
                 battery["plugged"] = str(data.get("plugged", "UNKNOWN")).upper()
@@ -66,8 +83,8 @@ def collect_battery_info():
                 if "current" in data and data["current"] is not None:
                     battery["current_ma"] = int(data["current"])
                 return battery
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     # Method B: Linux sysfs (/sys/class/power_supply)
     sys_power = Path("/sys/class/power_supply")
@@ -234,13 +251,32 @@ def collect_network_info():
         except Exception:
             pass
 
+    # If tailscale binary not in PATH (e.g. Android Termux VPN), probe Tailscale mesh interface
+    if not net_info.get("tailscale_ip"):
+        for probe_dest in ("100.85.108.5", "100.100.100.100"):
+            try:
+                s_ts = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s_ts.settimeout(0.5)
+                s_ts.connect((probe_dest, 8000 if probe_dest == "100.85.108.5" else 53))
+                ts_cand = s_ts.getsockname()[0]
+                s_ts.close()
+                if ts_cand and ts_cand.startswith("100."):
+                    net_info["tailscale_ip"] = ts_cand
+                    break
+            except Exception:
+                pass
+
+    # Ensure tailscale IP takes priority over cellular/CGNAT IPs for mesh communication
+    if net_info.get("tailscale_ip"):
+        net_info["ip"] = net_info["tailscale_ip"]
+
     # 2. Platform-specific Wi-Fi and Signal Metrics
     # Method A: Termux / Android via termux-wifi-connectioninfo
     if shutil.which("termux-wifi-connectioninfo"):
-        try:
-            res = subprocess.run(["termux-wifi-connectioninfo"], capture_output=True, text=True, timeout=2)
-            if res.returncode == 0 and res.stdout.strip():
-                wdata = json.loads(res.stdout)
+        stdout = _run_termux_api_cmd(["termux-wifi-connectioninfo"], timeout=2)
+        if stdout:
+            try:
+                wdata = json.loads(stdout)
                 ssid = wdata.get("ssid", "").strip('"')
                 if ssid and ssid != "<unknown ssid>":
                     net_info["wifi_ssid"] = ssid
@@ -257,8 +293,8 @@ def collect_network_info():
 
                 if not net_info.get("ip") and wdata.get("ip"):
                     net_info["ip"] = wdata["ip"]
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     # Method B: Windows netsh wlan show interfaces
     elif sys.platform == "win32":

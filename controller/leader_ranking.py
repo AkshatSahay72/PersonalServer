@@ -57,17 +57,23 @@ def apply_default_leadership_metadata(node_id: str, node_data: Dict[str, Any]) -
     
     # Check platform heuristics if not in predefined map
     platform = str(node_data.get("platform", "")).lower()
+    role = str(node_data.get("role", "")).lower()
     is_windows = "win" in platform
-    default_eligible = False if is_windows else policy.get("leader_eligible", True)
+    is_experimental = (role == "experimental-worker")
+    default_eligible = False if (is_windows or is_experimental) else policy.get("leader_eligible", True)
     
     if "leader_eligible" not in node_data:
-        node_data["leader_eligible"] = policy.get("leader_eligible", default_eligible)
+        node_data["leader_eligible"] = False if is_experimental else policy.get("leader_eligible", default_eligible)
     if "preferred_leader" not in node_data:
         node_data["preferred_leader"] = policy.get("preferred_leader", False)
     if "priority" not in node_data:
-        node_data["priority"] = policy.get("priority", 50 if node_data["leader_eligible"] else 0)
+        node_data["priority"] = 0 if is_experimental else policy.get("priority", 50 if node_data["leader_eligible"] else 0)
     if "worker_enabled" not in node_data:
-        node_data["worker_enabled"] = policy.get("worker_enabled", True)
+        node_data["worker_enabled"] = False if is_experimental else policy.get("worker_enabled", True)
+    if "scheduler_eligible" not in node_data:
+        node_data["scheduler_eligible"] = False if is_experimental else policy.get("scheduler_eligible", True)
+    if "participation_state" not in node_data:
+        node_data["participation_state"] = "OFF" if is_experimental else "AVAILABLE"
     if "build_worker_enabled" not in node_data:
         node_data["build_worker_enabled"] = policy.get("build_worker_enabled", is_windows)
     if "performance_score" not in node_data:

@@ -624,6 +624,51 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    def _get_private_gateway_url(self):
+        """Derives the private Tailscale/LAN gateway base URL dynamically from request/host state."""
+        hdrs = self.headers or {}
+        is_proxied_public = bool(hdrs.get("Cf-Ray") or hdrs.get("Cf-Connecting-Ip"))
+        host_hdr = (hdrs.get("Host") or hdrs.get("host") or "").strip()
+        if not is_proxied_public and host_hdr and "trycloudflare.com" not in host_hdr.lower():
+            return f"http://{host_hdr}".rstrip("/")
+        sys_info = get_system_info()
+        ts_ip = (sys_info.get("network") or {}).get("tailscale_ip")
+        if ts_ip:
+            return f"http://{ts_ip}:{PORT}"
+        lan_ip = (sys_info.get("network") or {}).get("ip")
+        if lan_ip and lan_ip != "127.0.0.1":
+            return f"http://{lan_ip}:{PORT}"
+        return f"http://127.0.0.1:{PORT}"
+
+    def _resolve_active_controller_base(self):
+        """Finds the active leader controller URL without hardcoded addresses."""
+        global _CACHED_ACTIVE_CONTROLLER_URL
+        configured_url = get_configured_controller_url()
+        with _CONTROLLER_URL_LOCK:
+            cached_url = _CACHED_ACTIVE_CONTROLLER_URL
+        primary = cached_url or configured_url
+
+        candidates = []
+        env_candidates = os.environ.get("PERSONALSERVER_CONTROLLER_URLS", "")
+        for u in env_candidates.split(","):
+            cu = u.strip().rstrip("/")
+            if cu and cu not in candidates:
+                candidates.append(cu)
+        for u in (primary, configured_url, DEFAULT_CONTROLLER_URL):
+            if u and u.rstrip("/") not in candidates:
+                candidates.append(u.rstrip("/"))
+
+        try:
+            from config.ha_manager import find_active_leader
+            active_url, _ = find_active_leader(candidates)
+            if active_url:
+                with _CONTROLLER_URL_LOCK:
+                    _CACHED_ACTIVE_CONTROLLER_URL = active_url.rstrip("/")
+                return _CACHED_ACTIVE_CONTROLLER_URL
+        except Exception:
+            pass
+        return primary.rstrip("/")
+
     def proxy_to_controller(self, method, subpath, query_str="", body_bytes=None):
         global _CACHED_ACTIVE_CONTROLLER_URL
         configured_url = get_configured_controller_url()
@@ -645,13 +690,13 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         if body_bytes is not None:
             headers["Content-Length"] = str(len(body_bytes))
 
-        auth_hdr = self.headers.get("Authorization") or self.headers.get("X-Auth-Token")
-        if not auth_hdr:
-            auth_token = get_controller_auth_token()
-            if auth_token:
-                auth_hdr = f"Bearer {auth_token}"
-        if auth_hdr:
-            headers["Authorization"] = auth_hdr if auth_hdr.startswith("Bearer ") else f"Bearer {auth_hdr}"
+        # Server-side credential injection only (never exposes controller secret to browser)
+        ctrl_token = get_controller_auth_token()
+        if ctrl_token:
+            headers["Authorization"] = f"Bearer {ctrl_token}"
+        elif self.headers.get("Authorization") or self.headers.get("X-Auth-Token"):
+            raw_hdr = self.headers.get("Authorization") or self.headers.get("X-Auth-Token")
+            headers["Authorization"] = raw_hdr if raw_hdr.startswith("Bearer ") else f"Bearer {raw_hdr}"
 
         timeout_sec = 35 if ("/apps" in subpath or "/jobs" in subpath) else 10
         req = urllib.request.Request(target_url, data=body_bytes, headers=headers, method=method)
@@ -925,6 +970,21 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, get_health())
                 return
 
+        # 1b. Live CCTV Camera Web Viewer
+        if path in ("/live-viewer", "/camera", "/cctv", "/viewer"):
+            viewer_file = STATIC_DIR / "live_viewer.html"
+            if viewer_file.exists():
+                content = viewer_file.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                try:
+                    self.wfile.write(content)
+                except Exception:
+                    self.close_connection = True
+                return
+
         # 2. Static Files (/static/style.css, /static/app.js)
         if path.startswith("/static/"):
             rel_name = os.path.basename(path)
@@ -940,6 +1000,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     content_type = "text/html"
                 elif rel_name.endswith(".json"):
                     content_type = "application/json"
+                elif rel_name.endswith(".apk"):
+                    content_type = "application/vnd.android.package-archive"
 
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
@@ -961,6 +1023,34 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         if path in ("/health", "/status"):
             self.send_json(200, get_health(self.current_correlation_id))
             return
+
+        # 3b. Node Hardware Capabilities: GET /hardware or /api/hardware
+        if path in ("/hardware", "/api/hardware"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                self.send_json(200, {"hardware": mgr.get_full_status()})
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to retrieve hardware status: {e}"})
+                return
+
+        # 3c. Continuous Live Camera Streaming: GET /live-camera or /api/live-camera
+        if path in ("/live-camera", "/api/live-camera"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                self.send_json(200, {"live_camera": mgr.camera.get_live_camera_status()})
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to query live camera status: {e}"})
+                return
 
         # 3a. Dedicated Public Share Namespace: GET /share/<path_or_share_id>...
         if path.startswith("/share/"):
@@ -1796,6 +1886,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # 8a. Live Diagnostics / Hardware & Speed Test: GET /diagnostics or GET /api/diagnostics
         if path in ("/diagnostics", "/api/diagnostics"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
             try:
                 from config.node_telemetry import run_live_diagnostics
                 config = load_config()
@@ -1809,6 +1902,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         # 8a2. Node Diagnostics: GET /api/nodes/<node_id>/diagnostics or /nodes/<node_id>/diagnostics
         norm_path = path.rstrip("/")
         if (norm_path.startswith("/api/nodes/") or norm_path.startswith("/nodes/")) and norm_path.endswith("/diagnostics"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
             parts = norm_path.strip("/").split("/")
             nid = parts[-2]
             config = load_config()
@@ -1827,18 +1923,124 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             self.proxy_to_controller("GET", subpath, parsed.query)
             return
 
-        # 8b. Platform Configuration: GET /api/platform or GET /api/config/platform
+        # 8b. Private Tailscale-Only QR/Link Enrollment Helper Page: GET /enroll
+        if path == "/enroll":
+            is_proxied_public = bool(self.headers.get("Cf-Ray") or self.headers.get("Cf-Connecting-Ip"))
+            client_ip = self.client_address[0] if self.client_address else ""
+            is_private_mesh = (not is_proxied_public) and (
+                client_ip in ("127.0.0.1", "::1", "localhost")
+                or client_ip.startswith("100.")
+                or client_ip.startswith("192.168.")
+                or client_ip.startswith("10.")
+                or client_ip.startswith("172.")
+            )
+            if not is_private_mesh:
+                self.send_json(403, {"error": "Enrollment links are restricted to the private Tailscale network."})
+                return
+
+            session_id = (query.get("session", [""])[0] or "").strip()
+            active_leader = self._resolve_active_controller_base()
+            safe_sess = session_id.replace("<", "").replace(">", "").replace('"', "")
+            safe_leader = active_leader.replace("<", "").replace(">", "").replace('"', "")
+            html_doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PersonalServer Private Node Enrollment</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;padding:20px;max-width:680px;margin:0 auto;}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:18px;}}
+code,pre{{font-family:monospace;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;display:block;overflow-x:auto;font-size:13px;}}
+.btn{{background:#238636;color:#fff;border:none;border-radius:6px;padding:8px 14px;cursor:pointer;font-weight:600;margin-top:8px;}}
+.muted{{color:#8b949e;font-size:13px;}}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>PersonalServer Private Node Enrollment</h2>
+<p class="muted">Tailscale Private Mesh Helper · Session: <span id="sess">{safe_sess or 'unknown'}</span></p>
+<p>Active Controller Leader: <strong>{safe_leader}</strong></p>
+<p class="muted">Paste this single-use command on Android/Termux or Linux (code read from local URL fragment only):</p>
+<pre id="cmd-box">Loading code from URL fragment...</pre>
+<button class="btn" onclick="navigator.clipboard?.writeText(document.getElementById('cmd-box').textContent)">Copy Command</button>
+</div>
+<script>
+const hash = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+const code = (hash.get('code') || '').trim();
+const sess = document.getElementById('sess').textContent.trim();
+const leader = {json.dumps(active_leader)};
+document.getElementById('cmd-box').textContent = code
+  ? "cd ~/PersonalServer && printf '%s\\\\n' '" + code + "' | python3 agent/node-agent.py onboard --controller " + leader + " --code -"
+  : "Missing enrollment code in URL fragment (#code=PS-XXXX-XXXX). Open the Recruit Node wizard on the dashboard.";
+</script>
+</body></html>""".encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(html_doc)))
+            self.end_headers()
+            self.wfile.write(html_doc)
+            return
+
+        # 8c. Authenticated Leader-Aware Enrollment Readiness: GET /api/enrollment/readiness
+        if path == "/api/enrollment/readiness":
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
+            active_ctrl = self._resolve_active_controller_base()
+            gw_url = self._get_private_gateway_url()
+            ctrl_token = get_controller_auth_token()
+            hdrs = {"User-Agent": "PersonalServer-WebGateway/1.0"}
+            if ctrl_token:
+                hdrs["Authorization"] = f"Bearer {ctrl_token}"
+            try:
+                req = urllib.request.Request(f"{active_ctrl}/enrollment/readiness", headers=hdrs, method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    payload["gateway_private_url"] = gw_url
+                    payload["discovered_leader_url"] = active_ctrl
+                    self.send_json(200, payload)
+                    return
+            except Exception as e:
+                self.send_json(200, {
+                    "leader_available": False,
+                    "recruitment_ready": False,
+                    "role": "unreachable",
+                    "leader_url": active_ctrl,
+                    "gateway_private_url": gw_url,
+                    "lease_valid": False,
+                    "tailscale_private_required": True,
+                    "blockers": [f"Active controller leader unreachable at {active_ctrl}: {e}"],
+                })
+                return
+
+        # 8d. Explicit auth enforcement on sensitive enrollment & diagnostic proxy routes
+        if path.startswith("/api/enrollment/") or path.startswith("/enrollment/"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
+            subpath = path[4:] if path.startswith("/api/") else path
+            self.proxy_to_controller("GET", subpath, parsed.query)
+            return
+
+        # 8e. Platform Configuration: GET /api/platform or GET /api/config/platform
         if path in ("/api/platform", "/api/config/platform"):
             self.send_json(200, get_platform_config().to_dict())
             return
 
-        # 8c. Cluster Utilization and Cluster Info Proxy
+        # 8f. Cluster Utilization and Cluster Info Proxy
         if path in ("/cluster/utilization", "/cluster", "/nodes") or path.startswith("/cluster/") or path.startswith("/nodes/"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
             self.proxy_to_controller("GET", path, parsed.query)
             return
 
-        # 9. Proxy to Controller for UI: /api/cluster, /api/jobs, /api/jobs/<job_id>
+        # 9. Proxy to Controller for UI: /api/cluster, /api/nodes, /api/jobs, /api/jobs/<job_id>
         if path.startswith("/api/"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
             subpath = path[4:]  # /api/cluster -> /cluster, /api/jobs -> /jobs
             self.proxy_to_controller("GET", subpath, parsed.query)
             return
@@ -1851,6 +2053,64 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+
+        # 0a. Node Hardware Capabilities: POST /hardware or /api/hardware
+        if path in ("/hardware", "/api/hardware"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            body = self.read_json_body()
+            if not body or not isinstance(body, dict):
+                self.send_json(400, {"error": "Invalid request body: Expected JSON object"})
+                return
+
+            operation = body.get("operation")
+            if not operation:
+                self.send_json(400, {"error": "Missing required field 'operation'"})
+                return
+
+            params = body.get("params", body)
+            if isinstance(params, dict) and "operation" in params and params is body:
+                params = {k: v for k, v in params.items() if k != "operation"}
+
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                res = mgr.execute_operation(operation, parameters=params)
+                status_code = 200 if res.get("success") else 400
+                self.send_json(status_code, res)
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to execute hardware operation: {e}"})
+                return
+
+        # 0a2. Continuous Live Camera Streaming: POST /live-camera or /api/live-camera
+        if path in ("/live-camera", "/api/live-camera"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            body = self.read_json_body()
+            if not body or not isinstance(body, dict):
+                self.send_json(400, {"error": "Invalid request body: Expected JSON object"})
+                return
+
+            op = body.get("operation") or body.get("action") or "START_LIVE_CAMERA"
+            params = body.get("parameters") or body.get("params") or body
+            if isinstance(params, dict) and params is body:
+                params = {k: v for k, v in params.items() if k not in ("operation", "action", "parameters", "params")}
+
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                res = mgr.execute_operation(op, parameters=params)
+                status_code = 200 if res.get("success") else 400
+                self.send_json(status_code, res)
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to execute live camera operation: {e}"})
+                return
 
         # 0b. Storage Subsystem: POST /storage/share (Create/Toggle Share)
         if path == "/storage/share":
@@ -2339,9 +2599,21 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # 4. Proxy Job Submission and Node Lifecycle to Controller: POST /api/* or POST /nodes/*
         if path.startswith("/api/") or path.startswith("/nodes/"):
-            subpath = path[4:] if path.startswith("/api/") else path
             content_len = int(self.headers.get("Content-Length", 0))
             body_bytes = self.rfile.read(content_len) if content_len > 0 else None
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
+            subpath = path[4:] if path.startswith("/api/") else path
+            norm_sub = subpath.rstrip("/")
+            if norm_sub == "/enrollment/sessions" or norm_sub.endswith("/credentials/rotate"):
+                try:
+                    payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+                    if isinstance(payload, dict) and not payload.get("gateway_url"):
+                        payload["gateway_url"] = self._get_private_gateway_url()
+                        body_bytes = json.dumps(payload).encode("utf-8")
+                except Exception:
+                    pass
             self.proxy_to_controller("POST", subpath, parsed.query, body_bytes)
             return
 
@@ -2443,6 +2715,9 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
 
         # Proxy /api/ DELETE requests (e.g. DELETE /api/apps/<app_id>) and /nodes/ to controller
         if path.startswith("/api/") or path.startswith("/nodes/"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized: Owner authentication required"})
+                return
             subpath = path[4:] if path.startswith("/api/") else path
             self.proxy_to_controller("DELETE", subpath, parsed.query)
             return
@@ -2498,11 +2773,32 @@ def start_heartbeat_reporter(interval_seconds=15):
 
                         now = datetime.now(timezone.utc).isoformat()
                         sys_info = get_system_info()
+
+                        worker_enabled = True
+                        node_cfg_file = CONFIG_DIR / "node.json"
+                        if node_cfg_file.exists():
+                            try:
+                                with open(node_cfg_file, "r", encoding="utf-8") as f_cfg:
+                                    ncfg = json.load(f_cfg)
+                                    worker_enabled = ncfg.get("worker_enabled", True)
+                            except Exception:
+                                pass
+
                         services_info = {
                             "node_api": "running",
-                            "node_worker": "running" if (is_service_running("agent/node-agent.py work") or is_service_running("node-agent.py work") or is_service_running("local_worker")) else "stopped",
-                            "cloudflare": "running" if is_service_running("cloudflared") else "stopped"
                         }
+                        if is_service_running("node-agent.py heartbeat") or is_service_running("agent/node-agent.py heartbeat"):
+                            services_info["node_heartbeat"] = "running"
+
+                        if is_service_running("agent/node-agent.py work") or is_service_running("node-agent.py work") or is_service_running("local_worker"):
+                            services_info["node_worker"] = "running"
+                        elif worker_enabled:
+                            services_info["node_worker"] = "stopped"
+
+                        if is_service_running("cloudflared"):
+                            services_info["cloudflare"] = "running"
+                        elif (CONFIG_DIR / "secrets" / "cloudflared.token").exists():
+                            services_info["cloudflare"] = "stopped"
 
                         payload = {
                             "node_id": node_id,
