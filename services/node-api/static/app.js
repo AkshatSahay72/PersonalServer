@@ -6011,6 +6011,7 @@ async function populateCallDevices() {
     nodes.forEach(node => {
       const isOnline = (node.status || "").toUpperCase() === "ONLINE";
       const isAndroid = (node.platform || "").toLowerCase().includes("android") || 
+                        (node.os || "").toLowerCase().includes("android") ||
                         (node.hostname || "").toLowerCase().includes("v2334") ||
                         (node.hostname || "").toLowerCase().includes("termux") ||
                         (node.node_id || "").toLowerCase().includes("v2334");
@@ -6019,7 +6020,7 @@ async function populateCallDevices() {
       opt.value = node.node_id;
       const statusIcon = isOnline ? "🟢" : "⚪";
       const typeLabel = isAndroid ? " [Android Node]" : "";
-      opt.textContent = `${statusIcon} ${node.hostname || node.node_id} (${node.node_id})${typeLabel}`;
+      opt.textContent = `${statusIcon} ${node.name || node.hostname || node.node_id} (${node.node_id})${typeLabel}`;
       if (!isOnline) {
         opt.disabled = true;
       }
