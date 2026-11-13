@@ -29,6 +29,8 @@ TYPE_AUDIO_DOWNSTREAM = 0x03
 TYPE_HEARTBEAT = 0x04
 TYPE_CONTROL = 0x05
 
+DEFAULT_MEDIA_PORT = 8766
+
 
 class LiveCallResult(dict):
     """Result dictionary that allows unpacking as (ok, dict) or indexing as dict."""
@@ -252,7 +254,7 @@ class LiveCallProvider:
             is_native = ok and res.get("status") == "ACTIVE"
 
             if is_native:
-                self.media_port = int(res.get("media_port", MediaStreamServer.DEFAULT_MEDIA_PORT))
+                self.media_port = int(res.get("media_port", DEFAULT_MEDIA_PORT))
                 self._start_media_stream_client(self.media_port)
             else:
                 # Host/mock fallback for development or simulated tests
