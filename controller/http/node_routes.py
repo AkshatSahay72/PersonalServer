@@ -619,13 +619,22 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         handler.send_json(404, {"error": f"Node '{node_id}' has no reachable IP."})
         return True
 
-    # GET /nodes/<node_id>/live-call/frame or /status (E07)
+    # GET /nodes/<node_id>/live-call/frame, /stream, /audio, or /status (E07)
     if "/live-call/" in norm_path:
-        is_frame = norm_path.endswith("/live-call/frame") or norm_path.endswith("/live-call/stream")
+        is_stream = norm_path.endswith("/live-call/stream")
+        is_frame = norm_path.endswith("/live-call/frame")
+        is_audio = norm_path.endswith("/live-call/audio")
         is_status = norm_path.endswith("/live-call/status")
-        if is_frame or is_status:
+        if is_stream or is_frame or is_audio or is_status:
             prefix = "/api/nodes/" if norm_path.startswith("/api/nodes/") else "/nodes/"
-            suffix = "/live-call/frame" if norm_path.endswith("/live-call/frame") else ("/live-call/stream" if norm_path.endswith("/live-call/stream") else "/live-call/status")
+            if is_stream:
+                suffix = "/live-call/stream"
+            elif is_frame:
+                suffix = "/live-call/frame"
+            elif is_audio:
+                suffix = "/live-call/audio"
+            else:
+                suffix = "/live-call/status"
             node_id = norm_path[len(prefix):-len(suffix)].strip("/")
 
             token = handler.parse_auth_token()
@@ -644,6 +653,41 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                     mgr = HardwareCapabilityManager.get_instance()
                     if is_status:
                         handler.send_json(200, {"node_id": node_id, "status": mgr.live_call.get_status()})
+                        return True
+                    elif is_audio:
+                        import base64
+                        chunk, sr, ch = mgr.live_call.get_audio_chunk(max_bytes=16000)
+                        b64_data = base64.b64encode(chunk).decode("ascii") if chunk else ""
+                        handler.send_json(200, {
+                            "node_id": node_id,
+                            "active": True,
+                            "pcm_base64": b64_data,
+                            "sample_rate": sr,
+                            "channels": ch,
+                            "bytes": len(chunk)
+                        })
+                        return True
+                    elif is_stream:
+                        handler.send_response(200)
+                        handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0")
+                        handler.send_header("Pragma", "no-cache")
+                        handler.send_header("Connection", "close")
+                        handler.send_header("Access-Control-Allow-Origin", "*")
+                        handler.end_headers()
+
+                        last_ts = 0.0
+                        while not getattr(handler, "close_connection", False):
+                            cur_sess = mgr.live_call.current_session
+                            if not cur_sess or cur_sess.state.value != "ACTIVE":
+                                break
+                            frame, ts = mgr.live_call.get_latest_frame_with_timestamp()
+                            if frame and ts > last_ts:
+                                last_ts = ts
+                                part_header = f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n".encode("utf-8")
+                                handler.wfile.write(part_header + frame + b"\r\n")
+                                handler.wfile.flush()
+                            mgr.live_call.wait_for_next_frame(timeout=0.08)
                         return True
                     else:
                         frame = mgr.live_call.get_latest_frame()
@@ -674,7 +718,15 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                 handler.send_json(502, {"error": f"Node '{node_id}' has no reachable IP"})
                 return True
 
-            remote_path = f"http://{node_ip}:8080/hardware/live-call/frame" if is_frame else f"http://{node_ip}:8080/hardware"
+            if is_stream:
+                remote_path = f"http://{node_ip}:8080/hardware/live-call/stream"
+            elif is_frame:
+                remote_path = f"http://{node_ip}:8080/hardware/live-call/frame"
+            elif is_audio:
+                remote_path = f"http://{node_ip}:8080/hardware/live-call/audio"
+            else:
+                remote_path = f"http://{node_ip}:8080/hardware"
+
             try:
                 if is_status:
                     req_data = json.dumps({"operation": "GET_LIVE_CALL_STATUS", "params": {}}).encode("utf-8")
@@ -692,6 +744,42 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                         data = json.loads(resp.read().decode("utf-8"))
                         handler.send_json(200, {"node_id": node_id, **data})
                         return True
+                elif is_audio:
+                    req = urllib.request.Request(
+                        remote_path,
+                        headers={
+                            "User-Agent": "PersonalServer-Controller/1.0",
+                            "Authorization": f"Bearer {token or ''}"
+                        }
+                    )
+                    with urllib.request.urlopen(req, timeout=2.5) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        handler.send_json(200, {"node_id": node_id, **data})
+                        return True
+                elif is_stream:
+                    req = urllib.request.Request(
+                        remote_path,
+                        headers={
+                            "User-Agent": "PersonalServer-Controller/1.0",
+                            "Authorization": f"Bearer {token or ''}"
+                        }
+                    )
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0")
+                    handler.send_header("Pragma", "no-cache")
+                    handler.send_header("Connection", "close")
+                    handler.send_header("Access-Control-Allow-Origin", "*")
+                    handler.end_headers()
+
+                    with urllib.request.urlopen(req, timeout=60.0) as resp:
+                        while not getattr(handler, "close_connection", False):
+                            chunk = resp.read(8192)
+                            if not chunk:
+                                break
+                            handler.wfile.write(chunk)
+                            handler.wfile.flush()
+                    return True
                 else:
                     req = urllib.request.Request(
                         remote_path,
@@ -713,6 +801,9 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                         except Exception:
                             pass
                         return True
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
+                handler.close_connection = True
+                return True
             except Exception as e:
                 handler.send_json(503, {"error": f"Failed reaching live call on node '{node_id}': {e}"})
                 return True

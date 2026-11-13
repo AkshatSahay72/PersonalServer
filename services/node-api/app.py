@@ -1086,8 +1086,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed to retrieve recording: {e}"})
                 return
 
-        # 3b3. On-Demand Live Call Video Frame (E07): GET /hardware/live-call/frame or /stream
-        if path in ("/hardware/live-call/frame", "/api/hardware/live-call/frame", "/hardware/live-call/stream", "/api/hardware/live-call/stream"):
+        # 3b3. On-Demand Live Call Video Stream (Continuous MJPEG) (E07): GET /hardware/live-call/stream
+        if path in ("/hardware/live-call/stream", "/api/hardware/live-call/stream"):
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
                 return
@@ -1098,13 +1098,54 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 if not sess or sess.state.value != "ACTIVE":
                     self.send_json(404, {"error": "No active live call session"})
                     return
-                frame = mgr.live_call.get_latest_frame()
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                last_ts = 0.0
+                while not getattr(self, "close_connection", False):
+                    cur_sess = mgr.live_call.current_session
+                    if not cur_sess or cur_sess.state.value != "ACTIVE":
+                        break
+                    frame, ts = mgr.live_call.get_latest_frame_with_timestamp()
+                    if frame and ts > last_ts:
+                        last_ts = ts
+                        part_header = f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n".encode("utf-8")
+                        self.wfile.write(part_header + frame + b"\r\n")
+                        self.wfile.flush()
+                    mgr.live_call.wait_for_next_frame(timeout=0.08)
+                return
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
+                self.close_connection = True
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed streaming live call: {e}"})
+                return
+
+        # 3b4. On-Demand Live Call Video Frame (E07): GET /hardware/live-call/frame
+        if path in ("/hardware/live-call/frame", "/api/hardware/live-call/frame"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                sess = mgr.live_call.current_session
+                if not sess or sess.state.value != "ACTIVE":
+                    self.send_json(404, {"error": "No active live call session"})
+                    return
+                frame, ts = mgr.live_call.get_latest_frame_with_timestamp()
                 if not frame:
                     self.send_json(503, {"error": "No video frame available yet"})
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(frame)))
+                self.send_header("X-Frame-Timestamp", str(ts))
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -1115,6 +1156,33 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 return
             except Exception as e:
                 self.send_json(500, {"error": f"Failed retrieving live call frame: {e}"})
+                return
+
+        # 3b5. On-Demand Live Call Phone Microphone Audio Chunk (E07): GET /hardware/live-call/audio
+        if path in ("/hardware/live-call/audio", "/api/hardware/live-call/audio"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                import base64
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                sess = mgr.live_call.current_session
+                if not sess or sess.state.value != "ACTIVE":
+                    self.send_json(200, {"active": False, "pcm_base64": "", "sample_rate": 16000, "channels": 1, "bytes": 0})
+                    return
+                chunk, sr, ch = mgr.live_call.get_audio_chunk(max_bytes=16000)
+                b64_data = base64.b64encode(chunk).decode("ascii") if chunk else ""
+                self.send_json(200, {
+                    "active": True,
+                    "pcm_base64": b64_data,
+                    "sample_rate": sr,
+                    "channels": ch,
+                    "bytes": len(chunk)
+                })
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed retrieving live call audio: {e}"})
                 return
 
         # 3c. Continuous Live Camera Streaming: GET /live-camera or /api/live-camera
@@ -2182,7 +2250,7 @@ document.getElementById('cmd-box').textContent = code
                 self.send_json(401, {"error": "Unauthorized"})
                 return
             body = self.read_json_body()
-            pcm_b64 = (body or {}).get("pcm_base64", "")
+            pcm_b64 = (body or {}).get("pcm_base64") or (body or {}).get("audio_base64") or ""
             sr = int((body or {}).get("sample_rate", 16000))
             ch = int((body or {}).get("channels", 1))
             try:

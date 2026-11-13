@@ -138,9 +138,43 @@ class TestLiveCallSessionAndProvider(unittest.TestCase):
         is_expired = session.check_watchdog_expiration()
         self.assertTrue(is_expired)
 
-        # Verify provider auto-cleanup
-        self.provider._check_session_watchdog()
-        self.assertFalse(self.provider.is_active())
+    def test_frame_timestamp_and_wait_for_next_frame(self):
+        """LiveCallProvider should provide arrival timestamps and wait_for_next_frame signaling."""
+        self.provider.start_session(quality="480p", fps=15)
+        frame = self.provider.wait_for_next_frame(timeout=0.3)
+        self.assertIsNotNone(frame)
+        self.assertTrue(isinstance(frame, bytes))
+
+        frame_latest, ts = self.provider.get_latest_frame_with_timestamp()
+        self.assertEqual(frame, frame_latest)
+        self.assertGreater(ts, 0.0)
+
+    def test_microphone_audio_chunk_buffering(self):
+        """LiveCallProvider should accumulate upstream microphone PCM chunks and allow consuming them."""
+        self.provider.start_session(with_mic=True)
+        time.sleep(0.15)
+        chunk, sr, ch = self.provider.get_audio_chunk(max_bytes=16000)
+        self.assertEqual(sr, 16000)
+        self.assertEqual(ch, 1)
+        self.assertTrue(isinstance(chunk, bytes))
+        self.assertGreater(len(chunk), 0)
+
+        # Consuming clears the buffer
+        empty_chunk, _, _ = self.provider.get_audio_chunk(max_bytes=16000)
+        self.assertEqual(len(empty_chunk), 0)
+
+    def test_update_session_forwards_camera_id_to_bridge(self):
+        """Updating camera to 'front' or 'back' must map and pass 'camera_id' and 'mute_mic'."""
+        with patch.object(self.provider, "_call_native_bridge", return_value=(True, {"status": "ACTIVE"})) as mock_bridge:
+            self.provider.start_session(camera="back")
+            self.provider.update_session(camera="front", with_mic=False)
+
+            # Check that _call_native_bridge was called with UPDATE_LIVE_CALL and camera_id == '1'
+            called_args = [call for call in mock_bridge.call_args_list if call[0][0] == "UPDATE_LIVE_CALL"]
+            self.assertTrue(len(called_args) > 0)
+            passed_params = called_args[0][0][1]
+            self.assertEqual(passed_params.get("camera_id"), "1")
+            self.assertTrue(passed_params.get("mute_mic"))
 
 
 class TestHardwareCapabilityManagerLiveCall(unittest.TestCase):

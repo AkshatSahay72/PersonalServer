@@ -90,16 +90,17 @@ class StreamQuality:
     """Configurable live video stream quality settings."""
     PRESETS = {
         "720p": {"width": 1280, "height": 720, "fps": 15, "bitrate_kbps": 1500},
-        "480p": {"width": 854, "height": 480, "fps": 15, "bitrate_kbps": 800},
-        "360p": {"width": 640, "height": 360, "fps": 15, "bitrate_kbps": 400},
+        "480p": {"width": 640, "height": 480, "fps": 15, "bitrate_kbps": 800},
+        "360p": {"width": 480, "height": 360, "fps": 15, "bitrate_kbps": 400},
+        "vga": {"width": 640, "height": 480, "fps": 15, "bitrate_kbps": 800},
     }
 
     def __init__(
         self,
-        width: int = 1280,
-        height: int = 720,
+        width: int = 640,
+        height: int = 480,
         fps: int = 15,
-        bitrate_kbps: int = 1500
+        bitrate_kbps: int = 800
     ):
         self.width = int(width)
         self.height = int(height)
@@ -110,15 +111,15 @@ class StreamQuality:
     def from_dict(cls, data: Optional[Dict[str, Any]] = None) -> "StreamQuality":
         if not data:
             return cls()
-        preset = data.get("preset")
+        preset = (data.get("preset") or data.get("quality") or "").lower()
         if preset in cls.PRESETS:
             p = cls.PRESETS[preset]
             return cls(width=p["width"], height=p["height"], fps=p["fps"], bitrate_kbps=p["bitrate_kbps"])
         return cls(
-            width=data.get("width", 1280),
-            height=data.get("height", 720),
+            width=data.get("width", 640),
+            height=data.get("height", 480),
             fps=data.get("fps", 15),
-            bitrate_kbps=data.get("bitrate_kbps", 1500)
+            bitrate_kbps=data.get("bitrate_kbps", 800)
         )
 
     def to_dict(self) -> Dict[str, Any]:

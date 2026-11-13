@@ -118,6 +118,11 @@ class LiveCallProvider:
         self._latest_jpeg_frame: Optional[bytes] = None
         self._frame_timestamp: float = 0.0
         self._frame_lock = threading.Lock()
+        self._frame_event = threading.Event()
+        self._audio_buffer = bytearray()
+        self._audio_buffer_lock = threading.Lock()
+        self._audio_sample_rate: int = 16000
+        self._audio_channels: int = 1
         self._frame_listeners: List[Callable[[bytes], None]] = []
         self._audio_listeners: List[Callable[[bytes, int, int], None]] = []
 
@@ -237,6 +242,9 @@ class LiveCallProvider:
             )
             session.state = SessionState.REQUESTED
             self.current_session = session
+            with self._audio_buffer_lock:
+                self._audio_buffer.clear()
+            self._frame_event.clear()
 
             # 2. Try native Android bridge
             bridge_params = {
@@ -365,16 +373,22 @@ class LiveCallProvider:
             session = self.current_session
             if "camera" in params:
                 session.camera_id = "1" if params["camera"] == "front" else "0"
+                params["camera_id"] = session.camera_id
             if "camera_id" in params:
                 session.camera_id = str(params["camera_id"])
+                params["camera_id"] = session.camera_id
             if "with_mic" in params:
                 session.mic_muted = not bool(params["with_mic"])
+                params["mute_mic"] = session.mic_muted
             if "mute_mic" in params:
                 session.mic_muted = bool(params["mute_mic"])
+                params["mute_mic"] = session.mic_muted
             if "with_speaker" in params:
                 session.speaker_muted = not bool(params["with_speaker"])
+                params["mute_speaker"] = session.speaker_muted
             if "mute_speaker" in params:
                 session.speaker_muted = bool(params["mute_speaker"])
+                params["mute_speaker"] = session.speaker_muted
 
             # Propagate to native bridge
             self._call_native_bridge("UPDATE_LIVE_CALL", params)
@@ -422,6 +436,27 @@ class LiveCallProvider:
         """Returns the most recent JPEG video frame."""
         with self._frame_lock:
             return self._latest_jpeg_frame
+
+    def wait_for_next_frame(self, timeout: float = 0.5) -> Optional[bytes]:
+        """Waits for next newly captured video frame or returns the latest available frame."""
+        self._frame_event.wait(timeout=timeout)
+        self._frame_event.clear()
+        with self._frame_lock:
+            return self._latest_jpeg_frame
+
+    def get_latest_frame_with_timestamp(self) -> Tuple[Optional[bytes], float]:
+        """Returns the most recent JPEG video frame and its arrival timestamp."""
+        with self._frame_lock:
+            return self._latest_jpeg_frame, self._frame_timestamp
+
+    def get_audio_chunk(self, max_bytes: int = 16000) -> Tuple[bytes, int, int]:
+        """Retrieves and clears pending microphone PCM audio chunks for browser playback."""
+        with self._audio_buffer_lock:
+            if not self._audio_buffer:
+                return b"", self._audio_sample_rate, self._audio_channels
+            chunk = bytes(self._audio_buffer[:max_bytes])
+            self._audio_buffer = self._audio_buffer[len(chunk):]
+            return chunk, self._audio_sample_rate, self._audio_channels
 
     # =========================================================================
     # Media Transport Reader (Client for 127.0.0.1:8766)
@@ -479,6 +514,7 @@ class LiveCallProvider:
                     with self._frame_lock:
                         self._latest_jpeg_frame = frame_bytes
                         self._frame_timestamp = timestamp_ms / 1000.0
+                    self._frame_event.set()
 
                     if self.current_session:
                         self.current_session.frames_received += 1
@@ -490,6 +526,13 @@ class LiveCallProvider:
 
                     if self.current_session:
                         self.current_session.audio_packets_received += 1
+
+                    with self._audio_buffer_lock:
+                        self._audio_sample_rate = sample_rate
+                        self._audio_channels = channels
+                        self._audio_buffer.extend(pcm_bytes)
+                        if len(self._audio_buffer) > 96000:
+                            self._audio_buffer = self._audio_buffer[-96000:]
 
                     for listener in self._audio_listeners:
                         try:
@@ -550,6 +593,14 @@ class LiveCallProvider:
             with self._frame_lock:
                 self._latest_jpeg_frame = minimal_jpeg
                 self._frame_timestamp = now
+            self._frame_event.set()
+
+            with self._audio_buffer_lock:
+                # Provide dummy PCM chunk for simulated audio testing
+                chunk_len = int(interval * 16000 * 2)
+                self._audio_buffer.extend(b"\x00" * chunk_len)
+                if len(self._audio_buffer) > 96000:
+                    self._audio_buffer = self._audio_buffer[-96000:]
 
             if self.current_session:
                 self.current_session.frames_received += 1

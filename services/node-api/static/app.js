@@ -5986,6 +5986,13 @@ let liveCallIsPushToTalkActive = false;
 let liveCallFpsCounter = 0;
 let liveCallFpsTimer = null;
 let liveCallFetchAbortController = null;
+let liveCallAudioPlayContext = null;
+let liveCallAudioNextPlayTime = 0;
+let liveCallAudioReceiverActive = false;
+let isSendingSpeak = false;
+let speakSendQueue = [];
+let liveCallLastFramesReceived = 0;
+let liveCallLastStatusTime = 0;
 
 async function loadLiveCall() {
   await populateCallDevices();
@@ -6198,7 +6205,8 @@ async function startLiveCallSession() {
 
     updateCallControlsUI(true);
     startLiveCallDurationTimer();
-    startLiveCallFrameLoop(nodeId);
+    startLiveCallStreamOrLoop(nodeId);
+    startLiveCallAudioReceiver(nodeId);
     startLiveCallStatusPolling(nodeId);
   } catch (err) {
     console.error("Start live call error:", err);
@@ -6241,6 +6249,7 @@ async function endLiveCallSession() {
 
 function stopLiveCallLoops() {
   liveCallFrameLoopActive = false;
+  liveCallAudioReceiverActive = false;
   if (liveCallFetchAbortController) {
     liveCallFetchAbortController.abort();
     liveCallFetchAbortController = null;
@@ -6257,6 +6266,12 @@ function stopLiveCallLoops() {
     clearInterval(liveCallFpsTimer);
     liveCallFpsTimer = null;
   }
+  if (liveCallAudioPlayContext) {
+    try { liveCallAudioPlayContext.close(); } catch (e) {}
+    liveCallAudioPlayContext = null;
+  }
+  speakSendQueue = [];
+  isSendingSpeak = false;
 }
 
 function startLiveCallDurationTimer() {
@@ -6272,20 +6287,40 @@ function startLiveCallDurationTimer() {
   }, 1000);
 }
 
-function startLiveCallFrameLoop(nodeId) {
+function startLiveCallStreamOrLoop(nodeId) {
   liveCallFrameLoopActive = true;
   liveCallFpsCounter = 0;
 
   const fpsBadge = document.getElementById("call-fps-badge");
-  if (liveCallFpsTimer) clearInterval(liveCallFpsTimer);
-  liveCallFpsTimer = setInterval(() => {
-    if (fpsBadge) fpsBadge.textContent = `${liveCallFpsCounter} FPS`;
-    liveCallFpsCounter = 0;
-  }, 1000);
-
   const resBadge = document.getElementById("call-res-badge");
   if (resBadge) resBadge.textContent = "640x480";
 
+  const videoStream = document.getElementById("call-video-stream");
+  if (videoStream) {
+    // Connect to continuous MJPEG stream over single HTTP connection
+    const streamUrl = `/api/nodes/${encodeURIComponent(nodeId)}/live-call/stream?t=${Date.now()}`;
+    videoStream.src = streamUrl;
+    videoStream.style.display = "block";
+
+    videoStream.onerror = () => {
+      console.warn("MJPEG stream error or unsupported; falling back to frame loop");
+      if (liveCallFrameLoopActive) {
+        startLiveCallFrameLoopFallback(nodeId);
+      }
+    };
+  }
+
+  if (liveCallFpsTimer) clearInterval(liveCallFpsTimer);
+  liveCallFpsTimer = setInterval(() => {
+    if (fpsBadge && liveCallFpsCounter > 0) {
+      fpsBadge.textContent = `${liveCallFpsCounter} FPS`;
+    }
+    liveCallFpsCounter = 0;
+  }, 1000);
+}
+
+function startLiveCallFrameLoopFallback(nodeId) {
+  if (!liveCallFrameLoopActive || !activeLiveCallSession) return;
   let isFetching = false;
   const loop = async () => {
     if (!liveCallFrameLoopActive || !activeLiveCallSession) return;
@@ -6314,7 +6349,6 @@ function startLiveCallFrameLoop(nodeId) {
             if (latencyBadge) latencyBadge.textContent = `${latency} ms`;
           }
         } else if (res.status === 404 || res.status === 410) {
-          console.warn("Session closed remotely (HTTP " + res.status + ")");
           handleRemoteSessionTermination();
           return;
         }
@@ -6327,15 +6361,90 @@ function startLiveCallFrameLoop(nodeId) {
       }
     }
     if (liveCallFrameLoopActive) {
-      setTimeout(loop, 40); // ~25 fps max poll rate
+      setTimeout(loop, 40);
     }
   };
-
   loop();
+}
+
+function startLiveCallAudioReceiver(nodeId) {
+  liveCallAudioReceiverActive = true;
+  liveCallAudioNextPlayTime = 0;
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!liveCallAudioPlayContext || liveCallAudioPlayContext.state === "closed") {
+    liveCallAudioPlayContext = new AudioContextClass();
+  }
+  if (liveCallAudioPlayContext.state === "suspended") {
+    liveCallAudioPlayContext.resume();
+  }
+
+  let isFetchingAudio = false;
+  const pollAudio = async () => {
+    if (!liveCallAudioReceiverActive || !activeLiveCallSession) return;
+    if (!isFetchingAudio && liveCallMicEnabled) {
+      isFetchingAudio = true;
+      try {
+        const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/audio`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.pcm_base64 && data.bytes > 0 && liveCallAudioPlayContext) {
+            playRawPcmChunk(data.pcm_base64, data.sample_rate || 16000, data.channels || 1);
+          }
+        }
+      } catch (e) {
+        console.debug("Audio poll tick error:", e);
+      } finally {
+        isFetchingAudio = false;
+      }
+    }
+    if (liveCallAudioReceiverActive) {
+      setTimeout(pollAudio, 150);
+    }
+  };
+  pollAudio();
+}
+
+function playRawPcmChunk(b64, sampleRate, channels) {
+  try {
+    const binary = atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const int16 = new Int16Array(bytes.buffer);
+    const numSamples = int16.length / channels;
+    if (!liveCallAudioPlayContext || liveCallAudioPlayContext.state === "closed") return;
+    const audioBuf = liveCallAudioPlayContext.createBuffer(channels, numSamples, sampleRate);
+
+    for (let ch = 0; ch < channels; ch++) {
+      const channelData = audioBuf.getChannelData(ch);
+      for (let i = 0; i < numSamples; i++) {
+        channelData[i] = int16[i * channels + ch] / 32768.0;
+      }
+    }
+
+    const source = liveCallAudioPlayContext.createBufferSource();
+    source.buffer = audioBuf;
+    source.connect(liveCallAudioPlayContext.destination);
+
+    const currentTime = liveCallAudioPlayContext.currentTime;
+    if (liveCallAudioNextPlayTime < currentTime) {
+      liveCallAudioNextPlayTime = currentTime + 0.02; // Small 20ms jitter buffer
+    }
+    source.start(liveCallAudioNextPlayTime);
+    liveCallAudioNextPlayTime += audioBuf.duration;
+  } catch (err) {
+    console.debug("Error playing raw PCM chunk:", err);
+  }
 }
 
 function startLiveCallStatusPolling(nodeId) {
   if (liveCallStatusTimer) clearInterval(liveCallStatusTimer);
+  liveCallLastFramesReceived = 0;
+  liveCallLastStatusTime = performance.now();
+
   liveCallStatusTimer = setInterval(async () => {
     if (!activeLiveCallSession) return;
     try {
@@ -6343,14 +6452,49 @@ function startLiveCallStatusPolling(nodeId) {
       const statusData = res?.status || res;
       if (statusData && statusData.session_active === false) {
         handleRemoteSessionTermination();
-      } else if (statusData) {
-        // Update hardware pills
+        return;
+      }
+      if (statusData) {
+        // Calculate measured FPS from node frames_received
+        const sess = statusData.session || {};
+        const frames = sess.frames_received || statusData.captured_frames || 0;
+        const now = performance.now();
+        const dt = (now - liveCallLastStatusTime) / 1000.0;
+        if (dt > 0.5 && liveCallLastFramesReceived > 0) {
+          const deltaFrames = frames - liveCallLastFramesReceived;
+          const measuredFps = Math.max(0, Math.round(deltaFrames / dt));
+          const fpsBadge = document.getElementById("call-fps-badge");
+          if (fpsBadge) {
+            fpsBadge.textContent = `${measuredFps} FPS`;
+          }
+        }
+        liveCallLastFramesReceived = frames;
+        liveCallLastStatusTime = now;
+
+        // Calculate latency if frame_timestamp available
+        const frameTs = statusData.frame_timestamp || 0;
+        if (frameTs > 0) {
+          const latencyMs = Math.max(8, Math.round(Date.now() - (frameTs * 1000)));
+          const latencyBadge = document.getElementById("call-latency-badge");
+          if (latencyBadge && latencyMs < 2000) {
+            latencyBadge.textContent = `${latencyMs} ms`;
+          }
+        }
+
+        const resBadge = document.getElementById("call-res-badge");
+        if (resBadge && (statusData.resolution || (sess.quality && sess.quality.width))) {
+          resBadge.textContent = statusData.resolution || `${sess.quality.width}x${sess.quality.height}`;
+        }
+
+        // Hardware pills
         const pillCam = document.getElementById("pill-cam-state");
         const pillMic = document.getElementById("pill-mic-state");
         const pillSpk = document.getElementById("pill-spk-state");
         if (pillCam) {
-          pillCam.className = statusData.camera_active ? "hw-pill pill-active" : "hw-pill pill-muted";
-          pillCam.textContent = statusData.camera_active ? "● Camera (Active)" : "○ Camera (Off)";
+          const camOn = statusData.camera_active !== false && statusData.session_active;
+          pillCam.className = camOn ? "hw-pill pill-active" : "hw-pill pill-muted";
+          const facing = statusData.camera_facing || (statusData.camera_id === "1" ? "front" : "back");
+          pillCam.textContent = camOn ? `● Camera (${facing})` : "○ Camera (Off)";
         }
         if (pillMic) {
           pillMic.className = statusData.mic_active ? "hw-pill pill-active" : "hw-pill pill-muted";
@@ -6364,7 +6508,7 @@ function startLiveCallStatusPolling(nodeId) {
     } catch (e) {
       console.debug("Status polling error:", e);
     }
-  }, 3000);
+  }, 1000);
 }
 
 function handleRemoteSessionTermination() {
@@ -6386,11 +6530,15 @@ async function switchCallCamera() {
     const res = await apiFetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/update`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ camera: newFacing })
+      body: JSON.stringify({ camera: newFacing, camera_id: newFacing === "front" ? "1" : "0" })
     });
     if (res && res.success) {
       liveCallCurrentFacing = newFacing;
       activeLiveCallSession.facing = newFacing;
+      const pillCam = document.getElementById("pill-cam-state");
+      if (pillCam) {
+        pillCam.textContent = `● Camera (${newFacing})`;
+      }
     }
   } catch (err) {
     console.error("Failed to switch camera:", err);
@@ -6457,14 +6605,14 @@ async function startPushToTalk() {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     liveCallAudioContext = new AudioContextClass({ sampleRate: 16000 });
     const source = liveCallAudioContext.createMediaStreamSource(liveCallAudioStream);
-    
+
     // Buffer size 2048 at 16kHz is ~128ms per chunk
     liveCallAudioProcessor = liveCallAudioContext.createScriptProcessor(2048, 1, 1);
-    
-    liveCallAudioProcessor.onaudioprocess = async (event) => {
+
+    liveCallAudioProcessor.onaudioprocess = (event) => {
       if (!liveCallIsPushToTalkActive || !activeLiveCallSession) return;
       const inputBuffer = event.inputBuffer.getChannelData(0);
-      
+
       // Convert Float32 [-1.0, 1.0] to 16-bit Signed PCM [-32768, 32767]
       const pcm16 = new Int16Array(inputBuffer.length);
       for (let i = 0; i < inputBuffer.length; i++) {
@@ -6480,15 +6628,13 @@ async function startPushToTalk() {
       }
       const b64 = btoa(binary);
 
-      const nodeId = activeLiveCallSession.nodeId;
-      try {
-        await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/speak`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pcm_base64: b64, sample_rate: 16000 })
-        });
-      } catch (err) {
-        console.debug("Speak transmission error:", err);
+      if (speakSendQueue.length > 2) {
+        speakSendQueue.shift(); // Drop oldest to avoid latency buildup
+      }
+      speakSendQueue.push(b64);
+
+      if (!isSendingSpeak) {
+        sendNextSpeakChunk();
       }
     };
 
@@ -6498,6 +6644,30 @@ async function startPushToTalk() {
     console.error("Microphone capture error:", err);
     showCallError(`Push-to-Talk error: ${err.message}`);
     stopPushToTalk();
+  }
+}
+
+async function sendNextSpeakChunk() {
+  if (!liveCallIsPushToTalkActive || !activeLiveCallSession || speakSendQueue.length === 0) {
+    isSendingSpeak = false;
+    return;
+  }
+  isSendingSpeak = true;
+  const chunk = speakSendQueue.shift();
+  const nodeId = activeLiveCallSession.nodeId;
+  try {
+    await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/speak`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pcm_base64: chunk, sample_rate: 16000 })
+    });
+  } catch (err) {
+    console.debug("Speak transmission error:", err);
+  } finally {
+    isSendingSpeak = false;
+    if (speakSendQueue.length > 0) {
+      sendNextSpeakChunk();
+    }
   }
 }
 
@@ -6524,6 +6694,8 @@ function stopPushToTalk() {
     });
     liveCallAudioStream = null;
   }
+  speakSendQueue = [];
+  isSendingSpeak = false;
 }
 
 // Guarantee session cleanup if user reloads or navigates away
