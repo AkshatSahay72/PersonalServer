@@ -654,6 +654,14 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             cu = u.strip().rstrip("/")
             if cu and cu not in candidates:
                 candidates.append(cu)
+        try:
+            from config.ha_manager import DEFAULT_CLUSTER_VOTERS
+            for vid, vdata in DEFAULT_CLUSTER_VOTERS.items():
+                vurl = vdata.get("url", "").rstrip("/")
+                if vurl and vurl not in candidates:
+                    candidates.append(vurl)
+        except Exception:
+            pass
         for u in (primary, configured_url, DEFAULT_CONTROLLER_URL):
             if u and u.rstrip("/") not in candidates:
                 candidates.append(u.rstrip("/"))
@@ -801,7 +809,131 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                         return
             except Exception:
                 pass
+            if self._serve_read_model_fallback(method, subpath, query_str, initial_err):
+                return
             self.send_json(502, {"error": f"Controller unavailable at {controller_url} (HA failover attempted): {initial_err}"})
+
+    def _serve_read_model_fallback(self, method, subpath, query_str="", initial_err=None):
+        """
+        Serves local replicated data during HA failover or partition.
+        GET requests return local state with X-PersonalServer-Read-Only: true.
+        Mutating requests return HTTP 503 explaining failover/degraded state.
+        """
+        clean_subpath = subpath.split("?")[0].rstrip("/")
+        if method == "GET":
+            from config.platform_config import get_controller_paths
+            paths = get_controller_paths()
+
+            # /nodes, /cluster, /api/nodes, /api/cluster
+            if clean_subpath in ("/nodes", "/cluster", "/api/nodes", "/api/cluster"):
+                if paths.nodes_file.exists():
+                    try:
+                        with open(paths.nodes_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        resp_bytes = json.dumps(data).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(resp_bytes)))
+                        self.send_header("X-PersonalServer-Read-Only", "true")
+                        self.send_header("X-PersonalServer-Leader-State", "electing")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(resp_bytes)
+                        return True
+                    except Exception:
+                        pass
+
+            # /jobs, /api/jobs
+            if clean_subpath in ("/jobs", "/api/jobs"):
+                if paths.jobs_file.exists():
+                    try:
+                        with open(paths.jobs_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        resp_bytes = json.dumps(data).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(resp_bytes)))
+                        self.send_header("X-PersonalServer-Read-Only", "true")
+                        self.send_header("X-PersonalServer-Leader-State", "electing")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(resp_bytes)
+                        return True
+                    except Exception:
+                        pass
+
+            # /apps, /api/apps
+            if clean_subpath in ("/apps", "/api/apps"):
+                if paths.apps_file.exists():
+                    try:
+                        with open(paths.apps_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        resp_bytes = json.dumps(data).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(resp_bytes)))
+                        self.send_header("X-PersonalServer-Read-Only", "true")
+                        self.send_header("X-PersonalServer-Leader-State", "electing")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(resp_bytes)
+                        return True
+                    except Exception:
+                        pass
+
+            # /ha/status, /api/ha/status
+            if clean_subpath in ("/ha/status", "/api/ha/status", "/ha/leader", "/api/ha/leader"):
+                try:
+                    from config.ha_manager import LeaderLease
+                    lease = LeaderLease.load_from_file(paths.leader_lease_file)
+                    fallback_ha = {
+                        "ha_enabled": True,
+                        "role": "electing",
+                        "leader_id": None,
+                        "leader_name": "Electing...",
+                        "leader_online": False,
+                        "leader_url": None,
+                        "term": lease.term,
+                        "state_version": lease.state_version,
+                        "lease_valid": False,
+                        "lease_remaining_sec": 0.0,
+                        "read_only_fallback": True,
+                        "timestamp": get_current_iso_timestamp()
+                    }
+                    resp_bytes = json.dumps(fallback_ha).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp_bytes)))
+                    self.send_header("X-PersonalServer-Read-Only", "true")
+                    self.send_header("X-PersonalServer-Leader-State", "electing")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(resp_bytes)
+                    return True
+                except Exception:
+                    pass
+
+        # For mutating requests, return 503 explaining failover/degraded state
+        if method in ("POST", "PUT", "DELETE", "PATCH"):
+            err_payload = json.dumps({
+                "error": "Cluster leader election in progress or quorum degraded. Authoritative mutations temporarily unavailable. Please retry in a few seconds.",
+                "status": "degraded",
+                "leader_state": "electing",
+                "retry_after_sec": 3
+            }).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_payload)))
+            self.send_header("Retry-After", "3")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                self.wfile.write(err_payload)
+            except Exception:
+                pass
+            return True
+
+        return False
 
     def proxy_to_router(self, method, full_path, body_bytes=None):
         config = load_config()

@@ -577,8 +577,8 @@ function resolveLeaderInfo(ha) {
     dotClass = "ha-dot-fenced";
     badgeClass = "ha-status-fenced";
     displayText = "Fenced";
-  } else if (ha.role === "candidate" || ha.role === "promoting" || ha.lease_valid === false) {
-    statusText = "Election";
+  } else if (ha.role === "candidate" || ha.role === "promoting" || ha.role === "electing" || ha.lease_valid === false || ha.read_only_fallback) {
+    statusText = ha.read_only_fallback ? "Read-Only (Electing)" : "Election";
     dotClass = "ha-dot-election";
     badgeClass = "ha-status-election";
     displayText = "Electing...";
@@ -943,7 +943,9 @@ function renderHADetailsModalContent(ha) {
 
   const partEl = document.getElementById("ha-modal-partition-safe");
   if (partEl) {
-    partEl.textContent = `Partition Safe: ${ha.partition_safe !== false ? "True" : "Partition Suspected"}`;
+    const qSize = ha.quorum_size || 2;
+    const vTotal = ha.total_voters || (ha.voters ? ha.voters.length : 3);
+    partEl.textContent = `Consensus: Raft Quorum (${qSize}/${vTotal} votes) · Partition Safe: ${ha.partition_safe !== false ? "True" : "Partition Suspected"}`;
   }
 
   // Standbys list

@@ -298,6 +298,31 @@ def validate_peer_configuration(
     return True, "valid", remote_peers
 
 
+DEFAULT_CLUSTER_VOTERS: Dict[str, Dict[str, Any]] = {
+    "server-5387a86bf36116b1": {
+        "node_id": "server-5387a86bf36116b1",
+        "name": "Vivo Y31",
+        "url": "http://100.85.108.5:8000",
+        "votes": 1,
+        "role": "voter"
+    },
+    "server-v2334-a531": {
+        "node_id": "server-v2334-a531",
+        "name": "Vivo V2334",
+        "url": "http://100.113.234.61:8000",
+        "votes": 1,
+        "role": "voter"
+    },
+    "server-win-c03532e6881c": {
+        "node_id": "server-win-c03532e6881c",
+        "name": "Aki",
+        "url": "http://100.120.251.42:8000",
+        "votes": 1,
+        "role": "voter"
+    }
+}
+
+
 class HAManager:
     """
     Cluster High Availability & Leader Election Manager.
@@ -325,6 +350,9 @@ class HAManager:
         self._lock = threading.RLock()
         self.paths = paths or get_controller_paths()
         self.lease_file = getattr(self.paths, "leader_lease_file", self.paths.data_dir / "leader_lease.json")
+        self.voters_file = getattr(self.paths, "voters_file", self.paths.data_dir / "voters.json")
+        self.election_state_file = getattr(self.paths, "ha_election_state_file", self.paths.data_dir / "ha_election_state.json")
+        self.voted_for: Optional[str] = None
 
         self.node_id = resolve_controller_node_id(node_id=node_id, paths=self.paths)
 
@@ -356,6 +384,16 @@ class HAManager:
         self.candidate_urls: List[str] = list(candidate_urls or parsed_candidates or [self.node_url])
         if self.node_url not in self.candidate_urls:
             self.candidate_urls.append(self.node_url)
+
+        # Ensure candidate_urls includes voting members only if not explicitly overridden by caller
+        if candidate_urls is None:
+            try:
+                for vid, vdata in self.load_voting_members().items():
+                    vurl = vdata.get("url")
+                    if vurl and vurl not in self.candidate_urls:
+                        self.candidate_urls.append(vurl)
+            except Exception:
+                pass
 
         # Validate peer configuration (Phase 3)
         self.peer_config_valid, self.peer_config_status, self.configured_peers = validate_peer_configuration(
@@ -432,6 +470,7 @@ class HAManager:
         self.state: str = HAState.STANDBY if self.configured_role == "standby" else HAState.LEADER
         self.current_lease: LeaderLease = LeaderLease.load_from_file(self.lease_file)
         self.state_version: int = self.current_lease.state_version
+        self._load_election_state()
         self.missed_checks: int = 0
         self.max_missed_checks: int = 3
         self.standby_nodes: Dict[str, Dict[str, Any]] = {}
@@ -477,6 +516,399 @@ class HAManager:
     def current_leader_url(self) -> str:
         with self._lock:
             return self.current_lease.leader_url
+
+    def _load_election_state(self):
+        """Loads term and voted_for from ha_election_state.json if available."""
+        if hasattr(self, "election_state_file") and self.election_state_file.exists():
+            try:
+                with open(self.election_state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.voted_for = data.get("voted_for")
+                    disk_term = data.get("term", 0)
+                    if hasattr(self, "current_lease") and disk_term > self.current_lease.term:
+                        self.current_lease.term = disk_term
+            except Exception:
+                pass
+
+    def _save_election_state(self, term: int, voted_for: Optional[str]):
+        """Persists term and voted_for to ha_election_state.json atomically."""
+        if not hasattr(self, "election_state_file"):
+            return
+        try:
+            from controller.stores.base import atomic_write_json_file
+            payload = {
+                "term": term,
+                "voted_for": voted_for,
+                "node_id": self.node_id,
+                "updated_at": get_current_iso_timestamp()
+            }
+            atomic_write_json_file(self.election_state_file, payload)
+        except Exception as e:
+            controller_logger.warning("Failed to persist election state: %s", e)
+
+    def load_voting_members(self) -> Dict[str, Dict[str, Any]]:
+        """Loads the current voting member configuration."""
+        if hasattr(self, "voters_file") and self.voters_file.exists():
+            try:
+                with open(self.voters_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data.get("voters", {})
+            except Exception:
+                pass
+
+        # If on production cluster nodes or node matches cluster voter, seed DEFAULT_CLUSTER_VOTERS
+        if self.node_id in DEFAULT_CLUSTER_VOTERS:
+            try:
+                self.save_voting_members(DEFAULT_CLUSTER_VOTERS)
+            except Exception:
+                pass
+            return dict(DEFAULT_CLUSTER_VOTERS)
+
+        # Fallback for dynamic / test environments without voters.json:
+        dynamic_voters = {
+            self.node_id: {
+                "node_id": self.node_id,
+                "name": self.node_id,
+                "url": self.node_url,
+                "votes": 1,
+                "role": "voter"
+            }
+        }
+        for u in getattr(self, "candidate_urls", []):
+            if not is_local_url(u, self.node_url):
+                vid = f"voter-{abs(hash(u)) % 100000}"
+                dynamic_voters[vid] = {
+                    "node_id": vid,
+                    "name": vid,
+                    "url": u,
+                    "votes": 1,
+                    "role": "voter"
+                }
+        return dynamic_voters
+
+    def save_voting_members(self, voters: Dict[str, Dict[str, Any]]) -> bool:
+        """Atomically saves voting member configuration to voters.json."""
+        if not hasattr(self, "voters_file"):
+            return False
+        try:
+            from controller.stores.base import atomic_save_json
+            payload = {
+                "version": 1,
+                "voters": voters,
+                "count": len(voters),
+                "updated_at": get_current_iso_timestamp()
+            }
+            backup_file = getattr(self.paths, "backup_voters_file", self.voters_file.with_suffix(".bak"))
+            atomic_save_json(self.voters_file, backup_file, payload, bump_ha=False)
+            return True
+        except Exception as e:
+            controller_logger.warning("Failed to save voting members to %s: %s", self.voters_file, e)
+            return False
+
+    def add_voting_member(self, node_id: str, url: str, name: Optional[str] = None) -> bool:
+        """Adds or updates a voting member."""
+        with self._lock:
+            voters = self.load_voting_members()
+            voters[node_id] = {
+                "node_id": node_id,
+                "name": name or node_id,
+                "url": str(url).rstrip("/"),
+                "votes": 1,
+                "role": "voter",
+                "added_at": get_current_iso_timestamp()
+            }
+            if url not in self.candidate_urls:
+                self.candidate_urls.append(url)
+            return self.save_voting_members(voters)
+
+    def remove_voting_member(self, node_id: str) -> bool:
+        """Removes a voting member."""
+        with self._lock:
+            voters = self.load_voting_members()
+            if node_id in voters:
+                del voters[node_id]
+                return self.save_voting_members(voters)
+            return False
+
+    @property
+    def quorum_size(self) -> int:
+        """Returns the minimum number of votes required for leader election: floor(N/2) + 1."""
+        voters = self.load_voting_members()
+        n = len(voters)
+        return max(1, (n // 2) + 1)
+
+    @property
+    def voting_members(self) -> List[Dict[str, Any]]:
+        """Returns a list of all configured voting members."""
+        return list(self.load_voting_members().values())
+
+    def handle_vote_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Raft RequestVote consensus protocol handler.
+        Evaluates candidate term, freshness, and monotonic single-vote rule.
+        """
+        with self._lock:
+            candidate_term = int(payload.get("term", 0))
+            candidate_id = str(payload.get("candidate_id", ""))
+            candidate_url = str(payload.get("candidate_url", ""))
+            candidate_version = int(payload.get("last_state_version", 0))
+            reason = payload.get("reason", "")
+
+            # 1. Rule: Candidate term must be >= local term
+            if candidate_term < self.current_term:
+                controller_logger.info(
+                    "HA_VOTE_REJECT",
+                    "Rejected vote for %s: candidate term %d < local term %d",
+                    candidate_id, candidate_term, self.current_term
+                )
+                return {
+                    "term": self.current_term,
+                    "vote_granted": False,
+                    "reason": f"Candidate term {candidate_term} is older than local term {self.current_term}"
+                }
+
+            # 2. If candidate term > local term, adopt higher term and step down
+            if candidate_term > self.current_term:
+                controller_logger.info(
+                    "HA_VOTE",
+                    "Adopting newer election term %d from candidate %s (was %d)",
+                    candidate_term, candidate_id, self.current_term
+                )
+                self.current_lease.term = candidate_term
+                self.current_lease.save_to_file(self.lease_file)
+                self.voted_for = None
+                self._save_election_state(candidate_term, None)
+                if self.state == HAState.LEADER:
+                    self.step_down(candidate_term, candidate_id, candidate_url)
+                elif self.state == HAState.CANDIDATE:
+                    self.state = HAState.STANDBY
+
+            # 3. Verify voter authorization (candidate must be in voting members or valid cluster node)
+            voters = self.load_voting_members()
+            if voters and candidate_id not in voters:
+                is_known_voter = False
+                try:
+                    from controller.stores import load_nodes_db
+                    nodes_db = load_nodes_db(paths=self.paths)
+                    node_entry = nodes_db.get("nodes", {}).get(candidate_id)
+                    if node_entry and node_entry.get("leader_eligible", True):
+                        is_known_voter = True
+                except Exception:
+                    pass
+                if not is_known_voter:
+                    return {
+                        "term": self.current_term,
+                        "vote_granted": False,
+                        "reason": f"Candidate '{candidate_id}' is not an authorized voting member"
+                    }
+
+            # 4. Monotonic single-vote rule: cannot vote for two different candidates in the same term
+            if self.voted_for is not None and self.voted_for != candidate_id:
+                controller_logger.info(
+                    "HA_VOTE_REJECT",
+                    "Rejected vote for %s: already voted for %s in term %d",
+                    candidate_id, self.voted_for, self.current_term
+                )
+                return {
+                    "term": self.current_term,
+                    "vote_granted": False,
+                    "reason": f"Already voted for '{self.voted_for}' in term {self.current_term}"
+                }
+
+            # 5. State freshness check: candidate's state version must not lag behind local state version
+            if candidate_version < self.state_version:
+                controller_logger.info(
+                    "HA_VOTE_REJECT",
+                    "Rejected vote for %s: candidate state version %d < local state version %d",
+                    candidate_id, candidate_version, self.state_version
+                )
+                return {
+                    "term": self.current_term,
+                    "vote_granted": False,
+                    "reason": f"Candidate state version {candidate_version} lags behind local version {self.state_version}"
+                }
+
+            # Grant vote!
+            self.voted_for = candidate_id
+            self._save_election_state(self.current_term, self.voted_for)
+            controller_logger.info(
+                "HA_VOTE_GRANTED",
+                "Granted vote to candidate %s at %s for term %d (Reason: %s)",
+                candidate_id, candidate_url, self.current_term, reason
+            )
+            return {
+                "term": self.current_term,
+                "vote_granted": True,
+                "reason": f"Vote granted for term {self.current_term}"
+            }
+
+    def campaign_for_leadership(self, reason: str = "Quorum election") -> bool:
+        """
+        Executes Raft-style RequestVote election requiring strict majority quorum.
+        Solicits votes from voting members. Promotes to LEADER only if votes >= quorum.
+        """
+        with self._lock:
+            if self.state == HAState.LEADER and self.current_lease.is_valid():
+                return True
+
+            new_term = self.current_term + 1
+            self.state = HAState.CANDIDATE
+            self.current_lease.term = new_term
+            self.current_lease.save_to_file(self.lease_file)
+            self.voted_for = self.node_id
+            self._save_election_state(new_term, self.voted_for)
+
+            voters = self.load_voting_members()
+            target_quorum = self.quorum_size
+            snapshot_version = self.state_version
+            token = self.auth_token
+
+            # Local node self-vote
+            votes = 1
+            granted_by = [self.node_id]
+
+            remote_voters = [
+                v for vid, v in voters.items()
+                if vid != self.node_id and not is_local_url(v.get("url", ""), self.node_url)
+            ]
+
+        controller_logger.info(
+            "HA_ELECTION_START",
+            "Node %s campaigning for LEADER (Term %d, Quorum needed: %d/%d). Reason: %s",
+            self.node_id, new_term, target_quorum, len(voters), reason
+        )
+
+        # 2. Solicit votes OUTSIDE lock
+        payload_bytes = json.dumps({
+            "term": new_term,
+            "candidate_id": self.node_id,
+            "candidate_url": self.node_url,
+            "last_state_version": snapshot_version,
+            "reason": reason
+        }).encode("utf-8")
+
+        for voter in remote_voters:
+            v_url = voter.get("url", "").rstrip("/")
+            if not v_url:
+                continue
+            v_id = voter.get("node_id", v_url)
+            vote_req = urllib.request.Request(
+                f"{v_url}/ha/vote",
+                data=payload_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "PersonalServer-HAConsensus/1.0",
+                    "Authorization": f"Bearer {token}" if token else ""
+                },
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(vote_req, timeout=2.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data.get("vote_granted") is True:
+                            votes += 1
+                            granted_by.append(v_id)
+                            controller_logger.info("HA_VOTE_RECEIVED", "Received vote from %s (Total: %d/%d)", v_id, votes, target_quorum)
+                        elif data.get("term", 0) > new_term:
+                            higher_term = data["term"]
+                            controller_logger.warning("HA_ELECTION_ABORT", "Discovered higher term %d from %s. Aborting campaign.", higher_term, v_id)
+                            with self._lock:
+                                self.current_lease.term = higher_term
+                                self.current_lease.save_to_file(self.lease_file)
+                                self.state = HAState.STANDBY
+                                self._save_election_state(higher_term, None)
+                            return False
+            except Exception as e:
+                controller_logger.info("HA_VOTE_UNAVAILABLE", "Could not reach voter %s (%s): %s", v_id, v_url, e)
+
+        # 3. Evaluate quorum outcome under lock
+        with self._lock:
+            if self.current_term != new_term or self.state != HAState.CANDIDATE:
+                controller_logger.warning("HA_ELECTION_STALE", "Election term or state changed during voting. Aborting.")
+                return False
+
+            if votes >= target_quorum:
+                now = time.time()
+                self.current_lease = LeaderLease(
+                    term=new_term,
+                    leader_id=self.node_id,
+                    leader_url=self.node_url,
+                    lease_expires_at=now + self.lease_duration_sec,
+                    state_version=self.state_version,
+                    last_renewed_at=get_current_iso_timestamp()
+                )
+                self.current_lease.save_to_file(self.lease_file)
+                self.state = HAState.LEADER
+                self.missed_checks = 0
+
+                self.last_transition = {
+                    "timestamp": get_current_iso_timestamp(),
+                    "reason": f"Quorum election ({votes}/{target_quorum} votes from {granted_by})",
+                    "from_node": self.current_leader_id if self.current_leader_id != self.node_id else None,
+                    "to_node": self.node_id,
+                    "term": new_term
+                }
+
+                controller_logger.info(
+                    "HA_PROMOTION_SUCCESS",
+                    "QUORUM ACHIEVED (%d/%d votes: %s). Node %s is now active LEADER (Term %d).",
+                    votes, target_quorum, granted_by, self.node_id, new_term
+                )
+
+                if not self._is_running:
+                    self.start_monitor()
+
+                if self.on_promotion_callback:
+                    try:
+                        self.on_promotion_callback()
+                    except Exception as e:
+                        controller_logger.error("HA_CALLBACK_ERROR", "Error in on_promotion_callback: %s", e)
+
+                self._broadcast_state_replication_async()
+                return True
+            else:
+                self.state = HAState.STANDBY
+                controller_logger.warning(
+                    "HA_QUORUM_LOST",
+                    "Quorum NOT reached (%d/%d votes: %s). Node %s cannot assume leadership. Holding STANDBY.",
+                    votes, target_quorum, granted_by, self.node_id
+                )
+                return False
+
+    def _broadcast_state_replication_async(self):
+        """Asynchronously notifies standby controllers of updated state."""
+        def _do_broadcast():
+            try:
+                voters = self.load_voting_members()
+                snapshot = self.export_state_snapshot()
+                payload_bytes = json.dumps(snapshot).encode("utf-8")
+                token = self.auth_token
+                for vid, v in voters.items():
+                    if vid == self.node_id:
+                        continue
+                    v_url = v.get("url", "").rstrip("/")
+                    if not v_url or is_local_url(v_url, self.node_url):
+                        continue
+                    req = urllib.request.Request(
+                        f"{v_url}/ha/replicate",
+                        data=payload_bytes,
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "PersonalServer-HAReplication/1.0",
+                            "Authorization": f"Bearer {token}" if token else ""
+                        },
+                        method="POST"
+                    )
+                    try:
+                        with urllib.request.urlopen(req, timeout=2.0) as resp:
+                            pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_do_broadcast, daemon=True, name="HAReplicationThread").start()
 
     def initialize(self):
         """Initializes HA state, discovering active leader or claiming initial lease."""
@@ -579,12 +1011,13 @@ class HAManager:
                     )
 
     def bump_state_version(self) -> int:
-        """Increments state version when cluster databases (nodes, jobs, apps) change."""
+        """Increments state version when cluster databases change."""
         with self._lock:
             self.state_version += 1
             if self.state == HAState.LEADER:
                 self.current_lease.state_version = self.state_version
                 self.current_lease.save_to_file(self.lease_file)
+                self._broadcast_state_replication_async()
             return self.state_version
 
     def renew_lease(self) -> bool:
@@ -710,12 +1143,17 @@ class HAManager:
             p = getattr(self, "paths", None) or get_controller_paths()
             p.ensure_directories()
             from controller.stores.base import atomic_save_json
-            for key, target_path, backup_path in [
+            stores_to_sync = [
                 ("nodes", p.nodes_file, p.backup_nodes_file),
                 ("jobs", p.jobs_file, p.backup_jobs_file),
                 ("apps", p.apps_file, p.backup_apps_file),
+                ("workflows", p.workflows_file, p.backup_workflows_file),
+                ("shares", p.shares_file, p.backup_shares_file),
+                ("artifacts", p.artifacts_file, p.backup_artifacts_file),
                 ("onboarding_codes", p.onboarding_codes_file, p.backup_onboarding_codes_file),
-            ]:
+                ("voters", getattr(p, "voters_file", p.data_dir / "voters.json"), getattr(p, "backup_voters_file", p.data_dir / "voters.json.bak")),
+            ]
+            for key, target_path, backup_path in stores_to_sync:
                 if key in payload and payload[key] is not None:
                     atomic_save_json(target_path, backup_path, payload[key], bump_ha=False)
 
@@ -770,7 +1208,11 @@ class HAManager:
                 "nodes": read_json_safe(p.nodes_file, {"cluster_name": "PersonalServer", "nodes": {}}),
                 "jobs": read_json_safe(p.jobs_file, {"jobs": {}}),
                 "apps": read_json_safe(p.apps_file, {"applications": {}}),
+                "workflows": read_json_safe(p.workflows_file, {"workflows": {}}),
+                "shares": read_json_safe(p.shares_file, {"shares": {}}),
+                "artifacts": read_json_safe(p.artifacts_file, {"artifacts": {}}),
                 "onboarding_codes": read_json_safe(p.onboarding_codes_file, {"codes": {}}),
+                "voters": read_json_safe(getattr(p, "voters_file", p.data_dir / "voters.json"), {"voters": {}}),
                 "timestamp": get_current_iso_timestamp()
             }
 
@@ -1021,8 +1463,14 @@ class HAManager:
 
                 # Process dead, API error, or unknown failure:
                 if self.missed_checks >= self.max_missed_checks or lease_expired:
-                    # Phase 4 Authority & Promotion Safety Check
-                    if not self.auto_promotion_enabled:
+                    if self.voters_file.exists() or len(self.load_voting_members()) >= 3:
+                        controller_logger.warning(
+                            "HA_FAILOVER_QUORUM",
+                            "Leader failure detected (%s, missed checks: %d). Initiating quorum election!",
+                            failure_mode, self.missed_checks
+                        )
+                        self.campaign_for_leadership(reason=f"Leader failure detected ({failure_mode})")
+                    elif not self.auto_promotion_enabled:
                         controller_logger.warning(
                             "HA_NO_AUTO_PROMOTION",
                             "Remote leader failure detected (%s, missed checks: %d), but auto_promotion_enabled=False. "
@@ -1030,16 +1478,14 @@ class HAManager:
                             failure_mode, self.missed_checks
                         )
                         return
-
-                    if not self.peer_config_valid:
+                    elif not self.peer_config_valid:
                         controller_logger.warning(
                             "HA_FAILOVER_BLOCKED",
                             "Peer configuration is invalid (%s). Cannot promote self; holding STANDBY.",
                             self.peer_config_status
                         )
                         return
-
-                    if failure_mode == HAFailureMode.PROCESS_DEAD:
+                    elif failure_mode == HAFailureMode.PROCESS_DEAD:
                         controller_logger.warning(
                             "HA_FAILOVER",
                             "Leader controller process on %s is CONFIRMED DEAD (host alive, missed checks: %d). Promoting self!",
@@ -1384,6 +1830,11 @@ class HAManager:
             "configured_peers": configured_peers,
             "auto_promotion_enabled": auto_promotion_enabled,
             "authority_mechanism": authority_mechanism,
+            "quorum_size": self.quorum_size,
+            "total_voters": len(self.load_voting_members()),
+            "voters": list(self.load_voting_members().values()),
+            "voted_for": self.voted_for,
+            "consensus_model": "raft_majority_quorum",
             "split_brain_mitigation": "automatic_promotion_disabled" if not auto_promotion_enabled else "active_fencing",
             "standbys_count": standbys_count,
             "standbys": standbys,
