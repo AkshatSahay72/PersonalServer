@@ -173,11 +173,15 @@ def handle_ha_post(handler: Any, path: str, body: Optional[Dict[str, Any]], toke
         return True
 
     if path in ("/ha/vote", "/api/ha/vote"):
+        token = token or handler.parse_auth_token()
         enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+        mgr = get_ha_manager()
+        candidate_id = (body or {}).get("candidate_id")
+        voters = mgr.load_voting_members()
+        is_known_voter = bool(candidate_id and candidate_id in voters)
+        if not is_known_voter and not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
             handler.send_json(401, {"error": "Unauthorized: Authentication required to vote in HA election"})
             return True
-        mgr = get_ha_manager()
         res = mgr.handle_vote_request(body or {})
         handler.send_json(200, res)
         return True
@@ -221,8 +225,13 @@ def handle_ha_post(handler: Any, path: str, body: Optional[Dict[str, Any]], toke
         return True
 
     if path in ("/ha/replicate", "/api/ha/replicate"):
+        token = token or handler.parse_auth_token()
         enrollment_token = get_or_create_enrollment_token()
-        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+        mgr = get_ha_manager()
+        leader_id = (body or {}).get("leader_id")
+        voters = mgr.load_voting_members()
+        is_known_voter = bool(leader_id and leader_id in voters)
+        if not is_known_voter and not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
             handler.send_json(401, {"error": "Unauthorized: Authentication required for HA state replication"})
             return True
         mgr = get_ha_manager()
