@@ -467,7 +467,7 @@ class HAManager:
         self._eval_seq: int = 0
 
         # State fields
-        self.state: str = HAState.STANDBY if self.configured_role == "standby" else HAState.LEADER
+        self.state: str = HAState.STANDBY if self.configured_role in ("standby", "auto") else HAState.LEADER
         self.current_lease: LeaderLease = LeaderLease.load_from_file(self.lease_file)
         self.state_version: int = self.current_lease.state_version
         self._load_election_state()
@@ -1362,22 +1362,42 @@ class HAManager:
                             controller_logger.error("HA_CALLBACK_ERROR", "Error in on_demotion_callback: %s", e)
                     self._eval_in_progress = False
                     return
-                # Renew local lease
-                self.renew_lease()
+
+                snapshot_term = self.current_term
+                candidates = list(self.candidate_urls)
+                local_url = self.node_url
+
+            elif self.state not in (HAState.STANDBY, HAState.FENCED):
                 self._eval_in_progress = False
                 return
+            else:
+                snapshot_term = self.current_term
+                snapshot_state = self.state
+                snapshot_leader_id = self.current_leader_id
+                snapshot_leader_url = self.current_leader_url
+                snapshot_version = self.state_version
+                candidates = list(self.candidate_urls)
+                local_url = self.node_url
 
-            if self.state not in (HAState.STANDBY, HAState.FENCED):
+        # Check if local node is leader and should check for higher term split-brain (e.g. partition healing)
+        if self.is_leader:
+            discovered_url, leader_info = find_active_leader(candidates, exclude_url=local_url)
+            if discovered_url and leader_info and leader_info.get("term", 0) > snapshot_term:
+                remote_term = leader_info["term"]
+                remote_id = leader_info.get("leader_id", "")
+                controller_logger.warning(
+                    "HA_DEMOTION",
+                    "Discovered active leader %s with higher term %d (local term %d). Demoting to STANDBY.",
+                    remote_id, remote_term, snapshot_term
+                )
+                self.step_down(remote_term, remote_id, discovered_url)
                 self._eval_in_progress = False
                 return
-
-            snapshot_term = self.current_term
-            snapshot_state = self.state
-            snapshot_leader_id = self.current_leader_id
-            snapshot_leader_url = self.current_leader_url
-            snapshot_version = self.state_version
-            candidates = list(self.candidate_urls)
-            local_url = self.node_url
+            with self._lock:
+                if self.state == HAState.LEADER:
+                    self.renew_lease()
+                self._eval_in_progress = False
+                return
 
         # 2. Network probe OUTSIDE the lock (Phase 2)
         try:
@@ -1886,8 +1906,12 @@ def find_active_leader(
                     data = json.loads(resp.read().decode("utf-8"))
                     if data.get("role") == HAState.LEADER and data.get("lease_valid", True):
                         return url, data
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                ha_responded.add(url)
         except Exception:
-            pass
+            # Connection refused, timeout, or unreachable: mark so we don't redundantly probe /health
+            ha_responded.add(url)
 
     # Fallback: check /health ONLY on candidates whose /ha/status did not answer (legacy non-HA controller).
     # Never promote a controller whose /ha/status explicitly reported STANDBY/non-leader.
