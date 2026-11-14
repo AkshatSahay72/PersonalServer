@@ -218,6 +218,49 @@ class LeaderLease:
         return cls()
 
 
+def is_local_url(url: str, local_node_url: Optional[str] = None) -> bool:
+    """Returns True if url points to the exact same controller process as local_node_url."""
+    if not url or not local_node_url:
+        return False
+    try:
+        u_clean = url.rstrip("/").lower()
+        l_clean = local_node_url.rstrip("/").lower()
+        if u_clean == l_clean:
+            return True
+
+        parsed = urllib.parse.urlparse(u_clean)
+        local_parsed = urllib.parse.urlparse(l_clean)
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        local_port = local_parsed.port or (443 if local_parsed.scheme == "https" else 80)
+        if port != local_port:
+            return False
+
+        host = (parsed.hostname or "").lower()
+        local_host = (local_parsed.hostname or "").lower()
+        if host == local_host:
+            return True
+
+        # Check if both hosts are local loopback or machine IPs
+        local_ips = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+        try:
+            hostname = socket.gethostname().lower()
+            local_ips.add(hostname)
+            for ip in socket.gethostbyname_ex(hostname)[2]:
+                local_ips.add(ip)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("10.255.255.255", 1))
+                local_ips.add(s.getsockname()[0])
+        except Exception:
+            pass
+
+        if host in local_ips and local_host in local_ips:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def validate_peer_configuration(
     candidate_urls: List[str],
     local_node_url: str
@@ -245,7 +288,7 @@ def validate_peer_configuration(
         except Exception as e:
             return False, f"invalid_url: Failed to parse '{u}': {e}", []
 
-        if u.lower() != clean_local:
+        if u.lower() != clean_local and not is_local_url(u, local_node_url):
             if u not in remote_peers:
                 remote_peers.append(u)
 
@@ -268,9 +311,9 @@ class HAManager:
         node_url: Optional[str] = None,
         candidate_urls: Optional[List[str]] = None,
         role: str = "auto",
-        lease_duration_sec: float = 10.0,
-        heartbeat_interval_sec: float = 3.0,
-        check_interval_sec: float = 2.0,
+        lease_duration_sec: float = 60.0,
+        heartbeat_interval_sec: float = 5.0,
+        check_interval_sec: float = 5.0,
         paths=None,
         auth_token: Optional[str] = None,
         on_promotion_callback: Optional[Callable[[], None]] = None,
@@ -284,24 +327,31 @@ class HAManager:
         self.lease_file = getattr(self.paths, "leader_lease_file", self.paths.data_dir / "leader_lease.json")
 
         self.node_id = resolve_controller_node_id(node_id=node_id, paths=self.paths)
-        self.node_url = str(node_url or "http://127.0.0.1:8000").rstrip("/")
+
+        # Load node.conf configuration
+        node_conf = getattr(self.paths, "config_dir", BASE_DIR / "config") / "node.conf"
+        conf_data: Dict[str, str] = {}
+        if node_conf.exists():
+            try:
+                with open(node_conf, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if "=" in line and not line.startswith("#"):
+                            k, v = line.split("=", 1)
+                            conf_data[k.strip()] = v.strip().strip('"').strip("'")
+            except Exception:
+                pass
+
+        if not node_url:
+            conf_node_url = os.environ.get("PERSONALSERVER_NODE_URL") or conf_data.get("PERSONALSERVER_NODE_URL")
+            node_url = conf_node_url or "http://127.0.0.1:8000"
+        self.node_url = str(node_url).rstrip("/")
         
         # Load candidate URLs from args or environment or node.conf
-        env_candidates = os.environ.get("PERSONALSERVER_CONTROLLER_URLS", "")
-        if not env_candidates:
-            node_conf = getattr(self.paths, "config_dir", BASE_DIR / "config") / "node.conf"
-            if node_conf.exists():
-                try:
-                    with open(node_conf, "r", encoding="utf-8") as f:
-                        for line in f:
-                            if line.strip().startswith("PERSONALSERVER_CONTROLLER_URLS="):
-                                env_candidates = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            elif not env_candidates and line.strip().startswith("CONTROLLER_URL="):
-                                c_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                                if c_url:
-                                    env_candidates = c_url
-                except Exception:
-                    pass
+        env_candidates = os.environ.get("PERSONALSERVER_CONTROLLER_URLS", "") or conf_data.get("PERSONALSERVER_CONTROLLER_URLS", "")
+        if not env_candidates and conf_data.get("CONTROLLER_URL"):
+            env_candidates = conf_data.get("CONTROLLER_URL", "")
+
         parsed_candidates = [u.strip().rstrip("/") for u in env_candidates.split(",") if u.strip()]
         self.candidate_urls: List[str] = list(candidate_urls or parsed_candidates or [self.node_url])
         if self.node_url not in self.candidate_urls:
@@ -312,8 +362,25 @@ class HAManager:
             self.candidate_urls, self.node_url
         )
 
+        env_role = os.environ.get("PERSONALSERVER_HA_ROLE") or conf_data.get("PERSONALSERVER_HA_ROLE")
+        if role == "auto" and env_role:
+            role = env_role
         self.configured_role = role.lower()  # "leader", "standby", or "auto"
+
+        conf_lease_dur = os.environ.get("PERSONALSERVER_HA_LEASE_DURATION") or conf_data.get("PERSONALSERVER_HA_LEASE_DURATION")
+        if conf_lease_dur:
+            try:
+                lease_duration_sec = float(conf_lease_dur)
+            except ValueError:
+                pass
         self.lease_duration_sec = float(lease_duration_sec)
+
+        conf_hb_int = os.environ.get("PERSONALSERVER_HA_HEARTBEAT_INTERVAL") or conf_data.get("PERSONALSERVER_HA_HEARTBEAT_INTERVAL")
+        if conf_hb_int:
+            try:
+                heartbeat_interval_sec = float(conf_hb_int)
+            except ValueError:
+                pass
         self.heartbeat_interval_sec = float(heartbeat_interval_sec)
         self.check_interval_sec = float(check_interval_sec)
         self.auth_token = auth_token
@@ -490,7 +557,7 @@ class HAManager:
                 controller_logger.info("HA_INIT", "HAManager discovered active leader at %s. Running as STANDBY.", active_url)
             else:
                 # No active leader found on network
-                if self.auto_promotion_enabled:
+                if self.auto_promotion_enabled or (disk_lease.leader_id == self.node_id and self.configured_role in ("leader", "auto")):
                     new_term = max(1, disk_lease.term + (1 if disk_lease.leader_id != self.node_id else 0))
                     self.state = HAState.LEADER
                     self.current_lease = LeaderLease(
@@ -501,7 +568,7 @@ class HAManager:
                         state_version=max(self.state_version, disk_lease.state_version)
                     )
                     self.current_lease.save_to_file(self.lease_file)
-                    controller_logger.info("HA_INIT", "No remote leader found. Auto-promotion enabled: elected self as LEADER (Term %d).", new_term)
+                    controller_logger.info("HA_INIT", "No remote leader found. Prior leader was self or auto-promotion enabled: elected self as LEADER (Term %d).", new_term)
                 else:
                     self.state = HAState.STANDBY
                     self.current_lease = disk_lease
@@ -556,6 +623,10 @@ class HAManager:
             self.current_lease.save_to_file(self.lease_file)
             self.state = HAState.LEADER
             self.missed_checks = 0
+
+            # Ensure monitor thread is running to actively renew the lease
+            if not self._is_running:
+                self.start_monitor()
 
             # Execute promotion hook
             if self.on_promotion_callback:
@@ -749,7 +820,7 @@ class HAManager:
         Returns: (is_alive: bool, failure_mode: str, status_data: Optional[dict], resolved_leader_url: Optional[str])
         """
         resolved_url = leader_url
-        if not resolved_url or resolved_url == local_node_url:
+        if not resolved_url or resolved_url == local_node_url or is_local_url(resolved_url, local_node_url):
             discovered_url, leader_info = find_active_leader(candidate_urls, exclude_url=local_node_url)
             if discovered_url:
                 resolved_url = discovered_url
@@ -834,7 +905,8 @@ class HAManager:
 
             if self.state == HAState.LEADER:
                 # Check if current lease has expired without renewal (self-fencing)
-                if not self.current_lease.is_valid():
+                # 5-second grace window to absorb system load and lock contention
+                if not self.current_lease.is_valid(grace_sec=5.0):
                     controller_logger.warning(
                         "HA_FENCED",
                         "Leader lease expired for %s (Term %d). Self-fencing local controller to prevent split-brain.",
@@ -1336,7 +1408,7 @@ def find_active_leader(
     ha_responded = set()
     for raw_url in candidate_urls:
         url = raw_url.rstrip("/")
-        if exclude_url and url == exclude_url.rstrip("/"):
+        if (exclude_url and url == exclude_url.rstrip("/")) or is_local_url(url, exclude_url):
             continue
 
         endpoint = f"{url}/ha/status"
@@ -1355,7 +1427,7 @@ def find_active_leader(
     # Never promote a controller whose /ha/status explicitly reported STANDBY/non-leader.
     for raw_url in candidate_urls:
         url = raw_url.rstrip("/")
-        if (exclude_url and url == exclude_url.rstrip("/")) or url in ha_responded:
+        if (exclude_url and url == exclude_url.rstrip("/")) or is_local_url(url, exclude_url) or url in ha_responded:
             continue
         try:
             req = urllib.request.Request(f"{url}/health", headers={"User-Agent": "PersonalServer-HAFinder/1.0"})

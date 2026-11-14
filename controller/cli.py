@@ -114,9 +114,25 @@ def start_server(host: Optional[str] = None, port: Optional[int] = None, timeout
     start_background_lease_sweeper(timeout, paths=paths)
 
     # Initialize High Availability (HA) Manager
-    ha_role = role or os.environ.get("PERSONALSERVER_HA_ROLE", "auto")
+    def _read_node_conf_val(key: str) -> Optional[str]:
+        val = os.environ.get(key)
+        if val and val.strip():
+            return val.strip().strip('"').strip("'")
+        conf_path = paths.config_dir / "node.conf"
+        if conf_path.exists():
+            try:
+                for line in conf_path.read_text(encoding="utf-8").splitlines():
+                    s = line.strip()
+                    if s.startswith(f"{key}="):
+                        return s.split("=", 1)[1].strip().strip('"').strip("'")
+            except Exception:
+                pass
+        return None
+
+    ha_role = role or _read_node_conf_val("PERSONALSERVER_HA_ROLE") or "auto"
     ha_node_id = resolve_controller_node_id(node_id=None, paths=paths)
-    ha_node_url = f"http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}"
+    configured_node_url = _read_node_conf_val("PERSONALSERVER_NODE_URL")
+    ha_node_url = configured_node_url or f"http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}"
     ha_mgr = get_ha_manager(paths=paths, role=ha_role, node_id=ha_node_id, node_url=ha_node_url, force_reload=True)
     ha_mgr.initialize()
     ha_mgr.start_monitor()
