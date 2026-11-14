@@ -1437,8 +1437,11 @@ class HAManager:
                     from controller.stores import load_nodes_db
                     from controller.leader_ranking import rank_leader_candidates
                     ndb = load_nodes_db(paths=self.paths)
+                    current_node_data = ndb.get("nodes", {}).get(self.node_id, {})
+                    from controller.leader_ranking import calculate_node_performance_score
+                    self.performance_score = calculate_node_performance_score(current_node_data)
                     ranked = rank_leader_candidates(ndb.get("nodes", {}), current_leader_id=self.node_id)
-                    if ranked and ranked[0][0] != self.node_id and ranked[0][1] > (self.performance_score + 10.0):
+                    if ranked and ranked[0][0] != self.node_id and ranked[0][1] > (self.performance_score + 15.0):
                         top_id = ranked[0][0]
                         if getattr(self, "_higher_merit_candidate", None) == top_id:
                             self._consecutive_higher_merit_checks += 1
