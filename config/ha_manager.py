@@ -1454,6 +1454,17 @@ class HAManager:
 
                 if failure_mode == HAFailureMode.NETWORK_PARTITION:
                     self.consecutive_partition_events += 1
+                    # In a 3-voter cluster with quorum, if the leader is partitioned/dead and lease is expired or checks missed,
+                    # initiate quorum election. The isolated minority will fail quorum (1 < 2), while the majority will achieve quorum!
+                    if (self.voters_file.exists() or len(self.load_voting_members()) >= 3) and (lease_expired or self.missed_checks >= self.max_missed_checks):
+                        controller_logger.warning(
+                            "HA_PARTITION_QUORUM",
+                            "Leader unreachable for %d checks (lease expired: %s). Initiating quorum election!",
+                            self.missed_checks, lease_expired
+                        )
+                        self.campaign_for_leadership(reason="Leader partitioned or lease expired")
+                        return
+
                     controller_logger.warning(
                         "HA_PARTITION",
                         "Suspected network/Tailscale partition to leader %s (consecutive: %d). Holding STANDBY to prevent split-brain.",
