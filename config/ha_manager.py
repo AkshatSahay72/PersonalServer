@@ -1714,8 +1714,12 @@ class HAManager:
             except Exception as e:
                 controller_logger.error("HA_ERROR", "Error in HA monitor loop: %s", e)
 
-            # Sleep interval depends on role
-            interval = self.heartbeat_interval_sec if self.is_leader else self.check_interval_sec
+            # Sleep interval depends on role; add randomized jitter for standbys to prevent election split votes
+            if self.is_leader:
+                interval = self.heartbeat_interval_sec
+            else:
+                jitter = secrets.randbelow(1500) / 1000.0  # 0 to 1.5s randomized jitter
+                interval = self.check_interval_sec + jitter
             self._stop_event.wait(timeout=interval)
 
     def resolve_leader_name(self, leader_id: Optional[str], nodes: Optional[Dict[str, Any]] = None) -> Tuple[str, bool, bool]:
