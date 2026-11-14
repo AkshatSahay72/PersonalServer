@@ -939,19 +939,6 @@ class HAManager:
                 controller_logger.info("HA_INIT", "HAManager initialized as STANDBY")
                 return
 
-            # If local node already holds a valid, unexpired on-disk lease for itself,
-            # resume active leadership without claiming an uncoordinated new lease.
-            if disk_lease.is_valid() and disk_lease.leader_id == self.node_id:
-                self.state = HAState.LEADER
-                self.current_lease = disk_lease
-                self.state_version = max(self.state_version, disk_lease.state_version)
-                controller_logger.info(
-                    "HA_INIT",
-                    "Resumed existing active LEADER lease from disk (Term %d, Version %d).",
-                    self.current_lease.term, self.state_version
-                )
-                return
-
             # Role == "auto": snapshot parameters needed for probe outside lock
             peer_valid = self.peer_config_valid
             peer_status = self.peer_config_status
@@ -988,8 +975,17 @@ class HAManager:
                 self.current_lease.save_to_file(self.lease_file)
                 controller_logger.info("HA_INIT", "HAManager discovered active leader at %s. Running as STANDBY.", active_url)
             else:
-                # No active leader found on network
-                if self.auto_promotion_enabled or (disk_lease.leader_id == self.node_id and self.configured_role in ("leader", "auto")):
+                # No active leader found on network: check if local disk lease was valid for self
+                if disk_lease.is_valid() and disk_lease.leader_id == self.node_id:
+                    self.state = HAState.LEADER
+                    self.current_lease = disk_lease
+                    self.state_version = max(self.state_version, disk_lease.state_version)
+                    controller_logger.info(
+                        "HA_INIT",
+                        "No remote leader found. Resumed existing active LEADER lease from disk (Term %d, Version %d).",
+                        self.current_lease.term, self.state_version
+                    )
+                elif self.auto_promotion_enabled or (disk_lease.leader_id == self.node_id and self.configured_role in ("leader", "auto")):
                     new_term = max(1, disk_lease.term + (1 if disk_lease.leader_id != self.node_id else 0))
                     self.state = HAState.LEADER
                     self.current_lease = LeaderLease(
