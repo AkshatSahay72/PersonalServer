@@ -423,18 +423,18 @@ class HAManager:
         self.check_interval_sec = float(check_interval_sec)
         self.auth_token = auth_token
         if not self.auth_token:
-            et_file = getattr(self.paths, "enrollment_token_file", self.paths.secrets_dir / "enrollment.token")
-            if et_file.exists():
+            reg_file = getattr(self.paths, "runtime_dir", BASE_DIR / "runtime") / "registration.json"
+            if reg_file.exists():
                 try:
-                    self.auth_token = et_file.read_text(encoding="utf-8").strip()
+                    with open(reg_file, "r", encoding="utf-8") as f:
+                        self.auth_token = json.load(f).get("auth_token")
                 except Exception:
                     pass
             if not self.auth_token:
-                reg_file = getattr(self.paths, "runtime_dir", BASE_DIR / "runtime") / "registration.json"
-                if reg_file.exists():
+                et_file = getattr(self.paths, "enrollment_token_file", self.paths.secrets_dir / "enrollment.token")
+                if et_file.exists():
                     try:
-                        with open(reg_file, "r", encoding="utf-8") as f:
-                            self.auth_token = json.load(f).get("auth_token")
+                        self.auth_token = et_file.read_text(encoding="utf-8").strip()
                     except Exception:
                         pass
 
