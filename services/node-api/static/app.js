@@ -501,12 +501,48 @@ async function loadDashboard() {
 }
 
 // High Availability (HA) Status & Failover Controller
+let cachedClusterState = null;
 let cachedHAStatus = null;
 let isUpdatingHA = false;
 let lastHAUpdateTimestamp = 0;
 let haUpdatePromise = null;
 
 function resolveLeaderInfo(ha) {
+  // If unified cluster state contract is available, strictly adhere to its authoritative leader
+  if (typeof cachedClusterState !== "undefined" && cachedClusterState && cachedClusterState.leader) {
+    const ldr = cachedClusterState.leader;
+    const isLeaseValid = ldr.lease_valid === true;
+    const hasLeader = !!ldr.node_id && isLeaseValid;
+    const leaderName = ldr.name || (hasLeader ? ldr.node_id : "Electing...");
+    const isLocal = ldr.is_local === true;
+
+    if (!hasLeader) {
+      return {
+        rawLeaderId: null,
+        leaderName: "Electing...",
+        isRegistered: false,
+        isOnline: false,
+        isVerified: false,
+        displayText: "Electing...",
+        statusText: "Election",
+        dotClass: "ha-dot-election",
+        badgeClass: "ha-status-election"
+      };
+    }
+
+    return {
+      rawLeaderId: ldr.node_id,
+      leaderName: leaderName,
+      isRegistered: true,
+      isOnline: true,
+      isVerified: true,
+      displayText: leaderName,
+      statusText: isLocal ? "Active" : "Active (Mesh)",
+      dotClass: "ha-dot-active",
+      badgeClass: "ha-status-active"
+    };
+  }
+
   if (!ha || typeof ha !== "object") {
     return {
       rawLeaderId: null,
@@ -1014,6 +1050,17 @@ async function updateHAStatus(force = false) {
   isUpdatingHA = true;
   haUpdatePromise = (async () => {
     try {
+      // 1. Authoritative Cluster State Contract
+      try {
+        const clusterState = await apiFetch("/api/cluster/state");
+        if (clusterState && clusterState.leader) {
+          cachedClusterState = clusterState;
+          if (Array.isArray(clusterState.nodes) && clusterState.nodes.length > 0) {
+            cachedNodes = clusterState.nodes.filter(n => n.status !== "REMOVED");
+          }
+        }
+      } catch (_) {}
+
       if (!cachedNodes || cachedNodes.length === 0) {
         try {
           const clusterRes = await apiFetch("/api/cluster");
@@ -1195,15 +1242,16 @@ function renderLeaderManagementUI(haStatus, nodes) {
   const transReasonEl = document.getElementById("leader-ui-last-transition-reason");
   const transTimeEl = document.getElementById("leader-ui-last-transition-time");
 
-  const leaderId = haStatus?.leader_id || "";
+  const authLeader = cachedClusterState?.leader;
+  const isLeaseValid = (authLeader?.lease_valid !== undefined) ? authLeader.lease_valid : !!haStatus?.lease_valid;
+  const leaderId = authLeader?.node_id || haStatus?.leader_id || "";
   const leaderNode = (nodes || []).find(n => n.node_id === leaderId);
-  const leaderName = haStatus?.leader_name || (leaderNode ? leaderNode.name : (leaderId || "Unknown"));
+  const leaderName = authLeader?.name || haStatus?.leader_name || (leaderNode ? leaderNode.name : (leaderId || (isLeaseValid ? "Leader" : "Electing...")));
 
   if (leaderNameEl) leaderNameEl.textContent = leaderName;
-  if (leaderIdEl) leaderIdEl.textContent = leaderId ? `ID: ${leaderId}` : "No active leader lease";
+  if (leaderIdEl) leaderIdEl.textContent = leaderId ? `ID: ${leaderId}` : (isLeaseValid ? "Authoritative Leader Lease" : "No active leader lease");
   if (termEl) {
-    const isLeaseValid = !!haStatus?.lease_valid;
-    const termVal = haStatus?.term !== undefined ? haStatus.term : "-";
+    const termVal = authLeader?.term !== undefined ? authLeader.term : (haStatus?.term !== undefined ? haStatus.term : "-");
     termEl.className = "mono";
     termEl.innerHTML = `Term ${termVal} · <span style="color: ${isLeaseValid ? '#3fb950' : '#f85149'};">${isLeaseValid ? 'Valid Lease' : 'Fenced / Expired'}</span>`;
   }
@@ -1575,8 +1623,8 @@ async function loadNodes() {
       }
 
       let haTag = "";
-      const isLeaderIdentified = cachedHAStatus && cachedHAStatus.lease_valid !== false && (n.node_id === cachedHAStatus.leader_id || (n.node_id === cachedHAStatus.node_id && cachedHAStatus.role === "leader"));
-      if (isLeaderIdentified) {
+      const isAuthoritativeLeader = (n.is_leader === true) || (cachedClusterState?.leader?.lease_valid && n.node_id === cachedClusterState?.leader?.node_id);
+      if (isAuthoritativeLeader) {
         if (isOnline) {
           haTag = `<span class="node-role-pill leader" title="Active Cluster Leader">Leader</span>`;
         } else {
@@ -1588,9 +1636,19 @@ async function loadNodes() {
         haTag = `<span class="node-role-pill worker" title="Compute Worker">Worker</span>`;
       }
 
+      let meritHtml = "";
+      if (n.merit_score !== undefined && n.merit_score !== null) {
+        if (n.leader_eligible !== false) {
+          meritHtml = `<div class="cell-muted" style="font-size: 11px; margin-top: 2px;">Merit: <span class="mono" style="color: #58a6ff;">${n.merit_score}</span></div>`;
+        } else {
+          const reasonTip = n.ineligibility_reason ? `title="${escapeHtml(n.ineligibility_reason)}"` : "";
+          meritHtml = `<div class="cell-muted" style="font-size: 11px; margin-top: 2px;" ${reasonTip}>Ineligible: <span style="color: #f85149;">${escapeHtml(n.ineligibility_reason || 'Excluded')}</span></div>`;
+        }
+      }
+
       return `
         <tr>
-          <td><strong class="cell-main">${n.name || n.node_id}</strong>${haTag}</td>
+          <td><strong class="cell-main">${n.name || n.node_id}</strong>${haTag}${meritHtml}</td>
           <td>${renderStatusPill(n.status)}</td>
           <td>${batHtml}</td>
           <td>${netHtml}</td>

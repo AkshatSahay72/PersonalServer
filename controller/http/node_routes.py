@@ -47,6 +47,11 @@ from controller.onboarding import (
     revoke_enrollment_session,
     validate_and_consume_onboarding_details,
 )
+from controller.leader_ranking import (
+    apply_default_leadership_metadata,
+    calculate_node_performance_score,
+    evaluate_node_eligibility,
+)
 from controller.stores import load_jobs_db, load_nodes_db, save_jobs_db, save_nodes_db
 from scheduler.scheduler import ResourceScheduler
 
@@ -72,12 +77,154 @@ def _is_private_mesh_request(handler: Any) -> bool:
 
 
 def _require_admin_auth(handler: Any, token: str, err_msg: str) -> bool:
-    """Verifies constant-time admin enrollment credential on sensitive owner routes."""
+    """Verifies constant-time admin enrollment credential or registered node token on sensitive owner routes."""
     enrollment_token = get_or_create_enrollment_token()
-    if not token or not constant_time_compare(token, enrollment_token):
-        handler.send_json(401, {"error": err_msg})
-        return False
-    return True
+    if (token and constant_time_compare(token, enrollment_token)) or (hasattr(handler, "is_authenticated_admin_or_node") and handler.is_authenticated_admin_or_node()):
+        return True
+    handler.send_json(401, {"error": err_msg})
+    return False
+
+
+def build_cluster_state(handler: Any) -> Dict[str, Any]:
+    """
+    Constructs the single authoritative cluster state contract:
+    - cluster_id, state_version, snapshot_timestamp
+    - leader: { node_id, name, term, address, is_local, lease_expires_at, lease_valid, election_mode }
+    - quorum: { voters, healthy_voters, minimum_required, quorum_achieved }
+    - cluster: { total_nodes, online_nodes, active_cores, memory_total_mb, memory_used_mb }
+    - nodes: array of { node_id, name, address, role, status, is_leader, leader_eligible, merit_score, ineligibility_reason, last_heartbeat }
+    - controller: { local_node_id, local_role, local_term, lease_valid }
+    """
+    from config.platform_config import get_controller_paths
+    paths = get_controller_paths()
+    nodes_db = load_nodes_db(paths=paths)
+    jobs_db = load_jobs_db(paths=paths)
+    timeout_sec = getattr(handler, "heartbeat_timeout", 30)
+    sweep_expired_leases(jobs_db, nodes_db, timeout_sec)
+    util = get_cluster_utilization(nodes_db, jobs_db, timeout_sec)
+    summary = get_cluster_summary(nodes_db, timeout_sec)
+    mgr = getattr(handler, "ha_manager", None) or get_ha_manager(paths=paths)
+
+    # Authoritative Leader info
+    leader_id = mgr.current_leader_id
+    leader_name, is_online, is_reg = mgr.resolve_leader_name(leader_id, nodes=nodes_db.get("nodes", {}))
+    lease_valid = bool(mgr.current_lease.is_valid())
+    is_local_leader = bool(mgr.is_leader and lease_valid and (not leader_id or leader_id == mgr.node_id))
+
+    # Display name resolution
+    if is_local_leader and (not leader_name or leader_name in ("None", "unknown", "")):
+        local_node = nodes_db.get("nodes", {}).get(mgr.node_id, {})
+        leader_name = local_node.get("name") or local_node.get("node_name") or mgr.node_id
+
+    leader_obj = {
+        "node_id": (mgr.node_id if is_local_leader else leader_id),
+        "name": leader_name if (leader_id or is_local_leader) else "Electing...",
+        "term": mgr.current_term,
+        "address": (mgr.node_url if is_local_leader else (mgr.current_leader_url or "")),
+        "is_local": is_local_leader,
+        "lease_expires_at": getattr(mgr.current_lease, "lease_expires_at", None) or getattr(mgr.current_lease, "expires_at", None),
+        "lease_valid": lease_valid,
+        "election_mode": getattr(mgr, "cluster_mode", "auto")
+    }
+
+    # Quorum info
+    voters_map = mgr.load_voting_members()
+    voters_list = []
+    healthy_voters_count = 0
+    for vid, vdata in voters_map.items():
+        v_url = vdata.get("url", "")
+        is_healthy = False
+        if vid == mgr.node_id:
+            is_healthy = True
+        else:
+            n_entry = nodes_db.get("nodes", {}).get(vid)
+            if n_entry and n_entry.get("status") == STATE_ONLINE:
+                is_healthy = True
+        if is_healthy:
+            healthy_voters_count += 1
+        voters_list.append({
+            "node_id": vid,
+            "name": vdata.get("name", vid),
+            "url": v_url,
+            "role": vdata.get("role", "voter"),
+            "healthy": is_healthy
+        })
+
+    req_quorum = mgr.quorum_size
+    quorum_achieved = (healthy_voters_count >= req_quorum)
+    quorum_obj = {
+        "voters": voters_list,
+        "healthy_voters": healthy_voters_count,
+        "minimum_required": req_quorum,
+        "quorum_achieved": quorum_achieved
+    }
+
+    # Cluster capacity info
+    cluster_util = util.get("cluster", {})
+    cluster_obj = {
+        "total_nodes": summary.get("cluster", {}).get("total_nodes", 0),
+        "online_nodes": summary.get("cluster", {}).get("online", 0),
+        "active_cores": cluster_util.get("cpu_cores_total", 0),
+        "memory_total_mb": cluster_util.get("memory_total_mb", 0.0),
+        "memory_used_mb": cluster_util.get("memory_used_mb", 0.0)
+    }
+
+    # Nodes array
+    nodes_array = []
+    raw_nodes = nodes_db.get("nodes", {})
+    for nid, raw_node in raw_nodes.items():
+        if raw_node.get("status") == STATE_REMOVED:
+            continue
+        apply_default_leadership_metadata(nid, raw_node)
+        s_node = sanitize_node_record(raw_node, timeout_sec)
+
+        eligible, reason = evaluate_node_eligibility(raw_node, timeout_sec)
+        score = calculate_node_performance_score(raw_node, timeout_sec) if eligible else 0.0
+
+        # Authoritative leader is strictly determined by valid lease matching node_id
+        is_node_leader = bool(lease_valid and (nid == leader_obj["node_id"]))
+
+        addr = raw_node.get("tailscale_ip") or raw_node.get("ip") or raw_node.get("host") or ""
+
+        nodes_array.append({
+            "node_id": nid,
+            "name": raw_node.get("name") or raw_node.get("node_name") or nid,
+            "address": addr,
+            "role": raw_node.get("role", "compute"),
+            "status": s_node.get("status", "UNKNOWN"),
+            "is_leader": is_node_leader,
+            "leader_eligible": eligible,
+            "merit_score": score,
+            "ineligibility_reason": reason,
+            "last_heartbeat": s_node.get("last_heartbeat") or raw_node.get("last_seen") or ""
+        })
+
+    # Sort nodes: leader first, then online by merit score desc, then name asc
+    nodes_array.sort(key=lambda n: (
+        not n["is_leader"],
+        n["status"] != STATE_ONLINE,
+        -n["merit_score"],
+        n["name"].lower()
+    ))
+
+    # Controller status
+    controller_obj = {
+        "local_node_id": mgr.node_id,
+        "local_role": mgr.state,
+        "local_term": mgr.current_term,
+        "lease_valid": lease_valid
+    }
+
+    return {
+        "cluster_id": nodes_db.get("cluster_name", "PersonalServer"),
+        "state_version": getattr(mgr, "state_version", 1),
+        "snapshot_timestamp": get_current_iso_timestamp(),
+        "leader": leader_obj,
+        "quorum": quorum_obj,
+        "cluster": cluster_obj,
+        "nodes": nodes_array,
+        "controller": controller_obj
+    }
 
 
 def _resolve_dynamic_controller_url(handler: Any) -> str:
@@ -206,6 +353,12 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         sweep_expired_leases(jobs_db, nodes_db, handler.heartbeat_timeout)
         util = get_cluster_utilization(nodes_db, jobs_db, handler.heartbeat_timeout)
         handler.send_json(200, util)
+        return True
+
+    # GET /cluster/state or /api/cluster/state
+    if path in ("/cluster/state", "/api/cluster/state"):
+        state = build_cluster_state(handler)
+        handler.send_json(200, state)
         return True
 
     # GET /cluster

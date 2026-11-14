@@ -24,29 +24,37 @@ DEFAULT_WEIGHT_NETWORK = 0.15
 
 # Default per-node role initializations
 DEFAULT_NODE_POLICIES = {
-    # Vivo Y31 (Leader)
+    # In J6 distributed control plane, all registered nodes are eligible peers with default priority 50
     "server-5387a86bf36116b1": {
         "leader_eligible": True,
-        "preferred_leader": True,
-        "priority": 100,
+        "preferred_leader": False,
+        "priority": 50,
         "worker_enabled": True,
         "build_worker_enabled": False,
     },
-    # Realme 5 Pro (Standby / Worker)
+    # Realme 5 Pro (Compute Worker / Controller)
     "server-95bad5ff01424d4c8d184330d6d2e394": {
         "leader_eligible": True,
         "preferred_leader": False,
-        "priority": 90,
+        "priority": 50,
         "worker_enabled": True,
         "build_worker_enabled": False,
     },
-    # Windows Laptop (Aki - Dedicated Compute & Build Worker)
+    # Windows Laptop (Aki - Dedicated Compute, Controller & Build Worker)
     "server-win-c03532e6881c": {
-        "leader_eligible": False,
+        "leader_eligible": True,
         "preferred_leader": False,
-        "priority": 0,
+        "priority": 50,
         "worker_enabled": True,
         "build_worker_enabled": True,
+    },
+    # Vivo V2334 (Phone Worker / Controller)
+    "server-v2334-a531": {
+        "leader_eligible": True,
+        "preferred_leader": False,
+        "priority": 50,
+        "worker_enabled": True,
+        "build_worker_enabled": False,
     }
 }
 
@@ -55,31 +63,80 @@ def apply_default_leadership_metadata(node_id: str, node_data: Dict[str, Any]) -
     """Ensures a node record has all leadership, preference, and worker flags populated."""
     policy = DEFAULT_NODE_POLICIES.get(node_id, {})
     
-    # Check platform heuristics if not in predefined map
     platform = str(node_data.get("platform", "")).lower()
     role = str(node_data.get("role", "")).lower()
     is_windows = "win" in platform
-    is_experimental = (role == "experimental-worker")
-    default_eligible = False if (is_windows or is_experimental) else policy.get("leader_eligible", True)
+    is_worker_only = (role == "worker-only")
     
     if "leader_eligible" not in node_data:
-        node_data["leader_eligible"] = False if is_experimental else policy.get("leader_eligible", default_eligible)
+        node_data["leader_eligible"] = False if is_worker_only else policy.get("leader_eligible", True)
     if "preferred_leader" not in node_data:
         node_data["preferred_leader"] = policy.get("preferred_leader", False)
     if "priority" not in node_data:
-        node_data["priority"] = 0 if is_experimental else policy.get("priority", 50 if node_data["leader_eligible"] else 0)
+        node_data["priority"] = policy.get("priority", 50)
     if "worker_enabled" not in node_data:
-        node_data["worker_enabled"] = False if is_experimental else policy.get("worker_enabled", True)
+        node_data["worker_enabled"] = policy.get("worker_enabled", True)
     if "scheduler_eligible" not in node_data:
-        node_data["scheduler_eligible"] = False if is_experimental else policy.get("scheduler_eligible", True)
+        node_data["scheduler_eligible"] = policy.get("scheduler_eligible", True)
     if "participation_state" not in node_data:
-        node_data["participation_state"] = "OFF" if is_experimental else "AVAILABLE"
+        node_data["participation_state"] = "AVAILABLE"
     if "build_worker_enabled" not in node_data:
         node_data["build_worker_enabled"] = policy.get("build_worker_enabled", is_windows)
     if "performance_score" not in node_data:
         node_data["performance_score"] = 0.0
 
     return node_data
+
+
+def evaluate_node_eligibility(
+    node: Dict[str, Any],
+    heartbeat_timeout_sec: float = 30.0
+) -> Tuple[bool, Optional[str]]:
+    """
+    Evaluates whether a node is eligible for leadership.
+    Hard filters:
+    - Must have leader_eligible=True
+    - Must be ONLINE
+    - Storage used < 95%
+    - Temperature < 60°C (if reported)
+    - Compute capable (RAM >= 512MB)
+    Returns (is_eligible, ineligibility_reason).
+    """
+    if not node.get("leader_eligible", True):
+        return False, "Node policy has leader_eligible disabled"
+
+    status = str(node.get("status", "")).upper()
+    if status != "ONLINE":
+        return False, f"Node status is {status or 'OFFLINE'}"
+
+    # Storage check (< 95%)
+    last_hb = node.get("last_heartbeat", {})
+    sys_metrics = last_hb.get("system", {}) if isinstance(last_hb, dict) else {}
+    storage_pct = sys_metrics.get("disk_percent") or sys_metrics.get("storage_percent")
+    if storage_pct is not None:
+        try:
+            if float(storage_pct) >= 95.0:
+                return False, f"Storage usage critical ({float(storage_pct):.1f}% >= 95%)"
+        except (ValueError, TypeError):
+            pass
+
+    # Thermal check (< 60.0°C)
+    temp_val = sys_metrics.get("temperature") or sys_metrics.get("thermal") or sys_metrics.get("battery_temp")
+    if temp_val is not None:
+        try:
+            temp_c = float(temp_val)
+            if temp_c >= 60.0:
+                return False, f"Thermal throttle / temperature critical ({temp_c:.1f}°C >= 60°C)"
+        except (ValueError, TypeError):
+            pass
+
+    # Resource check
+    res = node.get("resources", {})
+    ram_mb = res.get("ram_mb", 0)
+    if ram_mb and float(ram_mb) < 512:
+        return False, f"Insufficient memory ({ram_mb}MB < 512MB)"
+
+    return True, None
 
 
 def calculate_node_performance_score(
@@ -190,13 +247,11 @@ def rank_leader_candidates(
         # Ensure all leadership policy fields exist
         apply_default_leadership_metadata(nid, node)
 
-        # 1. Eligibility Check
-        if not node.get("leader_eligible", False):
-            node["performance_score"] = 0.0
-            continue
+        # 1. Eligibility Check (hard filters: policy, status, storage, thermal, compute)
+        eligible, reason = evaluate_node_eligibility(node, heartbeat_timeout_sec)
+        node["ineligibility_reason"] = reason
 
-        # 2. Status Check (Must be ONLINE)
-        if str(node.get("status", "")).upper() != "ONLINE":
+        if not eligible:
             node["performance_score"] = 0.0
             continue
 
@@ -204,8 +259,8 @@ def rank_leader_candidates(
         node["performance_score"] = score
         scored_candidates.append((nid, score, node))
 
-    # Sort descending by score, tie-break by node_id
-    scored_candidates.sort(key=lambda item: (item[1], item[0]), reverse=True)
+    # Sort descending by score, priority descending, tie-break by node_id ascending (deterministic)
+    scored_candidates.sort(key=lambda item: (-item[1], -float(item[2].get("priority", 50)), item[0]))
 
     # In manual preference mode, if preferred leader is in candidates, hoist it to top
     if mode == "manual_preference" and preferred_leader_id:

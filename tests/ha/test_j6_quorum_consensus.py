@@ -303,6 +303,112 @@ class TestJ6QuorumConsensus(unittest.TestCase):
         finally:
             shutil.rmtree(standby_dir, ignore_errors=True)
 
+    def test_authoritative_cluster_state_contract(self):
+        """Verifies GET /api/cluster/state unified contract and single-leader guarantee."""
+        from controller.http.node_routes import build_cluster_state
+        from controller.stores.base import atomic_save_json
+
+        # Setup mock nodes
+        nodes_data = {
+            "cluster_name": "PersonalServer-TestCluster",
+            "nodes": {
+                "node-leader": {
+                    "node_id": "node-leader",
+                    "name": "Leader Node",
+                    "status": "ONLINE",
+                    "role": "compute",
+                    "leader_eligible": True,
+                    "priority": 50,
+                    "ip": "100.64.0.1",
+                    "resources": {"ram_mb": 4096, "cpu_cores": 4},
+                    "last_heartbeat": {"system": {"cpu_percent": 10.0}}
+                },
+                "node-standby": {
+                    "node_id": "node-standby",
+                    "name": "Standby Node",
+                    "status": "ONLINE",
+                    "role": "compute",
+                    "leader_eligible": True,
+                    "priority": 50,
+                    "ip": "100.64.0.2",
+                    "resources": {"ram_mb": 4096, "cpu_cores": 4},
+                    "last_heartbeat": {"system": {"cpu_percent": 15.0}}
+                }
+            }
+        }
+        atomic_save_json(self.paths.nodes_file, self.paths.backup_nodes_file, nodes_data)
+
+        # Setup leader lease on disk
+        lease = LeaderLease(
+            term=5,
+            leader_id="node-leader",
+            leader_url="http://100.64.0.1:8000",
+            lease_expires_at=time.time() + 60.0,
+            state_version=10
+        )
+        lease.save_to_file(self.paths.data_dir / "ha_lease.json")
+
+        mgr = HAManager(node_id="test-node-local", node_url="http://127.0.0.1:8000", paths=self.paths, role="standby")
+        mgr.current_lease = lease
+
+        class MockHandler:
+            heartbeat_timeout = 30
+            ha_manager = mgr
+
+        from config.platform_config import override_controller_paths
+        with override_controller_paths(data_dir=self.paths.data_dir, secrets_dir=self.paths.secrets_dir):
+            state = build_cluster_state(MockHandler())
+
+        self.assertEqual(state["cluster_id"], "PersonalServer-TestCluster")
+        self.assertEqual(state["leader"]["node_id"], "node-leader")
+        self.assertEqual(state["leader"]["term"], 5)
+        self.assertTrue(state["leader"]["lease_valid"])
+
+        # Check nodes array
+        leader_nodes = [n for n in state["nodes"] if n["is_leader"]]
+        self.assertEqual(len(leader_nodes), 1, "Exactly ONE node must be stamped as leader")
+        self.assertEqual(leader_nodes[0]["node_id"], "node-leader")
+
+        standby_nodes = [n for n in state["nodes"] if not n["is_leader"]]
+        self.assertEqual(len(standby_nodes), 1)
+        self.assertFalse(standby_nodes[0]["is_leader"])
+        self.assertGreater(standby_nodes[0]["merit_score"], 0.0)
+
+    def test_merit_ranking_and_deterministic_tie_breaking(self):
+        """Verifies merit ranking ordering (score DESC, priority DESC, node_id ASC)."""
+        from controller.leader_ranking import rank_leader_candidates
+
+        test_nodes = {
+            "node-c": {
+                "node_id": "node-c",
+                "status": "ONLINE",
+                "priority": 50,
+                "leader_eligible": True,
+                "resources": {"ram_mb": 4096},
+                "last_heartbeat": {"system": {"cpu_percent": 20.0}}
+            },
+            "node-a": {
+                "node_id": "node-a",
+                "status": "ONLINE",
+                "priority": 50,
+                "leader_eligible": True,
+                "resources": {"ram_mb": 4096},
+                "last_heartbeat": {"system": {"cpu_percent": 20.0}}
+            },
+            "node-b": {
+                "node_id": "node-b",
+                "status": "ONLINE",
+                "priority": 50,
+                "leader_eligible": True,
+                "resources": {"ram_mb": 4096},
+                "last_heartbeat": {"system": {"cpu_percent": 20.0}}
+            }
+        }
+        ranked = rank_leader_candidates(test_nodes)
+        # All have identical specs and priority -> tie broken by node_id ASC: node-a, node-b, node-c
+        ordered_ids = [r[0] for r in ranked]
+        self.assertEqual(ordered_ids, ["node-a", "node-b", "node-c"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,7 +79,8 @@ class ConnectivityProvider(BaseDeviceProvider):
             }
 
         if operation == "VERIFY_CONTROLLER_REACHABLE":
-            host = parameters.get("host", "100.85.108.5")
+            default_host = os.environ.get("PERSONALSERVER_CONTROLLER_HOST", "127.0.0.1")
+            host = parameters.get("host", default_host)
             port = int(parameters.get("port", 8000))
             timeout = float(parameters.get("timeout_sec", 3.0))
 

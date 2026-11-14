@@ -253,11 +253,11 @@ def collect_network_info():
 
     # If tailscale binary not in PATH (e.g. Android Termux VPN), probe Tailscale mesh interface
     if not net_info.get("tailscale_ip"):
-        for probe_dest in ("100.85.108.5", "100.100.100.100"):
+        for probe_dest in ("100.100.100.100", "100.64.0.1"):
             try:
                 s_ts = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s_ts.settimeout(0.5)
-                s_ts.connect((probe_dest, 8000 if probe_dest == "100.85.108.5" else 53))
+                s_ts.connect((probe_dest, 53))
                 ts_cand = s_ts.getsockname()[0]
                 s_ts.close()
                 if ts_cand and ts_cand.startswith("100."):

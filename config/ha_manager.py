@@ -488,6 +488,9 @@ class HAManager:
         }
 
         # Background thread control
+        self._consecutive_higher_merit_checks: int = 0
+        self._higher_merit_candidate: Optional[str] = None
+        self.performance_score: float = 0.0
         self._monitor_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._is_running = False
@@ -777,6 +780,37 @@ class HAManager:
             "Node %s campaigning for LEADER (Term %d, Quorum needed: %d/%d). Reason: %s",
             self.node_id, new_term, target_quorum, len(voters), reason
         )
+
+        # Merit-based campaign staggering to prevent split votes and favor higher-merit candidates
+        rank_index = 0
+        try:
+            from controller.stores import load_nodes_db
+            from controller.leader_ranking import rank_leader_candidates
+            ndb = load_nodes_db(paths=self.paths)
+            candidates = rank_leader_candidates(ndb.get("nodes", {}))
+            for idx, (cid, score, cdata) in enumerate(candidates):
+                if cid == self.node_id:
+                    rank_index = idx
+                    break
+        except Exception:
+            pass
+
+        if rank_index > 0:
+            stagger = (rank_index * 1.5) + (secrets.randbelow(500) / 1000.0)
+            controller_logger.info(
+                "HA_ELECTION_STAGGER",
+                "Node %s is candidate rank %d. Staggering campaign by %.2fs to favor higher-merit nodes.",
+                self.node_id, rank_index, stagger
+            )
+            time.sleep(stagger)
+            with self._lock:
+                if self.state in (HAState.LEADER, HAState.STANDBY) and (self.current_lease.is_valid() and self.current_leader_id and self.current_leader_id != self.node_id):
+                    controller_logger.info(
+                        "HA_ELECTION_ABORTED",
+                        "Another leader %s established during stagger window. Aborting campaign.",
+                        self.current_leader_id
+                    )
+                    return False
 
         # 2. Solicit votes OUTSIDE lock
         payload_bytes = json.dumps({
@@ -1396,6 +1430,35 @@ class HAManager:
                 self.step_down(remote_term, remote_id, discovered_url)
                 self._eval_in_progress = False
                 return
+
+            # Check cooperative handover in auto mode if another node has higher merit for >= 3 consecutive checks
+            if self.cluster_mode in ("auto", "automatic"):
+                try:
+                    from controller.stores import load_nodes_db
+                    from controller.leader_ranking import rank_leader_candidates
+                    ndb = load_nodes_db(paths=self.paths)
+                    ranked = rank_leader_candidates(ndb.get("nodes", {}), current_leader_id=self.node_id)
+                    if ranked and ranked[0][0] != self.node_id and ranked[0][1] > (self.performance_score + 10.0):
+                        top_id = ranked[0][0]
+                        if getattr(self, "_higher_merit_candidate", None) == top_id:
+                            self._consecutive_higher_merit_checks += 1
+                        else:
+                            self._higher_merit_candidate = top_id
+                            self._consecutive_higher_merit_checks = 1
+
+                        if self._consecutive_higher_merit_checks >= 3:
+                            controller_logger.info(
+                                "HA_COOPERATIVE_HANDOVER",
+                                "Node %s has higher merit score (%.1f > %.1f) for %d consecutive checks. Initiating handover.",
+                                top_id, ranked[0][1], self.performance_score, self._consecutive_higher_merit_checks
+                            )
+                            self._consecutive_higher_merit_checks = 0
+                            self.controlled_handover(top_id)
+                    else:
+                        self._consecutive_higher_merit_checks = 0
+                except Exception:
+                    pass
+
             with self._lock:
                 if self.state == HAState.LEADER:
                     self.renew_lease()

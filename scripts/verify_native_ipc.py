@@ -80,7 +80,7 @@ def run_live_ipc_suite(port: int) -> str:
 
     # Verify service is NOT listening on non-loopback IPv4 interfaces
     ext_ips = set()
-    for target in ("100.85.108.5", "8.8.8.8"):
+    for target in ("100.100.100.100", "8.8.8.8"):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
                 probe.connect((target, 80))

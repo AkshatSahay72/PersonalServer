@@ -776,9 +776,13 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         except Exception as initial_err:
             # Trigger HA master auto-discovery across candidate controller URLs
             try:
-                from config.ha_manager import find_active_leader
+                from config.ha_manager import find_active_leader, DEFAULT_CLUSTER_VOTERS
                 env_candidates = os.environ.get("PERSONALSERVER_CONTROLLER_URLS", "")
                 candidates = [u.strip().rstrip("/") for u in env_candidates.split(",") if u.strip()]
+                for v in DEFAULT_CLUSTER_VOTERS.values():
+                    v_url = v.get("url", "").rstrip("/")
+                    if v_url and v_url not in candidates:
+                        candidates.append(v_url)
                 if controller_url not in candidates:
                     candidates.append(controller_url)
                 if configured_url not in candidates:
@@ -824,13 +828,94 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             from config.platform_config import get_controller_paths
             paths = get_controller_paths()
 
+            # /cluster/state, /api/cluster/state
+            if clean_subpath in ("/cluster/state", "/api/cluster/state"):
+                try:
+                    raw_data = {}
+                    if paths.nodes_file.exists():
+                        with open(paths.nodes_file, "r", encoding="utf-8") as f:
+                            raw_data = json.load(f)
+                    from controller.node_manager import get_cluster_summary
+                    summary = get_cluster_summary(raw_data)
+                    from config.ha_manager import LeaderLease
+                    lease = LeaderLease.load_from_file(paths.data_dir / "ha_lease.json")
+                    lease_valid = lease.is_valid()
+                    nodes_list = []
+                    for n in summary.get("nodes", []):
+                        nid = n.get("node_id")
+                        nodes_list.append({
+                            "node_id": nid,
+                            "name": n.get("name") or nid,
+                            "address": n.get("ip") or "",
+                            "role": n.get("role", "compute"),
+                            "status": n.get("status", "UNKNOWN"),
+                            "is_leader": bool(lease_valid and nid == lease.leader_id),
+                            "leader_eligible": n.get("leader_eligible", True),
+                            "merit_score": 0.0,
+                            "ineligibility_reason": None if n.get("status") == "ONLINE" else "Node is offline",
+                            "last_heartbeat": n.get("last_heartbeat") or ""
+                        })
+                    state_dict = {
+                        "cluster_id": raw_data.get("cluster_name", "PersonalServer"),
+                        "state_version": getattr(lease, "state_version", 1),
+                        "snapshot_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "leader": {
+                            "node_id": lease.leader_id if lease_valid else None,
+                            "name": getattr(lease, "leader_name", None) or (lease.leader_id if lease_valid else "Electing..."),
+                            "term": lease.term,
+                            "address": getattr(lease, "leader_url", None) or "",
+                            "is_local": False,
+                            "lease_expires_at": lease.expires_at,
+                            "lease_valid": lease_valid,
+                            "election_mode": "auto"
+                        },
+                        "quorum": {
+                            "voters": [],
+                            "healthy_voters": 0,
+                            "minimum_required": 2,
+                            "quorum_achieved": False
+                        },
+                        "cluster": {
+                            "total_nodes": summary.get("cluster", {}).get("total_nodes", len(nodes_list)),
+                            "online_nodes": summary.get("cluster", {}).get("online", 0),
+                            "active_cores": 0,
+                            "memory_total_mb": 0.0,
+                            "memory_used_mb": 0.0
+                        },
+                        "nodes": nodes_list,
+                        "controller": {
+                            "local_node_id": "gateway",
+                            "local_role": "degraded_read_model",
+                            "local_term": lease.term,
+                            "lease_valid": lease_valid
+                        }
+                    }
+                    resp_bytes = json.dumps(state_dict).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp_bytes)))
+                    self.send_header("X-PersonalServer-Read-Only", "true")
+                    self.send_header("X-PersonalServer-Leader-State", "degraded")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(resp_bytes)
+                    return True
+                except Exception:
+                    pass
+
             # /nodes, /cluster, /api/nodes, /api/cluster
             if clean_subpath in ("/nodes", "/cluster", "/api/nodes", "/api/cluster"):
                 if paths.nodes_file.exists():
                     try:
                         with open(paths.nodes_file, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        resp_bytes = json.dumps(data).encode("utf-8")
+                            raw_data = json.load(f)
+                        from controller.node_manager import get_cluster_summary
+                        summary = get_cluster_summary(raw_data)
+                        if clean_subpath in ("/nodes", "/api/nodes"):
+                            resp_data = {"nodes": summary.get("nodes", []), "count": len(summary.get("nodes", []))}
+                        else:
+                            resp_data = summary
+                        resp_bytes = json.dumps(resp_data).encode("utf-8")
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(resp_bytes)))
