@@ -1326,6 +1326,13 @@ class HAManager:
                     self.current_lease.lease_expires_at = time.time() + data.get("lease_remaining_sec", self.lease_duration_sec)
                     if data.get("leader_id"):
                         self.current_lease.leader_id = data["leader_id"]
+                        if data["leader_id"] != self.node_id and self.state == HAState.LEADER:
+                            self.state = HAState.STANDBY
+                            if self.on_demotion_callback:
+                                try:
+                                    self.on_demotion_callback()
+                                except Exception as e:
+                                    controller_logger.error("HA_CALLBACK_ERROR", "Error in on_demotion_callback: %s", e)
                     if data.get("term"):
                         self.current_lease.term = data["term"]
                     self.current_lease.save_to_file(self.lease_file)
@@ -1382,12 +1389,12 @@ class HAManager:
         # Check if local node is leader and should check for higher term split-brain (e.g. partition healing)
         if self.is_leader:
             discovered_url, leader_info = find_active_leader(candidates, exclude_url=local_url)
-            if discovered_url and leader_info and leader_info.get("term", 0) > snapshot_term:
-                remote_term = leader_info["term"]
+            if discovered_url and leader_info and (leader_info.get("term", 0) > snapshot_term or (leader_info.get("leader_id") and leader_info.get("leader_id") != self.node_id)):
+                remote_term = leader_info.get("term", snapshot_term)
                 remote_id = leader_info.get("leader_id", "")
                 controller_logger.warning(
                     "HA_DEMOTION",
-                    "Discovered active leader %s with higher term %d (local term %d). Demoting to STANDBY.",
+                    "Discovered active leader %s with term %d (local term %d). Demoting to STANDBY.",
                     remote_id, remote_term, snapshot_term
                 )
                 self.step_down(remote_term, remote_id, discovered_url)
