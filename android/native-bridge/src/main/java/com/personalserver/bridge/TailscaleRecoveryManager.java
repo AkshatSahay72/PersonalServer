@@ -118,6 +118,29 @@ public class TailscaleRecoveryManager {
         return isVpnActive() ? "CONNECTED" : "DISCONNECTED";
     }
 
+    public String getTailscaleIp() {
+        try {
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            if (ifaces != null) {
+                while (ifaces.hasMoreElements()) {
+                    NetworkInterface nif = ifaces.nextElement();
+                    String name = nif.getName().toLowerCase();
+                    if (name.startsWith("tun") || name.startsWith("tap") || name.contains("tailscale")) {
+                        Enumeration<java.net.InetAddress> addrs = nif.getInetAddresses();
+                        while (addrs.hasMoreElements()) {
+                            java.net.InetAddress addr = addrs.nextElement();
+                            String host = addr.getHostAddress();
+                            if (host != null && host.startsWith("100.")) {
+                                return host;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
     public boolean checkPeerConnectivity(String peerIp, int port, int timeoutMs) {
         if (peerIp == null || peerIp.isEmpty()) return false;
         try (Socket sock = new Socket()) {

@@ -2,6 +2,7 @@ package com.personalserver.bridge;
 
 import android.Manifest;
 import android.app.ForegroundServiceStartNotAllowedException;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -9,6 +10,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -58,6 +60,10 @@ public class BridgeActivity extends AppCompatActivity {
     private Button openTailscaleBtn;
     private Button retryVpnBtn;
     private TextView vpnAttentionHint;
+
+    // Battery Optimization Attention Panel
+    private LinearLayout batteryAttentionCard;
+    private Button exemptBatteryBtn;
 
     // Subsystem Indicators
     private TextView subsystemSummaryText;
@@ -140,7 +146,8 @@ public class BridgeActivity extends AppCompatActivity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Vivo V2334 • server-v2334-a531  (Android " + Build.VERSION.RELEASE + ", API " + Build.VERSION.SDK_INT + ")");
+        String deviceModel = (Build.MANUFACTURER != null ? Build.MANUFACTURER.toUpperCase() : "Android") + " " + Build.MODEL;
+        subtitle.setText(deviceModel + "  (Android " + Build.VERSION.RELEASE + ", API " + Build.VERSION.SDK_INT + ")");
         subtitle.setTextColor(Color.parseColor("#94A3B8"));
         subtitle.setTextSize(13f);
         subtitle.setPadding(0, 0, 0, 16);
@@ -242,6 +249,37 @@ public class BridgeActivity extends AppCompatActivity {
         vpnAttentionCard.addView(vpnAttentionHint);
 
         root.addView(vpnAttentionCard);
+
+        // Battery Optimization Attention Panel
+        batteryAttentionCard = new LinearLayout(this);
+        batteryAttentionCard.setOrientation(LinearLayout.VERTICAL);
+        batteryAttentionCard.setBackgroundColor(Color.parseColor("#2A1E0B"));
+        batteryAttentionCard.setPadding(24, 18, 24, 18);
+        batteryAttentionCard.setVisibility(View.GONE);
+
+        TextView batteryTitle = new TextView(this);
+        batteryTitle.setText("⚠️ Battery Optimization Active");
+        batteryTitle.setTextColor(Color.parseColor("#FBBF24"));
+        batteryTitle.setTextSize(16f);
+        batteryTitle.setPadding(0, 0, 0, 6);
+        batteryAttentionCard.addView(batteryTitle);
+
+        TextView batteryMessage = new TextView(this);
+        batteryMessage.setText("To keep PersonalServer running reliably when the screen is locked, exempt the Native Bridge from Android battery optimizations.");
+        batteryMessage.setTextColor(Color.parseColor("#FEF3C7"));
+        batteryMessage.setTextSize(13f);
+        batteryMessage.setPadding(0, 0, 0, 12);
+        batteryAttentionCard.addView(batteryMessage);
+
+        exemptBatteryBtn = new Button(this);
+        exemptBatteryBtn.setText("Disable Battery Optimization");
+        exemptBatteryBtn.setTextColor(Color.WHITE);
+        exemptBatteryBtn.setBackgroundColor(Color.parseColor("#D97706"));
+        exemptBatteryBtn.setPadding(16, 10, 16, 10);
+        exemptBatteryBtn.setOnClickListener(v -> requestIgnoreBatteryOptimizations());
+        batteryAttentionCard.addView(exemptBatteryBtn);
+
+        root.addView(batteryAttentionCard);
 
         // Subsystems Status Overview Card
         LinearLayout subsystemCard = new LinearLayout(this);
@@ -880,6 +918,21 @@ public class BridgeActivity extends AppCompatActivity {
         }
     }
 
+    public void requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                Intent intent = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(android.net.Uri.parse("package:" + getPackageName()));
+                startActivity(intent);
+            } catch (Exception e) {
+                try {
+                    Intent intent = new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+                    startActivity(intent);
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
@@ -1046,10 +1099,22 @@ public class BridgeActivity extends AppCompatActivity {
             vpnAttentionCard.setVisibility(showVpnPanel ? View.VISIBLE : View.GONE);
         }
 
+        // 3b. Battery Optimization Attention Panel visibility
+        if (batteryAttentionCard != null) {
+            boolean isOptimized = false;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                android.os.PowerManager pm = (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+                isOptimized = pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName());
+            }
+            batteryAttentionCard.setVisibility(isOptimized ? View.VISIBLE : View.GONE);
+        }
+
         // 4. Subsystems Summary block
         if (subsystemSummaryText != null) {
+            String tsIp = (tailscaleRecoveryManager != null) ? tailscaleRecoveryManager.getTailscaleIp() : null;
+            String tsLabel = tailscaleState + (tsIp != null ? " (" + tsIp + ")" : "");
             subsystemSummaryText.setText(
-                    "• Tailscale VPN   : " + tailscaleState + " (100.113.234.61)\n"
+                    "• Tailscale VPN   : " + tsLabel + "\n"
                             + "• Termux Envir.   : " + termuxState + "\n"
                             + "• Node API (:8080): " + nodeApiState + "\n"
                             + "• Node Worker     : " + workerState + "\n"
