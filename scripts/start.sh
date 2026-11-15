@@ -26,6 +26,23 @@ echo "=========================================="
 echo " PersonalServer - Starting Services"
 echo "=========================================="
 
+# ------------------------------------------------------------------------------
+# 0. Release Update Preflight (Optional & Configurable)
+# ------------------------------------------------------------------------------
+RELEASE_CONF="$CONFIG_DIR/release.conf"
+if [ -f "$RELEASE_CONF" ] && grep -qiE "^AUTO_UPDATE_ON_START=(true|1|yes)" "$RELEASE_CONF" 2>/dev/null; then
+    echo -n "Checking release updates... "
+    if [ -f "$BASE_DIR/scripts/update.sh" ]; then
+        if bash "$BASE_DIR/scripts/update.sh" --preflight >/dev/null 2>&1; then
+            echo "preflight OK"
+        else
+            echo "skipped / offline (continuing startup)"
+        fi
+    else
+        echo "update script not found"
+    fi
+fi
+
 # Helper: check if a PID is alive and matches expected command pattern
 is_pid_running() {
     local pid="$1"
@@ -111,9 +128,11 @@ if [ "$cloudflared_running" = false ]; then
         cloudflared_running=true
     else
         if ! command -v cloudflared >/dev/null 2>&1; then
-            echo "FAILED (cloudflared not found in PATH)"
+            echo "skipped (not installed on worker node)"
+            cloudflared_running="not_installed"
         elif [ ! -f "$TOKEN_FILE" ]; then
-            echo "FAILED (Token missing at $TOKEN_FILE)"
+            echo "skipped (no tunnel token configured for worker node)"
+            cloudflared_running="not_configured"
         else
             export GODEBUG="netdns=go"
             nohup cloudflared tunnel --no-prechecks run --token-file "$TOKEN_FILE" >> "$CLOUDFLARED_LOG" 2>&1 &
@@ -175,10 +194,10 @@ if [ "$node_worker_running" = false ]; then
 fi
 
 echo "=========================================="
-if [ "$node_api_running" = true ] && [ "$node_worker_running" = true ] && [ "$cloudflared_running" = true ]; then
+if [ "$node_api_running" = true ]; then
     echo "PersonalServer services started successfully."
     exit 0
 else
-    echo "PersonalServer started with warnings/errors."
+    echo "PersonalServer failed to start Node API."
     exit 1
 fi

@@ -421,6 +421,8 @@ public class Intent {
     public Intent putExtra(String k, String v) { extras.put(k, v); return this; }
     public Intent putExtra(String k, String[] v) { extras.put(k, v); return this; }
     public Intent putExtra(String k, boolean v) { extras.put(k, v); return this; }
+    public Intent putExtra(String k, int v) { extras.put(k, v); return this; }
+    public Intent putExtra(String k, Object v) { extras.put(k, v); return this; }
     public String getStringExtra(String k) { Object v = extras.get(k); return v instanceof String ? (String) v : null; }
     public int getIntExtra(String k, int def) { return def; }
     public boolean getBooleanExtra(String k, boolean def) { return def; }
@@ -548,6 +550,16 @@ public class Size {
     public int getHeight() { return height; }
 }
 """,
+    "android/util/Range.java": """
+package android.util;
+public class Range<T extends Comparable<? super T>> {
+    private final T lower;
+    private final T upper;
+    public Range(T lower, T upper) { this.lower = lower; this.upper = upper; }
+    public T getLower() { return lower; }
+    public T getUpper() { return upper; }
+}
+""",
     "android/view/Surface.java": "package android.view; public class Surface {}",
     "android/media/Image.java": """
 package android.media;
@@ -645,6 +657,7 @@ public class CameraCharacteristics {
     public static class Key<T> {}
     public static final Key<Integer> LENS_FACING = new Key<>();
     public static final Key<StreamConfigurationMap> SCALER_STREAM_CONFIGURATION_MAP = new Key<>();
+    public static final Key<android.util.Range<Integer>[]> CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES = new Key<>();
     public static final int LENS_FACING_FRONT = 0;
     public static final int LENS_FACING_BACK = 1;
     public <T> T get(Key<T> key) { return null; }
@@ -671,6 +684,11 @@ public class CameraDevice implements AutoCloseable {
     public static final int TEMPLATE_PREVIEW = 1;
     public static final int TEMPLATE_RECORD = 3;
     public static abstract class StateCallback {
+        public static final int ERROR_CAMERA_IN_USE = 1;
+        public static final int ERROR_MAX_CAMERAS_IN_USE = 2;
+        public static final int ERROR_CAMERA_DISABLED = 3;
+        public static final int ERROR_CAMERA_DEVICE = 4;
+        public static final int ERROR_CAMERA_SERVICE = 5;
         public abstract void onOpened(CameraDevice camera);
         public abstract void onDisconnected(CameraDevice camera);
         public abstract void onError(CameraDevice camera, int error);
@@ -691,6 +709,8 @@ public class CaptureRequest {
     public static class Key<T> {}
     public static final Key<Integer> CONTROL_AF_MODE = new Key<>();
     public static final int CONTROL_AF_MODE_CONTINUOUS_PICTURE = 4;
+    public static final Key<Byte> JPEG_QUALITY = new Key<>();
+    public static final Key<android.util.Range<Integer>> CONTROL_AE_TARGET_FPS_RANGE = new Key<>();
     public static class Builder {
         public void addTarget(Surface outputTarget) {}
         public <T> void set(Key<T> key, T value) {}
@@ -709,6 +729,7 @@ public class CameraCaptureSession implements AutoCloseable {
     public static abstract class CaptureCallback {}
     public void setRepeatingRequest(CaptureRequest request, CaptureCallback listener, Handler handler) throws CameraAccessException {}
     public void stopRepeating() throws CameraAccessException {}
+    public void abortCaptures() throws CameraAccessException {}
     @Override public void close() {}
 }
 """,
@@ -779,7 +800,7 @@ public class SensorManager {
     "android/app/Notification.java": "package android.app; public class Notification {}",
     "android/app/NotificationChannel.java": "package android.app; public class NotificationChannel { public NotificationChannel(String id, CharSequence name, int imp) {} public void setDescription(String d) {} }",
     "android/app/NotificationManager.java": "package android.app; public class NotificationManager { public static final int IMPORTANCE_LOW = 2; public void createNotificationChannel(NotificationChannel c) {} public void notify(int id, Notification n) {} public void cancel(int id) {} }",
-    "android/app/PendingIntent.java": "package android.app; import android.content.*; public class PendingIntent { public static final int FLAG_IMMUTABLE = 1; public static final int FLAG_UPDATE_CURRENT = 2; public static PendingIntent getActivity(Context c, int r, Intent i, int f) { return new PendingIntent(); } }",
+    "android/app/PendingIntent.java": "package android.app; import android.content.*; public class PendingIntent { public static final int FLAG_IMMUTABLE = 1; public static final int FLAG_UPDATE_CURRENT = 2; public static final int FLAG_MUTABLE = 33554432; public static PendingIntent getActivity(Context c, int r, Intent i, int f) { return new PendingIntent(); } public static PendingIntent getBroadcast(Context c, int r, Intent i, int f) { return new PendingIntent(); } }",
     "android/app/ForegroundServiceStartNotAllowedException.java": "package android.app; public class ForegroundServiceStartNotAllowedException extends IllegalStateException { public ForegroundServiceStartNotAllowedException(String msg) { super(msg); } }",
     "android/app/Service.java": """
 package android.app;
@@ -804,11 +825,11 @@ public abstract class Service extends Context {
 }
 """,
     "android/graphics/Color.java": "package android.graphics; public class Color { public static final int WHITE = -1; public static int parseColor(String s) { return 0; } }",
-    "android/view/View.java": "package android.view; public class View { public interface OnClickListener { void onClick(View v); } }",
-    "android/widget/LinearLayout.java": "package android.widget; import android.content.Context; public class LinearLayout { public static final int VERTICAL = 1; public static final int HORIZONTAL = 0; public LinearLayout(Context c) {} public void setOrientation(int o) {} public void setPadding(int l, int t, int r, int b) {} public void setBackgroundColor(int c) {} public void addView(Object v) {} }",
-    "android/widget/TextView.java": "package android.widget; import android.content.Context; public class TextView { public TextView(Context c) {} public void setText(CharSequence t) {} public void setTextColor(int c) {} public void setTextSize(float s) {} public void setPadding(int l, int t, int r, int b) {} }",
-    "android/widget/Button.java": "package android.widget; import android.content.Context; import android.view.View; public class Button extends TextView { public Button(Context c) { super(c); } public void setOnClickListener(View.OnClickListener l) {} }",
-    "android/widget/ScrollView.java": "package android.widget; import android.content.Context; public class ScrollView { public ScrollView(Context c) {} public void addView(Object v) {} }",
+    "android/view/View.java": "package android.view; public class View { public static final int VISIBLE = 0; public static final int INVISIBLE = 4; public static final int GONE = 8; public void setVisibility(int v) {} public void setBackgroundColor(int c) {} public interface OnClickListener { void onClick(View v); } }",
+    "android/widget/LinearLayout.java": "package android.widget; import android.content.Context; import android.view.View; public class LinearLayout extends View { public static final int VERTICAL = 1; public static final int HORIZONTAL = 0; public LinearLayout(Context c) {} public void setOrientation(int o) {} public void setPadding(int l, int t, int r, int b) {} public void setBackgroundColor(int c) {} public void setVisibility(int v) {} public void addView(Object v) {} }",
+    "android/widget/TextView.java": "package android.widget; import android.content.Context; import android.view.View; public class TextView extends View { public TextView(Context c) {} public void setText(CharSequence t) {} public void setTextColor(int c) {} public void setTextSize(float s) {} public void setPadding(int l, int t, int r, int b) {} public void setBackgroundColor(int c) {} public void setVisibility(int v) {} }",
+    "android/widget/Button.java": "package android.widget; import android.content.Context; import android.view.View; public class Button extends TextView { public Button(Context c) { super(c); } public void setOnClickListener(View.OnClickListener l) {} public void setBackgroundColor(int c) {} public void setVisibility(int v) {} }",
+    "android/widget/ScrollView.java": "package android.widget; import android.content.Context; import android.view.View; public class ScrollView extends View { public ScrollView(Context c) {} public void addView(Object v) {} public void setBackgroundColor(int c) {} public void setVisibility(int v) {} }",
     "androidx/annotation/NonNull.java": "package androidx.annotation; public @interface NonNull {}",
     "androidx/core/app/ActivityCompat.java": "package androidx.core.app; public class ActivityCompat { public static void requestPermissions(Object a, String[] p, int c) {} }",
     "androidx/core/app/NotificationCompat.java": """

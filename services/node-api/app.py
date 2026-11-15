@@ -423,6 +423,21 @@ def get_system_info():
 
 def get_health(correlation_id=None):
     config = load_config()
+    release_info = {}
+    release_state_file = RUNTIME_DIR / "release_state.json"
+    if release_state_file.exists():
+        try:
+            with open(release_state_file, "r", encoding="utf-8") as rf:
+                s = json.load(rf)
+                release_info = {
+                    "installed_commit": s.get("installed_commit"),
+                    "installed_branch": s.get("installed_branch"),
+                    "channel": s.get("channel", "release/stable"),
+                    "status": s.get("status", "INSTALLED"),
+                    "update_available": s.get("target_commit") is not None and s.get("target_commit") != s.get("installed_commit")
+                }
+        except Exception:
+            pass
     return {
         "status": "online",
         "node": {
@@ -430,6 +445,7 @@ def get_health(correlation_id=None):
             "name": config.get("NODE_NAME", config.get("name", "unknown")),
             "role": config.get("NODE_ROLE", config.get("role", "compute"))
         },
+        "release": release_info,
         "system": get_system_info(),
         "correlation_id": correlation_id or generate_correlation_id(),
         "timestamp": get_current_iso_timestamp()
@@ -600,8 +616,20 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
         if cf_email and is_proxied_public:
             return True
 
-        # If token matches configured auth token or controller enrollment token
-        if token and (constant_time_compare(token, expected_token) or constant_time_compare(token, controller_token)):
+        # If token matches configured auth token, registered controller token, or cluster enrollment token
+        enrollment_file = SECRETS_DIR / "enrollment.token"
+        enrollment_token = ""
+        if enrollment_file.exists():
+            try:
+                enrollment_token = enrollment_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+        if token and (
+            constant_time_compare(token, expected_token)
+            or constant_time_compare(token, controller_token)
+            or (enrollment_token and constant_time_compare(token, enrollment_token))
+        ):
             return True
 
         # If proxied through public tunnel, deny without valid CF auth or token
@@ -1313,8 +1341,17 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed to retrieve recording: {e}"})
                 return
 
-        # 3b3. On-Demand Live Call Video Stream (Continuous MJPEG) (E07): GET /hardware/live-call/stream
-        if path in ("/hardware/live-call/stream", "/api/hardware/live-call/stream"):
+        # 3b3. On-Demand Live Call Video Stream (Continuous MJPEG) (E07): GET /hardware/live-call/stream, /camera/stream, /cctv/stream
+        if path in (
+            "/hardware/live-call/stream",
+            "/api/hardware/live-call/stream",
+            "/hardware/camera/stream",
+            "/api/hardware/camera/stream",
+            "/camera/stream",
+            "/cctv/stream",
+            "/api/camera/stream",
+            "/api/cctv/stream"
+        ):
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
                 return
@@ -1323,8 +1360,17 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 mgr = HardwareCapabilityManager.get_instance()
                 sess = mgr.live_call.current_session
                 if not sess or sess.state.value != "ACTIVE":
-                    self.send_json(404, {"error": "No active live call session"})
-                    return
+                    # Auto-start on-demand CCTV stream if requested via camera/cctv endpoint
+                    preset_q = query.get("quality", ["720p"])[0] or "720p"
+                    cam_id = query.get("camera_id", ["0"])[0] or "0"
+                    ok, res = mgr.live_call.start_session(
+                        parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False},
+                        timeout_sec=300.0
+                    )
+                    if not ok:
+                        self.send_json(503, {"error": "No active camera session and auto-start failed", "details": res})
+                        return
+                    sess = mgr.live_call.current_session
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0")
@@ -1334,7 +1380,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
 
                 last_ts = 0.0
-                while not getattr(self, "close_connection", False):
+                stream_active = True
+                while stream_active:
                     cur_sess = mgr.live_call.current_session
                     if not cur_sess or cur_sess.state.value != "ACTIVE":
                         break
@@ -1342,8 +1389,12 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     if frame and ts > last_ts:
                         last_ts = ts
                         part_header = f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n".encode("utf-8")
-                        self.wfile.write(part_header + frame + b"\r\n")
-                        self.wfile.flush()
+                        try:
+                            self.wfile.write(part_header + frame + b"\r\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
+                            stream_active = False
+                            break
                     mgr.live_call.wait_for_next_frame(timeout=0.08)
                 return
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
@@ -1353,8 +1404,17 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed streaming live call: {e}"})
                 return
 
-        # 3b4. On-Demand Live Call Video Frame (E07): GET /hardware/live-call/frame
-        if path in ("/hardware/live-call/frame", "/api/hardware/live-call/frame"):
+        # 3b4. On-Demand Live Call Video Frame (E07): GET /hardware/live-call/frame, /camera/frame, /cctv/frame
+        if path in (
+            "/hardware/live-call/frame",
+            "/api/hardware/live-call/frame",
+            "/hardware/camera/frame",
+            "/api/hardware/camera/frame",
+            "/camera/frame",
+            "/cctv/frame",
+            "/api/camera/frame",
+            "/api/cctv/frame"
+        ):
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
                 return
@@ -1363,8 +1423,19 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 mgr = HardwareCapabilityManager.get_instance()
                 sess = mgr.live_call.current_session
                 if not sess or sess.state.value != "ACTIVE":
-                    self.send_json(404, {"error": "No active live call session"})
-                    return
+                    # Auto-start on-demand CCTV snapshot if not active
+                    preset_q = query.get("quality", ["720p"])[0] or "720p"
+                    cam_id = query.get("camera_id", ["0"])[0] or "0"
+                    ok, res = mgr.live_call.start_session(
+                        parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False},
+                        timeout_sec=60.0
+                    )
+                    if not ok:
+                        self.send_json(503, {"error": "No active camera session and auto-start failed", "details": res})
+                        return
+                    # Wait briefly for first frame
+                    mgr.live_call.wait_for_next_frame(timeout=1.5)
+                    sess = mgr.live_call.current_session
                 frame, ts = mgr.live_call.get_latest_frame_with_timestamp()
                 if not frame:
                     self.send_json(503, {"error": "No video frame available yet"})

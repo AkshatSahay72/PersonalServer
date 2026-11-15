@@ -4,10 +4,12 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.util.Log;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -18,6 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Manages Termux integration and approved command execution via com.termux.RUN_COMMAND.
+ * Captures asynchronous command exit codes, stdout, and stderr via PendingIntent broadcast callback.
  */
 public class TermuxRecoveryManager {
 
@@ -50,11 +53,29 @@ public class TermuxRecoveryManager {
     public static final String STATE_VERIFICATION_FAILED = "VERIFICATION_FAILED";
     public static final String STATE_SUPPRESSED = "SUPPRESSED";
 
+    public interface CommandResultListener {
+        void onCommandFinished(String opId, int exitCode, String stdout, String stderr);
+    }
+
+    private static final ConcurrentHashMap<String, JSONObject> GLOBAL_COMMAND_HISTORY = new ConcurrentHashMap<>();
+    private static final List<CommandResultListener> LISTENERS = Collections.synchronizedList(new ArrayList<>());
+
     private final Context context;
-    private final ConcurrentHashMap<String, JSONObject> commandHistory = new ConcurrentHashMap<>();
 
     public TermuxRecoveryManager(Context context) {
         this.context = context.getApplicationContext();
+    }
+
+    public static void addListener(CommandResultListener listener) {
+        if (listener != null && !LISTENERS.contains(listener)) {
+            LISTENERS.add(listener);
+        }
+    }
+
+    public static void removeListener(CommandResultListener listener) {
+        if (listener != null) {
+            LISTENERS.remove(listener);
+        }
     }
 
     public boolean isTermuxInstalled() {
@@ -99,6 +120,22 @@ public class TermuxRecoveryManager {
             return isCommandIntegrationReady() ? "UP" : "DEGRADED";
         } catch (Exception e) {
             return "UNKNOWN";
+        }
+    }
+
+    public void launchTermuxActivity() {
+        try {
+            PackageManager pm = context.getPackageManager();
+            if (pm != null) {
+                Intent launchIntent = pm.getLaunchIntentForPackage(TERMUX_PACKAGE);
+                if (launchIntent != null) {
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    context.startActivity(launchIntent);
+                    Log.i(TAG, "Launched Termux activity to awaken process");
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed launching Termux Activity: " + e.getMessage());
         }
     }
 
@@ -152,6 +189,21 @@ public class TermuxRecoveryManager {
         intent.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
         intent.putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", "0"); // Fail/Close
 
+        // Attach PendingIntent to capture command exitCode and output from Termux
+        Intent resultIntent = new Intent(context, TermuxCommandResultReceiver.class);
+        resultIntent.setAction(TermuxCommandResultReceiver.ACTION_TERMUX_RESULT);
+        resultIntent.putExtra("operation_id", opId);
+        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 31) {
+            piFlags |= 33554432; // PendingIntent.FLAG_MUTABLE
+        }
+        try {
+            PendingIntent pi = PendingIntent.getBroadcast(context, opId.hashCode(), resultIntent, piFlags);
+            intent.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", pi);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed creating RUN_COMMAND PendingIntent callback: " + e.getMessage());
+        }
+
         boolean dispatched = false;
         String dispatchError = null;
 
@@ -160,8 +212,17 @@ public class TermuxRecoveryManager {
             dispatched = true;
             Log.i(TAG, "Dispatched Termux RUN_COMMAND: " + operation + " (id=" + opId + ")");
         } catch (Exception e) {
-            dispatchError = e.getMessage();
-            Log.e(TAG, "Failed to start Termux RunCommandService: " + dispatchError, e);
+            Log.w(TAG, "Initial startService failed (" + e.getMessage() + "), attempting Termux activity launch to awaken...");
+            launchTermuxActivity();
+            try {
+                Thread.sleep(300);
+                context.startService(intent);
+                dispatched = true;
+                Log.i(TAG, "Dispatched Termux RUN_COMMAND after awakening: " + operation + " (id=" + opId + ")");
+            } catch (Exception e2) {
+                dispatchError = e2.getMessage();
+                Log.e(TAG, "Failed to start Termux RunCommandService: " + dispatchError, e2);
+            }
         }
 
         String targetService = (extraParams != null) ? extraParams.optString("target_service", "all") : "all";
@@ -185,13 +246,46 @@ public class TermuxRecoveryManager {
         record.put("verified", false);
         record.put("success", false); // Never reported as success until verification passes!
 
-        commandHistory.put(opId, record);
+        GLOBAL_COMMAND_HISTORY.put(opId, record);
         return record;
+    }
+
+    public static void handleResult(String opId, int resultCode, String stdout, String stderr, String errmsg, int errcode) {
+        if (opId == null) return;
+        JSONObject record = GLOBAL_COMMAND_HISTORY.get(opId);
+        if (record != null) {
+            try {
+                record.put("completion_timestamp", System.currentTimeMillis());
+                record.put("exit_code", resultCode);
+                boolean succeeded = (resultCode == 0);
+                record.put("status", succeeded ? STATE_SUCCEEDED : STATE_FAILED);
+                record.put("verified", succeeded);
+                record.put("success", succeeded);
+
+                String out = (stdout != null && !stdout.isEmpty()) ? stdout : stderr;
+                if (out != null) {
+                    String bounded = out.length() > 1024 ? out.substring(0, 1024) : out;
+                    record.put("diagnostic_output", bounded);
+                    record.put("execution_result", bounded);
+                }
+                if (errmsg != null && !errmsg.isEmpty()) {
+                    record.put("error_message", errmsg);
+                }
+            } catch (JSONException ignored) {}
+        }
+
+        synchronized (LISTENERS) {
+            for (CommandResultListener l : LISTENERS) {
+                try {
+                    l.onCommandFinished(opId, resultCode, stdout, stderr);
+                } catch (Exception ignored) {}
+            }
+        }
     }
 
     public void updateOperationRecord(String opId, String status, Integer exitCode, String result, String diagOutput) {
         if (opId == null) return;
-        JSONObject record = commandHistory.get(opId);
+        JSONObject record = GLOBAL_COMMAND_HISTORY.get(opId);
         if (record == null) return;
         try {
             record.put("status", status);
@@ -214,14 +308,14 @@ public class TermuxRecoveryManager {
 
     public JSONObject getOperation(String opId) {
         if (opId == null) return null;
-        return commandHistory.get(opId);
+        return GLOBAL_COMMAND_HISTORY.get(opId);
     }
 
     public JSONObject getCommandHistory() {
         JSONObject out = new JSONObject();
-        for (String key : commandHistory.keySet()) {
+        for (String key : GLOBAL_COMMAND_HISTORY.keySet()) {
             try {
-                out.put(key, commandHistory.get(key));
+                out.put(key, GLOBAL_COMMAND_HISTORY.get(key));
             } catch (Exception ignored) {}
         }
         return out;

@@ -477,8 +477,8 @@ class LiveCallProvider:
         sock = None
         while not self._stop_event.is_set() and retries < 15:
             try:
-                sock = socket.create_connection((self.bridge_host, port), timeout=1.0)
-                sock.settimeout(5.0)
+                sock = socket.create_connection((self.bridge_host, port), timeout=2.0)
+                sock.settimeout(15.0)
                 self._media_socket = sock
                 logger.info("Connected to Native MediaStreamServer on port %d", port)
                 break

@@ -556,11 +556,12 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         node_ip = node.get("ip")
         if node_ip:
             try:
+                node_auth_token = (node.get("auth_token") or enrollment_token or "").strip()
                 req = urllib.request.Request(
                     f"http://{node_ip}:8080/hardware",
                     headers={
                         "User-Agent": "PersonalServer-Controller/1.0",
-                        "Authorization": f"Bearer {token or ''}"
+                        "Authorization": f"Bearer {node_auth_token}"
                     }
                 )
                 with urllib.request.urlopen(req, timeout=3.5) as resp:
@@ -661,12 +662,13 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
             if download_flag:
                 q_params["download"] = "1"
             q_str = urllib.parse.urlencode(q_params)
+            node_auth_token = (node.get("auth_token") or enrollment_token or "").strip()
             remote_url = f"http://{node_ip}:8080/hardware/microphone/recording" + (f"?{q_str}" if q_str else "")
             req = urllib.request.Request(
                 remote_url,
                 headers={
                     "User-Agent": "PersonalServer-Controller/1.0",
-                    "Authorization": f"Bearer {token or ''}",
+                    "Authorization": f"Bearer {node_auth_token}",
                 },
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -751,11 +753,12 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         node_ip = node.get("ip")
         if node_ip:
             try:
+                node_auth_token = (node.get("auth_token") or enrollment_token or "").strip()
                 req = urllib.request.Request(
                     f"http://{node_ip}:8080/live-camera",
                     headers={
                         "User-Agent": "PersonalServer-Controller/1.0",
-                        "Authorization": f"Bearer {token or ''}"
+                        "Authorization": f"Bearer {node_auth_token}"
                     }
                 )
                 with urllib.request.urlopen(req, timeout=3.5) as resp:
@@ -772,23 +775,17 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
         handler.send_json(404, {"error": f"Node '{node_id}' has no reachable IP."})
         return True
 
-    # GET /nodes/<node_id>/live-call/frame, /stream, /audio, or /status (E07)
-    if "/live-call/" in norm_path:
-        is_stream = norm_path.endswith("/live-call/stream")
-        is_frame = norm_path.endswith("/live-call/frame")
-        is_audio = norm_path.endswith("/live-call/audio")
-        is_status = norm_path.endswith("/live-call/status")
+    # GET /nodes/<node_id>/live-call/frame, /stream, /audio, or /status (E07) and CCTV aliases
+    matched_get_sub = next((tag for tag in ("/live-call/", "/camera/", "/cctv/") if tag in norm_path), None)
+    if matched_get_sub:
+        is_stream = norm_path.endswith("/stream")
+        is_frame = norm_path.endswith("/frame")
+        is_audio = norm_path.endswith("/audio")
+        is_status = norm_path.endswith("/status")
         if is_stream or is_frame or is_audio or is_status:
             prefix = "/api/nodes/" if norm_path.startswith("/api/nodes/") else "/nodes/"
-            if is_stream:
-                suffix = "/live-call/stream"
-            elif is_frame:
-                suffix = "/live-call/frame"
-            elif is_audio:
-                suffix = "/live-call/audio"
-            else:
-                suffix = "/live-call/status"
-            node_id = norm_path[len(prefix):-len(suffix)].strip("/")
+            sub_after_prefix = norm_path[len(prefix):]
+            node_id = sub_after_prefix.split(matched_get_sub)[0].strip("/")
 
             token = handler.parse_auth_token()
             enrollment_token = get_or_create_enrollment_token()
@@ -830,7 +827,8 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                         handler.end_headers()
 
                         last_ts = 0.0
-                        while not getattr(handler, "close_connection", False):
+                        stream_active = True
+                        while stream_active:
                             cur_sess = mgr.live_call.current_session
                             if not cur_sess or cur_sess.state.value != "ACTIVE":
                                 break
@@ -838,8 +836,12 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                             if frame and ts > last_ts:
                                 last_ts = ts
                                 part_header = f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n".encode("utf-8")
-                                handler.wfile.write(part_header + frame + b"\r\n")
-                                handler.wfile.flush()
+                                try:
+                                    handler.wfile.write(part_header + frame + b"\r\n")
+                                    handler.wfile.flush()
+                                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
+                                    stream_active = False
+                                    break
                             mgr.live_call.wait_for_next_frame(timeout=0.08)
                         return True
                     else:
@@ -871,6 +873,8 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                 handler.send_json(502, {"error": f"Node '{node_id}' has no reachable IP"})
                 return True
 
+            node_auth_token = (node.get("auth_token") or enrollment_token or "").strip()
+
             if is_stream:
                 remote_path = f"http://{node_ip}:8080/hardware/live-call/stream"
             elif is_frame:
@@ -889,7 +893,7 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                         headers={
                             "Content-Type": "application/json",
                             "User-Agent": "PersonalServer-Controller/1.0",
-                            "Authorization": f"Bearer {token or ''}"
+                            "Authorization": f"Bearer {node_auth_token}"
                         },
                         method="POST"
                     )
@@ -902,7 +906,7 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                         remote_path,
                         headers={
                             "User-Agent": "PersonalServer-Controller/1.0",
-                            "Authorization": f"Bearer {token or ''}"
+                            "Authorization": f"Bearer {node_auth_token}"
                         }
                     )
                     with urllib.request.urlopen(req, timeout=2.5) as resp:
@@ -914,7 +918,7 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                         remote_path,
                         headers={
                             "User-Agent": "PersonalServer-Controller/1.0",
-                            "Authorization": f"Bearer {token or ''}"
+                            "Authorization": f"Bearer {node_auth_token}"
                         }
                     )
                     handler.send_response(200)
@@ -938,7 +942,7 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                         remote_path,
                         headers={
                             "User-Agent": "PersonalServer-Controller/1.0",
-                            "Authorization": f"Bearer {token or ''}"
+                            "Authorization": f"Bearer {node_auth_token}"
                         }
                     )
                     with urllib.request.urlopen(req, timeout=3.5) as resp:
@@ -1858,6 +1862,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
             return True
 
         try:
+            node_auth_token = (node.get("auth_token") or enrollment_token or "").strip()
             req_data = json.dumps({"operation": operation, "params": params}).encode("utf-8")
             req = urllib.request.Request(
                 f"http://{node_ip}:8080/hardware",
@@ -1865,7 +1870,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "PersonalServer-Controller/1.0",
-                    "Authorization": f"Bearer {token or ''}"
+                    "Authorization": f"Bearer {node_auth_token}"
                 },
                 method="POST"
             )
@@ -1940,6 +1945,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
             return True
 
         try:
+            node_auth_token = (node.get("auth_token") or enrollment_token or "").strip()
             req_data = json.dumps({"operation": op, "params": params}).encode("utf-8")
             req = urllib.request.Request(
                 f"http://{node_ip}:8080/live-camera",
@@ -1947,7 +1953,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "PersonalServer-Controller/1.0",
-                    "Authorization": f"Bearer {token or ''}"
+                    "Authorization": f"Bearer {node_auth_token}"
                 },
                 method="POST"
             )
@@ -1969,12 +1975,13 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
             })
             return True
 
-    # 10. POST /nodes/<node_id>/live-call/<action> (E07 Live Call Communication)
-    if "/live-call/" in norm_path:
+    # 10. POST /nodes/<node_id>/live-call/<action> or /camera/<action> or /cctv/<action>
+    matched_post_sub = next((tag for tag in ("/live-call/", "/camera/", "/cctv/") if tag in norm_path), None)
+    if matched_post_sub:
         prefix = "/api/nodes/" if norm_path.startswith("/api/nodes/") else "/nodes/"
         sub = norm_path[len(prefix):]
-        if "/live-call/" in sub:
-            parts = sub.split("/live-call/", 1)
+        if matched_post_sub in sub:
+            parts = sub.split(matched_post_sub, 1)
             node_id = parts[0].strip("/")
             action = parts[1].strip("/").lower()
             enrollment_token = get_or_create_enrollment_token()
@@ -2031,6 +2038,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
                 handler.send_json(502, {"error": f"Node '{node_id}' has no reachable IP recorded."})
                 return True
 
+            node_auth_token = (node.get("auth_token") or enrollment_token or "").strip()
             try:
                 if action == "speak":
                     remote_url = f"http://{node_ip}:8080/hardware/live-call/speak"
@@ -2045,7 +2053,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
                     headers={
                         "Content-Type": "application/json",
                         "User-Agent": "PersonalServer-Controller/1.0",
-                        "Authorization": f"Bearer {token or ''}"
+                        "Authorization": f"Bearer {node_auth_token}"
                     },
                     method="POST"
                 )

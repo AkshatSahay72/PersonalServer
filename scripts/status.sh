@@ -52,6 +52,31 @@ else
 fi
 
 echo
+echo "Release:"
+if [ -f "$BASE_DIR/scripts/release_manager.py" ]; then
+    python3 "$BASE_DIR/scripts/release_manager.py" status --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    commit = d.get('installed_commit', 'unknown')[:8]
+    branch = d.get('installed_branch', 'unknown')
+    channel = d.get('channel', 'unknown')
+    status = d.get('status', 'unknown')
+    up_avail = d.get('update_available', False)
+    target = (d.get('target_commit') or '')[:8]
+    print(f'  Installed: {commit} ({branch})')
+    print(f'  Channel:   {channel}')
+    print(f'  Status:    {status}')
+    if up_avail and target:
+        print(f'  Available: {target}')
+except Exception:
+    pass
+" 2>/dev/null || echo "  Installed: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+else
+    echo "  Installed: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+fi
+
+echo
 echo "Services:"
 echo
 
@@ -87,7 +112,7 @@ echo "  Port: 8080"
 
 # Check Health endpoint
 if [ -n "$node_api_pid" ]; then
-    health_resp=$(curl -s -m 2 http://127.0.0.1:8080/health 2>/dev/null)
+    health_resp=$(curl -s -m 5 http://127.0.0.1:8080/health 2>/dev/null)
     if echo "$health_resp" | grep -q '"status": "online"'; then
         echo "  Health: healthy (online)"
     else
@@ -127,46 +152,53 @@ fi
 echo
 
 # ------------------------------------------------------------------------------
-# 3. Cloudflare Tunnel Status
+# 4. Cloudflare Tunnel Status
 # ------------------------------------------------------------------------------
 echo "Cloudflare"
-cf_pid=""
-if [ -f "$CLOUDFLARED_PID_FILE" ]; then
-    cf_pid=$(cat "$CLOUDFLARED_PID_FILE" 2>/dev/null)
-fi
 
-if [ -n "$cf_pid" ] && kill -0 "$cf_pid" 2>/dev/null && ps -p "$cf_pid" -o args= 2>/dev/null | grep -q "cloudflared"; then
-    echo "  Process: running"
-    echo "  PID: $cf_pid"
+if [ ! -f "$TOKEN_FILE" ]; then
+    echo "  Process: not configured (optional on worker nodes)"
+    echo "  PID: -"
+    echo "  Connection: skipped"
 else
-    detected_cf_pid=$(pgrep -f "cloudflared tunnel" | head -n 1)
-    if [ -n "$detected_cf_pid" ]; then
-        echo "  Process: running (untracked PID)"
-        echo "  PID: $detected_cf_pid"
-        cf_pid="$detected_cf_pid"
-    else
-        echo "  Process: stopped"
-        echo "  PID: -"
-        all_healthy=false
+    cf_pid=""
+    if [ -f "$CLOUDFLARED_PID_FILE" ]; then
+        cf_pid=$(cat "$CLOUDFLARED_PID_FILE" 2>/dev/null)
     fi
-fi
 
-# Determine connection state
-if [ -n "$cf_pid" ]; then
-    if [ -f "$CLOUDFLARED_LOG" ]; then
-        if tail -n 30 "$CLOUDFLARED_LOG" 2>/dev/null | grep -qE "Registered tunnel connection|QUIC connection successful|Connection .* registered|PASS.*QUIC|PASS.*HTTP/2"; then
-            echo "  Connection: connected"
-        elif tail -n 30 "$CLOUDFLARED_LOG" 2>/dev/null | grep -qiE "error|fail|retrying"; then
-            echo "  Connection: degraded/retrying"
-            all_healthy=false
+    if [ -n "$cf_pid" ] && kill -0 "$cf_pid" 2>/dev/null && ps -p "$cf_pid" -o args= 2>/dev/null | grep -q "cloudflared"; then
+        echo "  Process: running"
+        echo "  PID: $cf_pid"
+    else
+        detected_cf_pid=$(pgrep -f "cloudflared tunnel" | head -n 1)
+        if [ -n "$detected_cf_pid" ]; then
+            echo "  Process: running (untracked PID)"
+            echo "  PID: $detected_cf_pid"
+            cf_pid="$detected_cf_pid"
         else
-            echo "  Connection: active"
+            echo "  Process: stopped"
+            echo "  PID: -"
+            all_healthy=false
+        fi
+    fi
+
+    # Determine connection state
+    if [ -n "$cf_pid" ]; then
+        if [ -f "$CLOUDFLARED_LOG" ]; then
+            if tail -n 30 "$CLOUDFLARED_LOG" 2>/dev/null | grep -qE "Registered tunnel connection|QUIC connection successful|Connection .* registered|PASS.*QUIC|PASS.*HTTP/2"; then
+                echo "  Connection: connected"
+            elif tail -n 30 "$CLOUDFLARED_LOG" 2>/dev/null | grep -qiE "error|fail|retrying"; then
+                echo "  Connection: degraded/retrying"
+                all_healthy=false
+            else
+                echo "  Connection: active"
+            fi
+        else
+            echo "  Connection: running (no log file)"
         fi
     else
-        echo "  Connection: running (no log file)"
+        echo "  Connection: disconnected"
     fi
-else
-    echo "  Connection: disconnected"
 fi
 
 echo "=========================================="

@@ -111,6 +111,13 @@ public class TailscaleRecoveryManager {
         return vpnTransport;
     }
 
+    public String probeVpnStatus() {
+        if (!isTailscaleInstalled()) {
+            return "NOT_INSTALLED";
+        }
+        return isVpnActive() ? "CONNECTED" : "DISCONNECTED";
+    }
+
     public boolean checkPeerConnectivity(String peerIp, int port, int timeoutMs) {
         if (peerIp == null || peerIp.isEmpty()) return false;
         try (Socket sock = new Socket()) {

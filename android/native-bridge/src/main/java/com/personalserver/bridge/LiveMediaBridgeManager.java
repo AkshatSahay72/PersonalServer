@@ -22,7 +22,9 @@ import android.media.ImageReader;
 import android.media.MediaRecorder;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.PowerManager;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
 import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
@@ -50,9 +52,10 @@ public class LiveMediaBridgeManager {
 
     private static final String TAG = "LiveMediaBridgeMgr";
 
-    public static final int DEFAULT_WIDTH = 640;
-    public static final int DEFAULT_HEIGHT = 480;
-    public static final int DEFAULT_FPS = 24;
+    public static final int DEFAULT_WIDTH = 1280;
+    public static final int DEFAULT_HEIGHT = 720;
+    public static final int DEFAULT_FPS = 15;
+    public static final int DEFAULT_JPEG_QUALITY = 70;
     public static final int DEFAULT_SAMPLE_RATE = 16000;
     public static final long DEFAULT_MAX_DURATION_MS = 300_000L; // 5 minutes max session
     public static final long INACTIVITY_TIMEOUT_MS = 30_000L;     // 30 seconds without heartbeat
@@ -75,9 +78,12 @@ public class LiveMediaBridgeManager {
     private volatile int currentWidth = DEFAULT_WIDTH;
     private volatile int currentHeight = DEFAULT_HEIGHT;
     private volatile int currentFps = DEFAULT_FPS;
+    private volatile int currentJpegQuality = DEFAULT_JPEG_QUALITY;
+    private volatile long lastBroadcastFrameTs = 0L;
     private volatile boolean isMicMuted = false;
     private volatile boolean isSpeakerMuted = false;
     private volatile LiveCallNotificationListener notificationListener;
+    private PowerManager.WakeLock sessionWakeLock;
 
     // Camera2 components
     private CameraDevice cameraDevice;
@@ -210,44 +216,91 @@ public class LiveMediaBridgeManager {
                 }
             }
 
-            // Verify permissions
+            // Verify permissions: Camera is required; Microphone is optional
             boolean cameraPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
                     == PackageManager.PERMISSION_GRANTED;
             boolean micPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
                     == PackageManager.PERMISSION_GRANTED;
 
-            if (!cameraPerm || !micPerm) {
+            if (!cameraPerm) {
                 JSONObject err = new JSONObject();
                 err.put("success", false);
-                err.put("error", "ANDROID_PERMISSION_DENIED: Camera and Microphone permissions are required");
+                err.put("error", "ANDROID_PERMISSION_DENIED: Camera permission is required for CCTV streaming");
                 err.put("error_code", "PERMISSION_DENIED");
-                err.put("camera_permission", cameraPerm ? "GRANTED" : "DENIED");
+                err.put("camera_permission", "DENIED");
                 err.put("microphone_permission", micPerm ? "GRANTED" : "DENIED");
                 return err;
             }
 
-            String sessionId = params.optString("session_id", "call-" + System.currentTimeMillis());
+            String sessionId = params.optString("session_id", "cctv-" + System.currentTimeMillis());
             activeCameraId = params.optString("camera_id", "0");
-            currentWidth = params.optInt("width", DEFAULT_WIDTH);
-            currentHeight = params.optInt("height", DEFAULT_HEIGHT);
-            currentFps = params.optInt("fps", DEFAULT_FPS);
+
+            // Quality preset parsing: 720p (default), 480p, 360p or custom dimensions
+            String preset = params.optString("quality", params.optString("preset", "")).toLowerCase();
+            if ("720p".equals(preset)) {
+                currentWidth = 1280;
+                currentHeight = 720;
+                currentFps = 15;
+            } else if ("480p".equals(preset) || "vga".equals(preset)) {
+                currentWidth = 640;
+                currentHeight = 480;
+                currentFps = 15;
+            } else if ("360p".equals(preset)) {
+                currentWidth = 480;
+                currentHeight = 360;
+                currentFps = 15;
+            } else {
+                currentWidth = params.optInt("width", DEFAULT_WIDTH);
+                currentHeight = params.optInt("height", DEFAULT_HEIGHT);
+                currentFps = params.optInt("fps", DEFAULT_FPS);
+            }
+            if (currentFps <= 0) currentFps = DEFAULT_FPS;
+
+            currentJpegQuality = params.optInt("jpeg_quality", params.optInt("quality_percent", DEFAULT_JPEG_QUALITY));
+            if (currentJpegQuality < 10) currentJpegQuality = 10;
+            if (currentJpegQuality > 100) currentJpegQuality = 100;
+
             maxSessionDurationMs = params.optLong("timeout_sec", 300) * 1000L;
             boolean enableAudio = params.optBoolean("audio_enabled", true);
+            if (enableAudio && !micPerm) {
+                Log.w(TAG, "Microphone permission not granted; continuing CCTV stream without audio");
+                enableAudio = false;
+            }
             boolean enableSpeaker = params.optBoolean("speaker_enabled", true);
 
             activeSessionId = sessionId;
             isSessionActive = true;
             sessionStartedAt = System.currentTimeMillis();
             lastActivityTimestamp = sessionStartedAt;
+            lastBroadcastFrameTs = 0L;
             isMicMuted = false;
             isSpeakerMuted = false;
             capturedFrames.set(0);
             capturedAudioChunks.set(0);
             playedSpeakerChunks.set(0);
 
+            // Acquire session wake lock to keep CPU running during screen-off operation
+            PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                try {
+                    if (sessionWakeLock == null) {
+                        sessionWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PersonalServer:CCTVSessionWakeLock");
+                        sessionWakeLock.setReferenceCounted(false);
+                    }
+                    if (!sessionWakeLock.isHeld()) {
+                        sessionWakeLock.acquire(maxSessionDurationMs + 60_000L);
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed acquiring session WakeLock: " + e.getMessage());
+                }
+            }
+
             // 1. Start loopback media stream server
             boolean serverOk = mediaStreamServer.start();
             if (!serverOk) {
+                if (sessionWakeLock != null && sessionWakeLock.isHeld()) {
+                    try { sessionWakeLock.release(); } catch (Exception ignored) {}
+                }
                 isSessionActive = false;
                 activeSessionId = null;
                 JSONObject err = new JSONObject();
@@ -321,6 +374,12 @@ public class LiveMediaBridgeManager {
         stopWatchdog();
         mediaStreamServer.stop();
 
+        if (sessionWakeLock != null && sessionWakeLock.isHeld()) {
+            try {
+                sessionWakeLock.release();
+            } catch (Exception ignored) {}
+        }
+
         isSessionActive = false;
         activeSessionId = null;
 
@@ -350,6 +409,7 @@ public class LiveMediaBridgeManager {
                 res.put("camera_id", activeCameraId);
                 res.put("resolution", currentWidth + "x" + currentHeight);
                 res.put("fps", currentFps);
+                res.put("jpeg_quality", currentJpegQuality);
                 res.put("mic_muted", isMicMuted);
                 res.put("speaker_muted", isSpeakerMuted);
                 res.put("captured_frames", capturedFrames.get());
@@ -376,19 +436,66 @@ public class LiveMediaBridgeManager {
             if (params.has("mute_speaker")) {
                 isSpeakerMuted = params.getBoolean("mute_speaker");
             }
+            if (params.has("jpeg_quality") || params.has("quality_percent")) {
+                int nq = params.optInt("jpeg_quality", params.optInt("quality_percent", currentJpegQuality));
+                currentJpegQuality = Math.max(10, Math.min(100, nq));
+            }
+
+            boolean needsReinit = false;
             if (params.has("camera_id")) {
                 String newCam = params.getString("camera_id");
                 if (!newCam.equals(activeCameraId)) {
+                    Log.i(TAG, "Switching camera from " + activeCameraId + " to " + newCam);
                     activeCameraId = newCam;
-                    releaseCamera();
-                    initCamera(activeCameraId, currentWidth, currentHeight, currentFps);
+                    needsReinit = true;
                 }
+            }
+
+            if (params.has("quality") || params.has("preset")) {
+                String preset = params.optString("quality", params.optString("preset", "")).toLowerCase();
+                int nw = currentWidth;
+                int nh = currentHeight;
+                int nfps = currentFps;
+                if ("720p".equals(preset)) {
+                    nw = 1280; nh = 720; nfps = 15;
+                } else if ("480p".equals(preset) || "vga".equals(preset)) {
+                    nw = 640; nh = 480; nfps = 15;
+                } else if ("360p".equals(preset)) {
+                    nw = 480; nh = 360; nfps = 15;
+                }
+                if (nw != currentWidth || nh != currentHeight || nfps != currentFps) {
+                    currentWidth = nw;
+                    currentHeight = nh;
+                    currentFps = nfps;
+                    needsReinit = true;
+                }
+            } else if (params.has("width") || params.has("height") || params.has("fps")) {
+                int nw = params.optInt("width", currentWidth);
+                int nh = params.optInt("height", currentHeight);
+                int nfps = params.optInt("fps", currentFps);
+                if (nw != currentWidth || nh != currentHeight || nfps != currentFps) {
+                    currentWidth = nw;
+                    currentHeight = nh;
+                    currentFps = nfps;
+                    needsReinit = true;
+                }
+            }
+
+            if (needsReinit) {
+                releaseCamera();
+                try {
+                    Thread.sleep(150);
+                } catch (InterruptedException ignored) {}
+                initCamera(activeCameraId, currentWidth, currentHeight, currentFps);
             }
 
             JSONObject res = new JSONObject();
             res.put("success", true);
             res.put("session_id", activeSessionId);
             res.put("camera_id", activeCameraId);
+            res.put("resolution", currentWidth + "x" + currentHeight);
+            res.put("fps", currentFps);
+            res.put("jpeg_quality", currentJpegQuality);
             res.put("mic_muted", isMicMuted);
             res.put("speaker_muted", isSpeakerMuted);
             return res;
@@ -399,6 +506,43 @@ public class LiveMediaBridgeManager {
     // Camera2 Capture Implementation
     // =========================================================================
 
+    private Size chooseBestResolution(CameraManager cm, String cameraId, int targetW, int targetH) {
+        try {
+            CameraCharacteristics cc = cm.getCameraCharacteristics(cameraId);
+            StreamConfigurationMap map = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            if (map != null) {
+                Size[] sizes = map.getOutputSizes(ImageFormat.JPEG);
+                if (sizes != null && sizes.length > 0) {
+                    Size exact = null;
+                    Size closest = sizes[0];
+                    long minDiff = Long.MAX_VALUE;
+                    long targetPixels = (long) targetW * targetH;
+
+                    for (Size s : sizes) {
+                        if (s.getWidth() == targetW && s.getHeight() == targetH) {
+                            exact = s;
+                            break;
+                        }
+                        long diff = Math.abs((long) s.getWidth() * s.getHeight() - targetPixels);
+                        if (diff < minDiff) {
+                            minDiff = diff;
+                            closest = s;
+                        }
+                    }
+                    if (exact != null) {
+                        return exact;
+                    }
+                    Log.i(TAG, "Target resolution " + targetW + "x" + targetH + " closest supported: "
+                            + closest.getWidth() + "x" + closest.getHeight());
+                    return closest;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed negotiating camera resolution: " + e.getMessage());
+        }
+        return new Size(targetW, targetH);
+    }
+
     @SuppressLint("MissingPermission")
     private void initCamera(String cameraId, int width, int height, int fps) {
         CameraManager cm = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
@@ -408,24 +552,41 @@ public class LiveMediaBridgeManager {
         }
 
         try {
+            Size chosenSize = chooseBestResolution(cm, cameraId, width, height);
+            final int actualW = chosenSize.getWidth();
+            final int actualH = chosenSize.getHeight();
+            currentWidth = actualW;
+            currentHeight = actualH;
+
             cameraThread = new HandlerThread("Camera2BackgroundThread");
             cameraThread.start();
             cameraHandler = new Handler(cameraThread.getLooper());
 
-            imageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 2);
+            final long minFrameIntervalMs = (fps > 0) ? (1000L / fps) : 66L;
+            lastBroadcastFrameTs = 0L;
+
+            imageReader = ImageReader.newInstance(actualW, actualH, ImageFormat.JPEG, 2);
             imageReader.setOnImageAvailableListener(reader -> {
                 Image img = null;
                 try {
                     img = reader.acquireLatestImage();
                     if (img != null) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastBroadcastFrameTs < minFrameIntervalMs) {
+                            // Frame throttling for target FPS and 500-800 kbps rate control
+                            img.close();
+                            img = null;
+                            return;
+                        }
+                        lastBroadcastFrameTs = now;
+                        lastActivityTimestamp = now;
+
                         ByteBuffer buffer = img.getPlanes()[0].getBuffer();
                         byte[] bytes = new byte[buffer.remaining()];
                         buffer.get(bytes);
 
                         capturedFrames.incrementAndGet();
-                        long now = System.currentTimeMillis();
-                        lastActivityTimestamp = now;
-                        mediaStreamServer.broadcastVideoFrame(now, width, height, MediaStreamServer.CODEC_JPEG, bytes);
+                        mediaStreamServer.broadcastVideoFrame(now, actualW, actualH, MediaStreamServer.CODEC_JPEG, bytes);
                     }
                 } catch (Exception e) {
                     Log.d(TAG, "Frame processing drop: " + e.getMessage());
@@ -436,32 +597,63 @@ public class LiveMediaBridgeManager {
                 }
             }, cameraHandler);
 
+            cameraRunning.set(true);
+
             cm.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(@NonNull CameraDevice camera) {
+                    if (!cameraRunning.get()) {
+                        Log.i(TAG, "Camera opened after session release; closing immediately");
+                        try {
+                            camera.close();
+                        } catch (Exception ignored) {}
+                        return;
+                    }
                     cameraDevice = camera;
-                    cameraRunning.set(true);
                     startCameraPreviewSession();
                 }
 
                 @Override
                 public void onDisconnected(@NonNull CameraDevice camera) {
                     Log.w(TAG, "Camera disconnected");
-                    camera.close();
+                    try {
+                        camera.close();
+                    } catch (Exception ignored) {}
                     cameraDevice = null;
                     cameraRunning.set(false);
                 }
 
                 @Override
                 public void onError(@NonNull CameraDevice camera, int error) {
-                    Log.e(TAG, "Camera error: " + error);
-                    camera.close();
+                    String errName = "UNKNOWN(" + error + ")";
+                    switch (error) {
+                        case CameraDevice.StateCallback.ERROR_CAMERA_IN_USE:
+                            errName = "ERROR_CAMERA_IN_USE";
+                            break;
+                        case CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE:
+                            errName = "ERROR_MAX_CAMERAS_IN_USE";
+                            break;
+                        case CameraDevice.StateCallback.ERROR_CAMERA_DISABLED:
+                            errName = "ERROR_CAMERA_DISABLED";
+                            break;
+                        case CameraDevice.StateCallback.ERROR_CAMERA_DEVICE:
+                            errName = "ERROR_CAMERA_DEVICE";
+                            break;
+                        case CameraDevice.StateCallback.ERROR_CAMERA_SERVICE:
+                            errName = "ERROR_CAMERA_SERVICE";
+                            break;
+                    }
+                    Log.e(TAG, "Camera error: " + errName);
+                    try {
+                        camera.close();
+                    } catch (Exception ignored) {}
                     cameraDevice = null;
                     cameraRunning.set(false);
                 }
             }, cameraHandler);
         } catch (Exception e) {
             Log.e(TAG, "Failed initializing Camera2: " + e.getMessage());
+            cameraRunning.set(false);
         }
     }
 
@@ -473,16 +665,45 @@ public class LiveMediaBridgeManager {
             CaptureRequest.Builder builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
             builder.addTarget(imageReader.getSurface());
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            builder.set(CaptureRequest.JPEG_QUALITY, (byte) currentJpegQuality);
+
+            // Configure AE Target FPS range if available
+            CameraManager cm = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+            if (cm != null && activeCameraId != null) {
+                try {
+                    CameraCharacteristics cc = cm.getCameraCharacteristics(activeCameraId);
+                    Range<Integer>[] fpsRanges = cc.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                    if (fpsRanges != null) {
+                        Range<Integer> bestRange = null;
+                        for (Range<Integer> r : fpsRanges) {
+                            if (r.getUpper() <= currentFps + 5) {
+                                if (bestRange == null || r.getUpper() > bestRange.getUpper()) {
+                                    bestRange = r;
+                                }
+                            }
+                        }
+                        if (bestRange != null) {
+                            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, bestRange);
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
 
             cameraDevice.createCaptureSession(
                     Collections.singletonList(imageReader.getSurface()),
                     new CameraCaptureSession.StateCallback() {
                         @Override
                         public void onConfigured(@NonNull CameraCaptureSession session) {
+                            if (!cameraRunning.get()) {
+                                try {
+                                    session.close();
+                                } catch (Exception ignored) {}
+                                return;
+                            }
                             captureSession = session;
                             try {
                                 session.setRepeatingRequest(builder.build(), null, cameraHandler);
-                            } catch (CameraAccessException e) {
+                            } catch (Exception e) {
                                 Log.e(TAG, "Failed starting repeating capture request: " + e.getMessage());
                             }
                         }
@@ -503,7 +724,10 @@ public class LiveMediaBridgeManager {
         cameraRunning.set(false);
         try {
             if (captureSession != null) {
-                captureSession.stopRepeating();
+                try {
+                    captureSession.stopRepeating();
+                    captureSession.abortCaptures();
+                } catch (Exception ignored) {}
                 captureSession.close();
                 captureSession = null;
             }

@@ -39,6 +39,7 @@
         android:icon="@android:drawable/ic_menu_info_details"
         android:label="PersonalServer Native Bridge"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
 
         <activity
@@ -69,6 +70,15 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".TermuxCommandResultReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.personalserver.bridge.ACTION_TERMUX_RESULT" />
             </intent-filter>
         </receiver>
 

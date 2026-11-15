@@ -101,15 +101,15 @@ public class BridgeService extends Service {
         if (!running || bridgeServer == null || !bridgeServer.isListening()) {
             return;
         }
+        if (active) {
+            acquireWakeLock();
+        }
         String text = active
-                ? ("Live Call Active (" + sessionId + "): " + details)
+                ? ("CCTV Live Stream Active (" + sessionId + "): " + details)
                 : ("Loopback IPC active on 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT);
         try {
             Notification n = buildNotification(text);
-            NotificationManager nm = getSystemService(NotificationManager.class);
-            if (nm != null) {
-                nm.notify(NOTIFICATION_ID, n);
-            }
+            startForegroundWithCompat(n);
         } catch (Exception e) {
             Log.w(TAG, "Failed updating live call notification: " + e.getMessage());
         }
