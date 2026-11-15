@@ -82,6 +82,9 @@ else
     echo "[*] Existing node configuration found at $CONFIG_FILE"
 fi
 
+# Ensure shell scripts retain executable permissions where supported
+chmod +x "$SERVER_DIR/bootstrap.sh" "$SERVER_DIR"/install/*.sh "$SERVER_DIR"/scripts/*.sh 2>/dev/null || true
+
 echo "======================================================="
 echo "[OK] Termux worker provisioning complete."
 echo "Next step: Register with the controller using:"

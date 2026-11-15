@@ -67,6 +67,9 @@ else
 
 fi
 
+# Ensure shell scripts retain executable permissions where supported
+chmod +x "$SERVER_DIR/bootstrap.sh" "$SERVER_DIR"/install/*.sh "$SERVER_DIR"/scripts/*.sh 2>/dev/null || true
+
 echo
 echo "[4/4] Installation complete."
 echo
