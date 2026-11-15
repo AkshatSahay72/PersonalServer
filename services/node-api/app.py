@@ -2529,9 +2529,15 @@ document.getElementById('cmd-box').textContent = code
                 from agent.hardware.manager import HardwareCapabilityManager
                 mgr = HardwareCapabilityManager.get_instance()
                 res = mgr.execute_operation(operation, parameters=params)
-                err_code = str((res.get("result") or {}).get("error_code") or "").upper()
+                result_obj = res.get("result") or {}
+                err_code = str(result_obj.get("error_code") or result_obj.get("error") or res.get("error") or "").upper()
                 if res.get("success"):
                     status_code = 200
+                elif err_code == "SESSION_ALREADY_ACTIVE":
+                    status_code = 200
+                    res["success"] = True
+                    res["already_active"] = True
+                    res["status"] = "ACTIVE"
                 elif err_code in ("PERMISSION_DENIED", "UNAUTHORIZED"):
                     status_code = 403
                 else:

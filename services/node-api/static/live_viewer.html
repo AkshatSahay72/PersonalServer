@@ -290,7 +290,9 @@
           data = await res.json();
         } catch (e) {}
 
-        const isOk = (res.ok && data.success) || (data && (data.already_active || data.error === "SESSION_ALREADY_ACTIVE"));
+        const resErr = (data && data.result && (data.result.error || data.result.error_code)) || (data && data.error) || "";
+        const isAlreadyActive = Boolean(data && (data.already_active || resErr === "SESSION_ALREADY_ACTIVE"));
+        const isOk = (res.ok && data.success) || isAlreadyActive;
         if (isOk) {
           isStreaming = true;
           document.getElementById("btn-toggle").textContent = "⏹ Stop Stream";
@@ -298,6 +300,11 @@
           updateBadge("LIVE", "live");
           document.getElementById("placeholder").style.display = "none";
           document.getElementById("telemetry").style.display = "flex";
+
+          const activeSess = (data && data.result && data.result.session) || (data && data.session) || {};
+          if (activeSess.camera_id !== undefined && activeSess.camera_id !== null) {
+            activeCamera = String(activeSess.camera_id);
+          }
 
           const img = document.getElementById("stream-img");
           const streamUrl = `/camera/stream?t=${Date.now()}` + (token ? `&token=${encodeURIComponent(token)}` : "");
@@ -468,6 +475,28 @@
         document.exitFullscreen().catch(() => {});
       }
     }
+
+    async function checkExistingStream() {
+      try {
+        const res = await fetch("/hardware", { headers: getAuthHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          const hw = data.hardware || {};
+          const liveCall = hw.live_call || {};
+          if (liveCall.session_active) {
+            console.log("Existing active session discovered, connecting viewer...");
+            if (liveCall.facing) {
+              activeCamera = liveCall.facing === "front" ? "1" : "0";
+            }
+            await startStream();
+          }
+        }
+      } catch (e) {}
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      checkExistingStream();
+    });
   </script>
 </body>
 </html>

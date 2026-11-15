@@ -6247,7 +6247,8 @@ async function startLiveCallSession() {
       body: JSON.stringify(payload)
     });
 
-    if (!res || !res.success) {
+    const isAlready = Boolean(res && (res.already_active || res.error === "SESSION_ALREADY_ACTIVE" || (res.result && res.result.error === "SESSION_ALREADY_ACTIVE")));
+    if (!res || (!res.success && !isAlready)) {
       const err = res?.error || "Failed to establish live call session.";
       if (err.includes("PERMISSION_DENIED") || err.includes("permission")) {
         showPermissionWarning();
