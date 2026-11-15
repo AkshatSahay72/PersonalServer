@@ -929,13 +929,18 @@ def handle_node_get(handler: Any, path: str, query: Dict[str, list]) -> bool:
                     handler.send_header("Access-Control-Allow-Origin", "*")
                     handler.end_headers()
 
+                    stream_active = True
                     with urllib.request.urlopen(req, timeout=60.0) as resp:
-                        while not getattr(handler, "close_connection", False):
-                            chunk = resp.read(8192)
-                            if not chunk:
+                        while stream_active:
+                            try:
+                                chunk = resp.read(8192)
+                                if not chunk:
+                                    break
+                                handler.wfile.write(chunk)
+                                handler.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
+                                stream_active = False
                                 break
-                            handler.wfile.write(chunk)
-                            handler.wfile.flush()
                     return True
                 else:
                     req = urllib.request.Request(
@@ -2066,6 +2071,17 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
                     err_data = json.loads(e.read().decode("utf-8"))
                 except Exception:
                     err_data = {"error": f"Node returned HTTP {e.code}: {e.reason}"}
+                if action == "start" and ((err_data.get("result") or {}).get("error") == "SESSION_ALREADY_ACTIVE" or err_data.get("error") == "SESSION_ALREADY_ACTIVE"):
+                    active_sess = (err_data.get("result") or {}).get("session", {})
+                    handler.send_json(200, {
+                        "node_id": node_id,
+                        "success": True,
+                        "status": "ACTIVE",
+                        "session_id": active_sess.get("session_id", "active"),
+                        "session": active_sess,
+                        "already_active": True
+                    })
+                    return True
                 handler.send_json(e.code, {"node_id": node_id, **err_data})
                 return True
             except Exception as e:

@@ -1367,7 +1367,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                         parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False},
                         timeout_sec=300.0
                     )
-                    if not ok:
+                    if not ok and res.get("error") != "SESSION_ALREADY_ACTIVE":
                         self.send_json(503, {"error": "No active camera session and auto-start failed", "details": res})
                         return
                     sess = mgr.live_call.current_session
@@ -1430,7 +1430,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                         parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False},
                         timeout_sec=60.0
                     )
-                    if not ok:
+                    if not ok and res.get("error") != "SESSION_ALREADY_ACTIVE":
                         self.send_json(503, {"error": "No active camera session and auto-start failed", "details": res})
                         return
                     # Wait briefly for first frame

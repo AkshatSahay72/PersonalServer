@@ -6362,12 +6362,24 @@ function startLiveCallStreamOrLoop(nodeId) {
     videoStream.src = streamUrl;
     videoStream.style.display = "block";
 
+    videoStream.onload = () => {
+      liveCallFpsCounter++;
+    };
+
     videoStream.onerror = () => {
       console.warn("MJPEG stream error or unsupported; falling back to frame loop");
       if (liveCallFrameLoopActive) {
         startLiveCallFrameLoopFallback(nodeId);
       }
     };
+
+    // Watchdog fallback: if no frames rendered after 2.5s, engage rapid frame loop
+    setTimeout(() => {
+      if (liveCallFrameLoopActive && liveCallFpsCounter === 0) {
+        console.info("MJPEG stream watchdog: No frames received in 2.5s; engaging frame loop fallback");
+        startLiveCallFrameLoopFallback(nodeId);
+      }
+    }, 2500);
   }
 
   if (liveCallFpsTimer) clearInterval(liveCallFpsTimer);

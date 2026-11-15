@@ -285,8 +285,13 @@
           })
         });
 
-        const data = await res.json();
-        if (res.ok && data.success) {
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (e) {}
+
+        const isOk = (res.ok && data.success) || (data && (data.already_active || data.error === "SESSION_ALREADY_ACTIVE"));
+        if (isOk) {
           isStreaming = true;
           document.getElementById("btn-toggle").textContent = "⏹ Stop Stream";
           document.getElementById("btn-toggle").className = "btn-danger";
@@ -301,18 +306,76 @@
           document.getElementById("pill-res").textContent = quality;
           document.getElementById("pill-cam").textContent = activeCamera === "1" ? "Front (1)" : "Rear (0)";
 
+          img.onerror = () => {
+            console.warn("MJPEG stream error or unsupported in img; falling back to frame polling");
+            startFramePollingFallback();
+          };
+
+          // Watchdog: If no frames rendered after 2.5s, engage frame polling fallback
+          setTimeout(() => {
+            if (isStreaming && fpsCount === 0) {
+              console.info("Watchdog engaging frame polling fallback");
+              startFramePollingFallback();
+            }
+          }, 2500);
+
           startFpsTracking();
         } else {
           updateBadge("ERROR", "error");
           alert("Failed to start stream: " + (data.error || JSON.stringify(data)));
         }
       } catch (err) {
+        // Even if POST /hardware fails, attempt direct /camera/stream connection
+        try {
+          isStreaming = true;
+          document.getElementById("placeholder").style.display = "none";
+          document.getElementById("telemetry").style.display = "flex";
+          const img = document.getElementById("stream-img");
+          img.src = `/camera/stream?t=${Date.now()}`;
+          img.style.display = "block";
+          updateBadge("LIVE", "live");
+          document.getElementById("btn-toggle").textContent = "⏹ Stop Stream";
+          document.getElementById("btn-toggle").className = "btn-danger";
+          startFpsTracking();
+          startFramePollingFallback();
+          return;
+        } catch (e) {}
         updateBadge("FAILED", "error");
         alert("Connection failed: " + err.message);
       }
     }
 
+    let framePollingActive = false;
+    function startFramePollingFallback() {
+      if (framePollingActive || !isStreaming) return;
+      framePollingActive = true;
+      const pollLoop = async () => {
+        if (!isStreaming || !framePollingActive) return;
+        try {
+          const frameUrl = `/camera/frame?t=${Date.now()}` + (token ? `&token=${encodeURIComponent(token)}` : "");
+          const r = await fetch(frameUrl);
+          if (r.ok) {
+            const blob = await r.blob();
+            if (blob.size > 0 && isStreaming) {
+              const objUrl = URL.createObjectURL(blob);
+              const img = document.getElementById("stream-img");
+              const old = img.src;
+              img.src = objUrl;
+              img.style.display = "block";
+              if (old && old.startsWith("blob:")) URL.revokeObjectURL(old);
+              fpsCount++;
+            }
+          }
+        } catch (e) {}
+        if (isStreaming && framePollingActive) {
+          setTimeout(pollLoop, 65);
+        }
+      };
+      pollLoop();
+    }
+
     async function stopStream() {
+      framePollingActive = false;
       try {
         await fetch("/hardware", {
           method: "POST",
