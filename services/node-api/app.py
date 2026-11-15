@@ -234,6 +234,16 @@ def ensure_storage_root():
 
 def get_controller_auth_token():
     """Load enrollment token or node auth token for controller communication."""
+    try:
+        reg_file = RUNTIME_DIR / "registration.json"
+        if reg_file.exists():
+            with open(reg_file, "r", encoding="utf-8") as f:
+                reg_data = json.load(f)
+                if reg_data.get("auth_token"):
+                    return reg_data["auth_token"].strip()
+    except Exception:
+        pass
+
     enrollment_file = SECRETS_DIR / "enrollment.token"
     if enrollment_file.exists():
         try:
