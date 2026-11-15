@@ -18,6 +18,7 @@ import time
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -53,6 +54,8 @@ class TestClusterInventoryV18(unittest.TestCase):
             config_dir=self.config_dir
         )
         self.paths = self.paths_ctx.__enter__()
+        self.finder_patcher = patch("config.ha_manager.find_active_leader", return_value=(None, None))
+        self.finder_patcher.start()
 
         # Realistic V1.8 cluster nodes database
         self.nodes_file = self.data_dir / "nodes.json"
@@ -159,6 +162,8 @@ class TestClusterInventoryV18(unittest.TestCase):
             f.write("NODE_ID=server-5387a86bf36116b1\nNODE_NAME=\"Vivo Y31\"\n")
 
     def tearDown(self):
+        if hasattr(self, "finder_patcher"):
+            self.finder_patcher.stop()
         self.paths_ctx.__exit__(None, None, None)
         shutil.rmtree(self.test_root, ignore_errors=True)
 
