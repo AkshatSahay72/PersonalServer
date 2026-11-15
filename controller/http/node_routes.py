@@ -1299,9 +1299,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
     # 3. POST /nodes/<node_id>/drain
     if path.startswith("/nodes/") and path.endswith("/drain"):
         node_id = path[7:-6].strip()
-        enrollment_token = get_or_create_enrollment_token()
-        if not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Admin enrollment token required to drain a node"})
+        if not _require_admin_auth(handler, token, "Unauthorized: Admin enrollment token required to drain a node"):
             return True
 
         nodes_db = load_nodes_db()
@@ -1361,9 +1359,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
     # 4. POST /nodes/<node_id>/deboard
     if path.startswith("/nodes/") and path.endswith("/deboard"):
         node_id = path[7:-8].strip()
-        enrollment_token = get_or_create_enrollment_token()
-        if not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Admin enrollment token required to deboard a node"})
+        if not _require_admin_auth(handler, token, "Unauthorized: Admin enrollment token required to deboard a node"):
             return True
 
         nodes_db = load_nodes_db()
@@ -1405,9 +1401,7 @@ def handle_node_post(handler: Any, path: str, body: Dict[str, Any], token: str) 
     # 5. POST /nodes/<node_id>/resume
     if path.startswith("/nodes/") and path.endswith("/resume"):
         node_id = path[7:-7].strip()
-        enrollment_token = get_or_create_enrollment_token()
-        if not constant_time_compare(token, enrollment_token):
-            handler.send_json(401, {"error": "Unauthorized: Admin enrollment token required to resume a node"})
+        if not _require_admin_auth(handler, token, "Unauthorized: Admin enrollment token required to resume a node"):
             return True
 
         nodes_db = load_nodes_db()
