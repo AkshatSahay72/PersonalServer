@@ -1358,9 +1358,13 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             try:
                 from agent.hardware.manager import HardwareCapabilityManager
                 mgr = HardwareCapabilityManager.get_instance()
-                sess = mgr.live_call.current_session
-                if not sess or sess.state.value != "ACTIVE":
-                    # Auto-start on-demand CCTV stream if requested via camera/cctv endpoint
+                cur_sess = mgr.live_call.current_session
+                frame, ts = mgr.live_call.get_latest_frame_with_timestamp()
+                stale = (ts > 0 and (time.time() - ts > 4.0))
+                if not cur_sess or cur_sess.state.value != "ACTIVE" or stale or not mgr.live_call.is_active():
+                    if stale or (cur_sess and not mgr.live_call.is_active()):
+                        mgr.live_call.stop_session("Auto-recovering stale camera session")
+                        time.sleep(0.2)
                     preset_q = query.get("quality", ["720p"])[0] or "720p"
                     cam_id = query.get("camera_id", ["0"])[0] or "0"
                     ok, res = mgr.live_call.start_session(
@@ -1370,7 +1374,8 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     if not ok and res.get("error") != "SESSION_ALREADY_ACTIVE":
                         self.send_json(503, {"error": "No active camera session and auto-start failed", "details": res})
                         return
-                    sess = mgr.live_call.current_session
+                    mgr.live_call.wait_for_next_frame(timeout=2.0)
+                    cur_sess = mgr.live_call.current_session
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0")

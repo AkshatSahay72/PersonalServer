@@ -128,7 +128,11 @@ class LiveCallProvider:
 
     def is_active(self) -> bool:
         with self._lock:
-            return bool(self.current_session and self.current_session.state == SessionState.ACTIVE)
+            if not (self.current_session and self.current_session.state == SessionState.ACTIVE):
+                return False
+            if self._media_thread and not self._media_thread.is_alive():
+                return False
+            return True
 
     def get_capabilities(self) -> Dict[str, Any]:
         return {
@@ -157,8 +161,37 @@ class LiveCallProvider:
         # In CI or host development, simulated live call is supported
         return True, "Simulated host provider available"
 
+    def _ensure_bridge_awake(self):
+        """Probes port 8765. If unreachable on Android, triggers BridgeActivity via 'am' to wake the service."""
+        try:
+            with socket.create_connection((self.bridge_host, self.bridge_port), timeout=0.3):
+                return
+        except Exception:
+            pass
+
+        # Try to wake up BridgeActivity via Android 'am' command if on Android
+        try:
+            import subprocess
+            am_bin = find_termux_tool("am") or "am"
+            subprocess.run(
+                [am_bin, "start", "-n", "com.personalserver.bridge/.BridgeActivity"],
+                capture_output=True,
+                timeout=4
+            )
+            for _ in range(12):
+                time.sleep(0.25)
+                try:
+                    with socket.create_connection((self.bridge_host, self.bridge_port), timeout=0.2):
+                        logger.info("Successfully woke Native Bridge on %s:%s", self.bridge_host, self.bridge_port)
+                        return
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("Failed waking native bridge: %s", e)
+
     def _call_native_bridge(self, operation: str, parameters: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
         """Sends a JSON control request to LocalBridgeServer on 127.0.0.1:8765."""
+        self._ensure_bridge_awake()
         req = {
             "version": 1,
             "protocol_version": 1,
@@ -170,8 +203,8 @@ class LiveCallProvider:
             "data": parameters or {}
         }
         try:
-            with socket.create_connection((self.bridge_host, self.bridge_port), timeout=2.5) as s:
-                s.settimeout(2.5)
+            with socket.create_connection((self.bridge_host, self.bridge_port), timeout=6.0) as s:
+                s.settimeout(6.0)
                 payload = (json.dumps(req) + "\n").encode("utf-8")
                 s.sendall(payload)
                 buf = b""
@@ -215,22 +248,24 @@ class LiveCallProvider:
             if "with_speaker" in params and "speaker_enabled" not in params:
                 params["speaker_enabled"] = bool(params["with_speaker"])
 
+            camera_id = str(params.get("camera_id", "0"))
+            quality = StreamQuality.from_dict(params)
+            audio_enabled = bool(params.get("audio_enabled", True))
+            speaker_enabled = bool(params.get("speaker_enabled", True))
+
             # 1. Prevent duplicate active sessions
             if self.current_session and self.current_session.state == SessionState.ACTIVE:
                 if not self.current_session.is_expired():
                     return LiveCallResult({
                         "success": False,
                         "error": "SESSION_ALREADY_ACTIVE",
+                        "error_code": "SESSION_ALREADY_ACTIVE",
                         "session": self.current_session.to_dict()
                     })
                 else:
                     self.stop_session("Prior session timed out")
 
             session_id = f"call-{uuid.uuid4().hex[:8]}"
-            camera_id = str(params.get("camera_id", "0"))
-            quality = StreamQuality.from_dict(params)
-            audio_enabled = bool(params.get("audio_enabled", True))
-            speaker_enabled = bool(params.get("speaker_enabled", True))
 
             session = LiveCallSession(
                 session_id=session_id,
@@ -259,15 +294,33 @@ class LiveCallProvider:
             }
 
             ok, res = self._call_native_bridge("START_LIVE_CALL", bridge_params)
-            is_native = ok and res.get("status") == "ACTIVE"
+            err_code = str(res.get("error_code") or res.get("error") or "").upper()
+            if not ok and "SESSION_ALREADY_ACTIVE" in err_code:
+                logger.info("Prior bridge session active; sending STOP_LIVE_CALL reset")
+                self._call_native_bridge("STOP_LIVE_CALL", {"reason": "Re-syncing"})
+                time.sleep(0.3)
+                ok, res = self._call_native_bridge("START_LIVE_CALL", bridge_params)
+
+            is_native = ok and (res.get("status") == "ACTIVE" or res.get("success") is True)
+            is_android = os.path.exists("/data/data/com.termux") or "com.termux" in os.environ.get("PREFIX", "")
 
             if is_native:
                 self.media_port = int(res.get("media_port", DEFAULT_MEDIA_PORT))
                 self._start_media_stream_client(self.media_port)
-            else:
-                # Host/mock fallback for development or simulated tests
+            elif not is_android:
+                # Host/mock fallback for development or simulated tests (CI / Windows / Linux PC)
                 logger.info("Using simulated live media generator (Native bridge not active: %s)", res.get("error"))
                 self._start_simulated_stream_generator(quality)
+            else:
+                logger.error("Native bridge failed on Android device: %s", res.get("error"))
+                session.state = SessionState.ERROR
+                self.current_session = None
+                return LiveCallResult({
+                    "success": False,
+                    "status": "ERROR",
+                    "error": f"Native bridge failed to start camera: {res.get('error', 'unknown error')}",
+                    "backend": "none"
+                })
 
             session.state = SessionState.ACTIVE
             session.started_at = time.time()
@@ -544,10 +597,14 @@ class LiveCallProvider:
                 logger.debug("Media client socket stream ended: %s", e)
         finally:
             try:
-                sock.close()
+                if sock:
+                    sock.close()
             except Exception:
                 pass
             self._media_socket = None
+            if not self._stop_event.is_set() and self.current_session:
+                logger.warning("Media stream connection lost unexpectedly; resetting session state")
+                self.current_session.state = SessionState.IDLE
 
     def _recv_exact(self, sock: socket.socket, num_bytes: int) -> bytes:
         data = bytearray()

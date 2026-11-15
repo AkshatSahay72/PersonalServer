@@ -200,6 +200,21 @@ class AndroidPermissionBridge:
         self.probe_storage_permission()
 
         # Camera & Audio require companion native service or prompt
+        import socket
+        try:
+            with socket.create_connection(("127.0.0.1", 8765), timeout=0.3):
+                self._states["android.permission.CAMERA"] = BridgePermissionState.PERMISSION_GRANTED
+                self._states["android.permission.RECORD_AUDIO"] = BridgePermissionState.PERMISSION_GRANTED
+        except Exception:
+            cam_path = self.find_tool("termux-camera-info")
+            if cam_path:
+                try:
+                    cres = subprocess.run([cam_path], capture_output=True, text=True, timeout=2.0)
+                    if cres.returncode == 0 and cres.stdout.strip().startswith("["):
+                        self._states["android.permission.CAMERA"] = BridgePermissionState.PERMISSION_GRANTED
+                except Exception:
+                    pass
+
         if self._states.get("android.permission.CAMERA") == BridgePermissionState.DETECTED:
             self._states["android.permission.CAMERA"] = BridgePermissionState.PERMISSION_REQUIRED
 
