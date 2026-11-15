@@ -125,6 +125,12 @@ class LiveCallProvider:
         self._audio_channels: int = 1
         self._frame_listeners: List[Callable[[bytes], None]] = []
         self._audio_listeners: List[Callable[[bytes, int, int], None]] = []
+        self._last_frame_consumed_time: float = 0.0
+        self._watchdog_thread: Optional[threading.Thread] = None
+
+    def mark_frame_consumed(self):
+        """Records client frame consumption activity to prevent inactivity watchdog timeout."""
+        self._last_frame_consumed_time = time.time()
 
     def is_active(self) -> bool:
         with self._lock:
@@ -282,12 +288,15 @@ class LiveCallProvider:
             self._frame_event.clear()
 
             # 2. Try native Android bridge
+            jpeg_quality = int(params.get("jpeg_quality", 50))
             bridge_params = {
                 "session_id": session_id,
                 "camera_id": camera_id,
                 "width": quality.width,
                 "height": quality.height,
                 "fps": quality.fps,
+                "jpeg_quality": jpeg_quality,
+                "quality_percent": jpeg_quality,
                 "audio_enabled": audio_enabled,
                 "speaker_enabled": speaker_enabled,
                 "timeout_sec": timeout_sec
@@ -325,6 +334,8 @@ class LiveCallProvider:
             session.state = SessionState.ACTIVE
             session.started_at = time.time()
             session.webrtc_state = "CONNECTED"
+            self._last_frame_consumed_time = time.time()
+            self._start_inactivity_watchdog()
 
             # 3. Generate WebRTC SDP answer and ICE candidates
             offer_sdp = params.get("sdp_offer", "")
@@ -341,18 +352,36 @@ class LiveCallProvider:
                 "backend": "android-native-bridge" if is_native else "simulated-test-stream"
             })
 
+    def _start_inactivity_watchdog(self):
+        """Starts a background monitor that auto-releases camera if no clients consume frames for >15s."""
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_thread = threading.Thread(
+            target=self._inactivity_watchdog_loop,
+            daemon=True,
+            name="LiveCallInactivityWatchdog"
+        )
+        self._watchdog_thread.start()
+
+    def _inactivity_watchdog_loop(self):
+        while not self._stop_event.is_set():
+            time.sleep(2.0)
+            with self._lock:
+                if not self.current_session or self.current_session.state != SessionState.ACTIVE:
+                    break
+                if self._last_frame_consumed_time > 0 and (time.time() - self._last_frame_consumed_time > 15.0):
+                    logger.info("Inactivity watchdog: no consumers for 15s; auto-releasing camera to IDLE")
+                    self.stop_session("Inactivity watchdog: no consumers for 15s")
+                    break
+
     def stop_session(self, reason: str = "Requested by user/controller") -> LiveCallResult:
         """Terminates the live call session and guarantees release of all hardware resources."""
         with self._lock:
-            if not self.current_session:
-                return LiveCallResult({"success": True, "status": "IDLE", "message": "No live call session was active"})
-
-            session = self.current_session
-            session.state = SessionState.STOPPING
+            self._last_frame_consumed_time = 0.0
             self._stop_event.set()
 
-            # 1. Stop native bridge session
-            self._call_native_bridge("STOP_LIVE_CALL", {"session_id": session.session_id, "reason": reason})
+            # 1. ALWAYS stop native bridge session and release Camera2 hardware
+            self._call_native_bridge("STOP_LIVE_CALL", {"reason": reason})
 
             # 2. Close media socket connection
             if self._media_socket:
@@ -366,16 +395,19 @@ class LiveCallProvider:
                 self._media_thread.join(timeout=1.0)
                 self._media_thread = None
 
-            # 3. Mark session stopped
+            with self._frame_lock:
+                self._latest_jpeg_frame = None
+
+            if not self.current_session:
+                return LiveCallResult({"success": True, "status": "IDLE", "message": "No live call session was active"})
+
+            session = self.current_session
             session.state = SessionState.IDLE
             session.stopped_at = time.time()
             session.webrtc_state = "CLOSED"
             data = session.to_dict()
             data["stop_reason"] = reason
             self.current_session = None
-
-            with self._frame_lock:
-                self._latest_jpeg_frame = None
 
             logger.info("Live call session %s stopped cleanly (%s)", session.session_id, reason)
             return LiveCallResult({"success": True, "status": "STOPPED", "session": data})
@@ -487,6 +519,7 @@ class LiveCallProvider:
 
     def get_latest_frame(self) -> Optional[bytes]:
         """Returns the most recent JPEG video frame."""
+        self.mark_frame_consumed()
         with self._frame_lock:
             return self._latest_jpeg_frame
 
@@ -494,11 +527,13 @@ class LiveCallProvider:
         """Waits for next newly captured video frame or returns the latest available frame."""
         self._frame_event.wait(timeout=timeout)
         self._frame_event.clear()
+        self.mark_frame_consumed()
         with self._frame_lock:
             return self._latest_jpeg_frame
 
     def get_latest_frame_with_timestamp(self) -> Tuple[Optional[bytes], float]:
         """Returns the most recent JPEG video frame and its arrival timestamp."""
+        self.mark_frame_consumed()
         with self._frame_lock:
             return self._latest_jpeg_frame, self._frame_timestamp
 

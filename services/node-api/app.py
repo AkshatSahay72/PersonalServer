@@ -34,6 +34,10 @@ PORT = 8080
 # Can optionally be capped via the MAX_UPLOAD_BYTES environment variable (in bytes)
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES")) if os.environ.get("MAX_UPLOAD_BYTES") else None
 
+# CCTV streaming viewer reference counter & lock (for automatic on-demand hardware release)
+_active_stream_viewers = 0
+_cctv_stream_lock = threading.Lock()
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE_DIR))
 import mimetypes
@@ -1355,6 +1359,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
                 return
+            global _active_stream_viewers
+            with _cctv_stream_lock:
+                _active_stream_viewers += 1
+
             try:
                 from agent.hardware.manager import HardwareCapabilityManager
                 mgr = HardwareCapabilityManager.get_instance()
@@ -1365,10 +1373,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     if stale or (cur_sess and not mgr.live_call.is_active()):
                         mgr.live_call.stop_session("Auto-recovering stale camera session")
                         time.sleep(0.2)
-                    preset_q = query.get("quality", ["720p"])[0] or "720p"
+                    preset_q = query.get("quality", ["480p"])[0] or "480p"
                     cam_id = query.get("camera_id", ["0"])[0] or "0"
                     ok, res = mgr.live_call.start_session(
-                        parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False},
+                        parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False, "jpeg_quality": 50},
                         timeout_sec=300.0
                     )
                     if not ok and res.get("error") != "SESSION_ALREADY_ACTIVE":
@@ -1393,6 +1401,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                     frame, ts = mgr.live_call.get_latest_frame_with_timestamp()
                     if frame and ts > last_ts:
                         last_ts = ts
+                        mgr.live_call.mark_frame_consumed()
                         part_header = f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n".encode("utf-8")
                         try:
                             self.wfile.write(part_header + frame + b"\r\n")
@@ -1408,6 +1417,16 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"error": f"Failed streaming live call: {e}"})
                 return
+            finally:
+                with _cctv_stream_lock:
+                    _active_stream_viewers = max(0, _active_stream_viewers - 1)
+                    remaining = _active_stream_viewers
+                if remaining == 0:
+                    try:
+                        from agent.hardware.manager import HardwareCapabilityManager
+                        HardwareCapabilityManager.get_instance().live_call.stop_session("All CCTV viewers disconnected")
+                    except Exception:
+                        pass
 
         # 3b4. On-Demand Live Call Video Frame (E07): GET /hardware/live-call/frame, /camera/frame, /cctv/frame
         if path in (
@@ -1426,25 +1445,32 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
             try:
                 from agent.hardware.manager import HardwareCapabilityManager
                 mgr = HardwareCapabilityManager.get_instance()
-                sess = mgr.live_call.current_session
-                if not sess or sess.state.value != "ACTIVE":
-                    # Auto-start on-demand CCTV snapshot if not active
-                    preset_q = query.get("quality", ["720p"])[0] or "720p"
+                cur_sess = mgr.live_call.current_session
+                was_active = bool(cur_sess and cur_sess.state.value == "ACTIVE" and mgr.live_call.is_active())
+                if not was_active:
+                    preset_q = query.get("quality", ["480p"])[0] or "480p"
                     cam_id = query.get("camera_id", ["0"])[0] or "0"
                     ok, res = mgr.live_call.start_session(
-                        parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False},
-                        timeout_sec=60.0
+                        parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False, "jpeg_quality": 50},
+                        timeout_sec=30.0
                     )
                     if not ok and res.get("error") != "SESSION_ALREADY_ACTIVE":
                         self.send_json(503, {"error": "No active camera session and auto-start failed", "details": res})
                         return
-                    # Wait briefly for first frame
                     mgr.live_call.wait_for_next_frame(timeout=1.5)
-                    sess = mgr.live_call.current_session
+
                 frame, ts = mgr.live_call.get_latest_frame_with_timestamp()
+                mgr.live_call.mark_frame_consumed()
                 if not frame:
                     self.send_json(503, {"error": "No video frame available yet"})
                     return
+
+                # If this was a one-off snapshot and no streaming viewer is connected, release camera
+                with _cctv_stream_lock:
+                    has_viewers = _active_stream_viewers > 0
+                if not was_active and not has_viewers:
+                    mgr.live_call.stop_session("Snapshot complete - releasing camera")
+
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(frame)))

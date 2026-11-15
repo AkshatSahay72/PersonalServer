@@ -219,9 +219,9 @@
       <div class="controls-group">
         <label for="select-res" style="font-size: 12px; color: #9ca3af;">Quality:</label>
         <select id="select-res" onchange="changeQuality()">
-          <option value="720p" selected>720p (1280x720, 15 FPS)</option>
-          <option value="480p">480p (640x480, 15 FPS)</option>
-          <option value="360p">360p (480x360, 15 FPS)</option>
+          <option value="480p" selected>480p (Fast, 640x480, 15 FPS)</option>
+          <option value="720p">720p (HD, 1280x720, 15 FPS)</option>
+          <option value="360p">360p (Ultra Fast, 480x360, 15 FPS)</option>
         </select>
         <button onclick="takeSnapshot()">📸 Snapshot</button>
         <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
@@ -279,8 +279,9 @@
             params: {
               camera_id: activeCamera,
               quality: quality,
+              jpeg_quality: 50,
               audio_enabled: false,
-              timeout_sec: 1800
+              timeout_sec: 300
             }
           })
         });
@@ -476,26 +477,30 @@
       }
     }
 
-    async function checkExistingStream() {
-      try {
-        const res = await fetch("/hardware", { headers: getAuthHeaders() });
-        if (res.ok) {
-          const data = await res.json();
-          const hw = data.hardware || {};
-          const liveCall = hw.live_call || {};
-          if (liveCall.session_active) {
-            console.log("Existing active session discovered, connecting viewer...");
-            if (liveCall.facing) {
-              activeCamera = liveCall.facing === "front" ? "1" : "0";
-            }
-            await startStream();
-          }
-        }
-      } catch (e) {}
-    }
-
     window.addEventListener("DOMContentLoaded", () => {
-      checkExistingStream();
+      // Clean STANDBY state on page load - strictly on-demand
+      updateBadge("STANDBY", "");
+      document.getElementById("btn-toggle").textContent = "▶ Start Stream";
+      document.getElementById("btn-toggle").className = "btn-primary";
+    });
+
+    // Auto-release camera hardware on tab close or navigation
+    window.addEventListener("beforeunload", () => {
+      if (isStreaming) {
+        navigator.sendBeacon("/hardware", JSON.stringify({
+          operation: "STOP_LIVE_CALL",
+          params: { reason: "Page unload" }
+        }));
+      }
+    });
+
+    window.addEventListener("pagehide", () => {
+      if (isStreaming) {
+        navigator.sendBeacon("/hardware", JSON.stringify({
+          operation: "STOP_LIVE_CALL",
+          params: { reason: "Page hidden" }
+        }));
+      }
     });
   </script>
 </body>
