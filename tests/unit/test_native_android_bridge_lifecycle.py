@@ -469,10 +469,25 @@ public abstract class AccessibilityService extends Context {
     public abstract void onAccessibilityEvent(AccessibilityEvent event);
     public abstract void onInterrupt();
     public AccessibilityNodeInfo getRootInActiveWindow() { return null; }
+    public AccessibilityServiceInfo getServiceInfo() { return new AccessibilityServiceInfo(); }
+    public void setServiceInfo(AccessibilityServiceInfo info) {}
     public void onDestroy() {}
 }
 """,
-    "android/accessibilityservice/AccessibilityServiceInfo.java": "package android.accessibilityservice; public class AccessibilityServiceInfo {}",
+    "android/accessibilityservice/AccessibilityServiceInfo.java": """
+package android.accessibilityservice;
+public class AccessibilityServiceInfo {
+    public static final int FEEDBACK_GENERIC = 16;
+    public static final int FLAG_DEFAULT = 1;
+    public static final int FLAG_RETRIEVE_INTERACTIVE_WINDOWS = 4;
+    public static final int FLAG_INCLUDE_NOT_IMPORTANT_VIEWS = 2;
+    public int eventTypes;
+    public int feedbackType;
+    public int flags;
+    public long notificationTimeout;
+    public String[] packageNames;
+}
+""",
     "android/view/accessibility/AccessibilityEvent.java": """
 package android.view.accessibility;
 public class AccessibilityEvent {
@@ -491,9 +506,13 @@ public class AccessibilityNodeInfo {
     public List<AccessibilityNodeInfo> findAccessibilityNodeInfosByText(String text) { return new ArrayList<>(); }
     public boolean isClickable() { return false; }
     public boolean isChecked() { return false; }
+    public boolean isCheckable() { return false; }
     public boolean performAction(int action) { return true; }
     public AccessibilityNodeInfo getParent() { return null; }
     public CharSequence getClassName() { return null; }
+    public CharSequence getContentDescription() { return null; }
+    public CharSequence getText() { return null; }
+    public CharSequence getViewIdResourceName() { return null; }
     public int getChildCount() { return 0; }
     public AccessibilityNodeInfo getChild(int index) { return null; }
     public void recycle() {}

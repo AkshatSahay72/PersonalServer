@@ -817,6 +817,7 @@ public class BridgeActivity extends AppCompatActivity {
 
     public void launchTailscaleApp() {
         if (tailscaleRecoveryManager != null) {
+            TailscaleAccessibilityService.requestAutoToggle();
             Intent intent = tailscaleRecoveryManager.resolveLaunchIntent();
             try {
                 startActivity(intent);

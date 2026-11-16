@@ -92,6 +92,21 @@ public class TailscaleAccessibilityService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         activeInstance = this;
+        try {
+            AccessibilityServiceInfo info = getServiceInfo();
+            if (info == null) {
+                info = new AccessibilityServiceInfo();
+            }
+            info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED | AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED;
+            info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
+            info.flags = AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                    | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
+            info.notificationTimeout = 100;
+            info.packageNames = new String[]{TAILSCALE_PACKAGE};
+            setServiceInfo(info);
+        } catch (Exception e) {
+            Log.w(TAG, "Configuring service info via code failed: " + e.getMessage());
+        }
         Log.i(TAG, "TailscaleAccessibilityService connected and ready");
     }
 
@@ -121,23 +136,10 @@ public class TailscaleAccessibilityService extends AccessibilityService {
         if (root == null) return;
 
         try {
-            // 1. Primary Strategy: Look for known connect toggle view ID
-            List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(TOGGLE_RES_ID);
+            List<AccessibilityNodeInfo> candidates = new java.util.ArrayList<>();
+            findCandidatesRecursively(root, candidates);
 
-            // 2. Fallback Strategy A: Look for text "Connect" or "Tap to connect"
-            if (nodes.isEmpty()) {
-                nodes = root.findAccessibilityNodeInfosByText("Connect");
-            }
-            if (nodes.isEmpty()) {
-                nodes = root.findAccessibilityNodeInfosByText("Tap to connect");
-            }
-
-            // 3. Fallback Strategy B: Search for Switch widget if disconnected
-            if (nodes.isEmpty()) {
-                searchForSwitchNode(root, nodes);
-            }
-
-            for (AccessibilityNodeInfo node : nodes) {
+            for (AccessibilityNodeInfo node : candidates) {
                 if (node == null) continue;
                 if (attemptClick(node)) {
                     Log.i(TAG, "Zero-touch accessibility action: successfully activated Tailscale connection toggle");
@@ -152,38 +154,83 @@ public class TailscaleAccessibilityService extends AccessibilityService {
         }
     }
 
-    private boolean attemptClick(AccessibilityNodeInfo node) {
-        if (node == null) return false;
-        if (node.isClickable()) {
-            return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        }
-        AccessibilityNodeInfo parent = node.getParent();
-        if (parent != null && parent.isClickable()) {
-            boolean clicked = parent.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            try { parent.recycle(); } catch (Exception ignored) {}
-            return clicked;
-        }
-        return false;
-    }
+    private void findCandidatesRecursively(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> candidates) {
+        if (node == null) return;
 
-    private void searchForSwitchNode(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> result) {
-        if (node == null || result.size() > 0) return;
-        CharSequence className = node.getClassName();
-        if (className != null && (className.toString().contains("Switch") || className.toString().contains("ToggleButton"))) {
-            if (!node.isChecked()) {
-                result.add(node);
-                return;
+        boolean matches = false;
+
+        // 1. Checkable switch/toggle that is currently unchecked (Compose or native Switch)
+        if (node.isCheckable() && !node.isChecked()) {
+            matches = true;
+        }
+
+        // 2. View resource ID containing connect or toggle
+        CharSequence resId = node.getViewIdResourceName();
+        if (!matches && resId != null) {
+            String idStr = resId.toString().toLowerCase();
+            if (idStr.contains("connect_toggle") || idStr.contains("toggle") || idStr.contains("connect")) {
+                matches = true;
             }
         }
+
+        // 3. Content Description matches "connect", "stopped", or "tailscale"
+        CharSequence desc = node.getContentDescription();
+        if (!matches && desc != null) {
+            String descStr = desc.toString().toLowerCase();
+            if (descStr.contains("connect") || descStr.contains("toggle") || descStr.contains("stopped") || descStr.contains("tap to connect")) {
+                matches = true;
+            }
+        }
+
+        // 4. Text matches "Connect", "Stopped", or "Tap to connect"
+        CharSequence text = node.getText();
+        if (!matches && text != null) {
+            String textStr = text.toString().toLowerCase();
+            if (textStr.equals("connect") || textStr.contains("tap to connect") || textStr.equals("stopped") || textStr.contains("disconnected")) {
+                matches = true;
+            }
+        }
+
+        // 5. Class name contains Switch or ToggleButton
+        CharSequence cls = node.getClassName();
+        if (!matches && cls != null) {
+            String clsStr = cls.toString();
+            if ((clsStr.contains("Switch") || clsStr.contains("ToggleButton")) && !node.isChecked()) {
+                matches = true;
+            }
+        }
+
+        if (matches) {
+            candidates.add(node);
+        }
+
         int childCount = node.getChildCount();
         for (int i = 0; i < childCount; i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
-                searchForSwitchNode(child, result);
-                if (result.size() > 0) return;
-                try { child.recycle(); } catch (Exception ignored) {}
+                findCandidatesRecursively(child, candidates);
             }
         }
+    }
+
+    private boolean attemptClick(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+        if (node.isClickable() && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            return true;
+        }
+        AccessibilityNodeInfo curr = node;
+        for (int depth = 0; depth < 4; depth++) {
+            AccessibilityNodeInfo parent = curr.getParent();
+            if (parent != null) {
+                if (parent.isClickable() && parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    return true;
+                }
+                curr = parent;
+            } else {
+                break;
+            }
+        }
+        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
     @Override

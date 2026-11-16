@@ -160,11 +160,13 @@ public class TermuxRecoveryManager {
         switch (operation) {
             case OP_START_SERVICES:
                 executable = "/data/data/com.termux/files/usr/bin/bash";
-                arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/start.sh"};
+                arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/doctor.sh", "fix"};
+                workDir = "/data/data/com.termux/files/home/PersonalServer";
                 break;
             case OP_STOP_SERVICES:
                 executable = "/data/data/com.termux/files/usr/bin/bash";
                 arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/stop.sh"};
+                workDir = "/data/data/com.termux/files/home/PersonalServer";
                 break;
             case OP_RUN_DOCTOR:
                 executable = "/data/data/com.termux/files/usr/bin/bash";
