@@ -25,14 +25,21 @@ python scripts/doctor.py
 5. **Storage Sandbox & File Permissions**: Validates write permissions and detects primary database corruption.
 
 ### Automated Repair (Self-Healing Mode):
-If degraded or orphaned services are detected, run the doctor in repair mode:
+If degraded or orphaned services are detected, run the doctor in repair mode using the wrapper script:
 ```bash
+./scripts/doctor.sh fix
+# or directly with python:
 python scripts/doctor.py --repair
 ```
+
+> [!IMPORTANT]
+> **Failsafe & Supervisor Rule:** Running `./scripts/doctor.sh` without arguments runs in *read-only diagnostic mode* and will not fix problems. Autonomous node watchdogs, background recovery daemons, and failsafe supervisors must explicitly invoke `./scripts/doctor.sh fix` to trigger active remediation.
+
 **Automated Repairs Performed:**
-- Cleans stale lock files and dead PID registrations.
-- Adopts untracked running controller processes.
+- Cleans stale lock files and dead PID registrations across `runtime/`.
+- Resurrects dead daemons (`node-api` :8080, `node-worker`, `cloudflared`, `node-heartbeat`).
 - Restores corrupted JSON databases from their automated timestamped backups (`*.bak`).
+- Triggers Tailscale mesh auto-reconnect routines (see [Node Failsafe & Auto-Recovery](../features/failsafe-recovery.md)).
 
 ---
 
