@@ -25,14 +25,26 @@ This matrix maps all functional and operational requirements to their milestone,
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **NODE-001** | One-tap startup via RUN_COMMAND intent | P0 | M0 | `BridgeActivity.java`, `NodeStartupStateMachine.java` | Physical tap validation | **Verified** |
 | **NODE-002** | Persistent foreground service lifecycle | P0 | M0 | `BridgeService.java`, `AndroidManifest.xml` | Foreground notification check | **Verified** |
-| **NODE-003** | Tailscale detection & zero-touch coordinate toggle | P0 | M3 | `TailscaleRecoveryManager.java`, `docs/features/failsafe-recovery.md` | VPN disconnect & tap test | **In Progress** |
+| **NODE-003** | Tailscale detection & Accessibility zero-touch toggle | P0 | M3 | `TailscaleRecoveryManager.java`, `TailscaleAccessibilityService.java` | Dynamic view hierarchy test | **In Progress** |
 | **NODE-004** | Cross-device Android 11 & 16 compatibility | P0 | M2 | `build.gradle`, `BridgeService.java` | Physical test on Y31 & R5P | **Scheduled** |
 | **NODE-005** | Thermal throttling when battery > 42°C | P1 | M3 | `agent/node-agent.py`, `node_telemetry.py` | Unit test with simulated thermal | **Verified** |
 | **NODE-006** | Auto-resurrection via active doctor repair (`doctor.sh fix`) | P0 | M3 | `scripts/doctor.sh`, `scripts/doctor.py` | Process kill recovery test | **In Progress** |
 
 ---
 
-## 3. Cluster Control Plane & Ingress (`CTRL-xxx`)
+## 3. Failsafe, Concurrency & Storage Resilience (`FAIL-xxx`)
+
+| ID | Description | Priority | Milestone | Implementing Files | Verification Test | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **FAIL-001** | Active remediation via `scripts/doctor.sh fix` | P0 | M3 | `scripts/doctor.sh`, `scripts/doctor.py` | Automated repair integration test | **In Progress** |
+| **FAIL-002** | Zero-touch Tailscale toggle via Accessibility Service | P0 | M3 | `TailscaleRecoveryManager.java`, `TailscaleAccessibilityService.java` | View ID toggle simulation | **In Progress** |
+| **FAIL-003** | Bounded 5MB log rotation across all daemons | P1 | M3 | `services/node-api/app.py`, `agent/node-agent.py` | Log overflow test | **Scheduled** |
+| **FAIL-004** | Multi-process store concurrency via `fcntl.flock` | P0 | M3 | `controller/stores/base.py` | Parallel process write collision test | **Scheduled** |
+| **FAIL-005** | HA monotonic clock lease validity (`time.monotonic`) | P0 | M3 | `config/ha_manager.py` | Simulated clock jump test | **Scheduled** |
+
+---
+
+## 4. Cluster Control Plane & Ingress (`CTRL-xxx`)
 
 | ID | Description | Priority | Milestone | Implementing Files | Verification Test | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |

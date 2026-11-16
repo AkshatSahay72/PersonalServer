@@ -47,11 +47,16 @@ flowchart LR
 ---
 
 ### Milestone M3: Node Health, Thermal Protection & Auto-Recovery
-- **Objective:** Guarantee 24/7 hardware longevity, thermal safety, and automated self-healing across mobile nodes before expanding to wider cluster devices.
+- **Objective:** Guarantee 24/7 cluster survivability, autonomous self-healing, process concurrency safety, and storage protection across mobile nodes.
 - **Scope:**
   - **Thermal Protection Engine (Completed):** Active battery temperature monitor in `Node Agent` / `node_telemetry.py`: throttle on-demand streams at 42°C, emergency cutoff at 45°C with hysteresis cooldown lock.
   - **Failsafe Remediation Refactor (`doctor.sh fix`):** Ensure autonomous supervisor and watchdog routines explicitly invoke `scripts/doctor.sh fix` (`--repair`) rather than passive diagnostic inspection, actively purging dead PID locks, resurrecting crashed daemons (Node API, Worker, Cloudflared), and repairing state stores.
-  - **Zero-Touch Tailscale Auto-Recovery:** Eliminate manual VPN toggling on Android by implementing an automated top-left coordinate tap / Accessibility UI toggle after intent launch (`am start -n com.tailscale.ipn/.MainActivity`) when `100.x.y.z` interface drops.
+  - **Zero-Touch Tailscale Auto-Recovery (Dynamic Alternative Options):**
+    - *Option A (Recommended):* Android Accessibility Service within Native Bridge to locate and toggle the Connect/Switch widget dynamically by text or ID (immune to screen resolution, DPI, or orientation).
+    - *Option B (Fallback):* Screen-wake (`FLAG_DISMISS_KEYGUARD`) + model-calibrated coordinate tap (`input tap <X> <Y>`).
+  - **Log Rotation & Storage Guard:** Implement bounded 5MB log rotation (`RotatingFileHandler`, `maxBytes=5MB`, `backupCount=3`) across `app.py`, `node-agent.py`, and `scripts/start.sh` to eliminate disk exhaustion (`ENOSPC`) crashes.
+  - **Multi-Process Store Concurrency (`fcntl.flock`):** Upgrade `controller/stores/base.py` to use inter-process file locking (`fcntl.flock`) alongside in-memory `RLock` to prevent concurrent CLI, Doctor, and Controller write collisions.
+  - **HA Consensus Monotonic Clock Sync:** Switch lease duration and heartbeat timers in `config/ha_manager.py` from wall-clock `time.time()` to monotonic countdowns (`time.monotonic()`) to eliminate split-brain risks from clock drift or NTP adjustments.
   - **Dashboard Alerts & Supervisor Resilience:** Real-time thermal alerts on UI, process anti-churn backoff, and Termux service resurrection.
 - **Dependencies:** M1.
 - **Status:** **Active Priority**

@@ -73,38 +73,74 @@ On Android edge nodes, Tailscale runs as an OS VPN service application (`com.tai
 2. Triggering an Android Intent (`am start -n com.tailscale.ipn/.MainActivity`) only opens the Tailscale application into the foreground.
 3. **The VPN toggle switch remains unclicked.** The app sits on screen waiting for physical human touch, breaking remote autonomous operation.
 
-### 4.2 The Solution: Fixed-Coordinate Automated UI Toggle
-The Tailscale Android application has a clean, static interface where the main connection toggle button sits at a **fixed, deterministic location in the top-left area** of the screen.
+### 4.2 The Solution: Dynamic View Hierarchy Inspection via Android Accessibility Service
+
+Rather than relying on brittle pixel coordinates that break across different screen resolutions and orientations, PersonalServer implements an **unprivileged Android Accessibility Service** (`TailscaleAccessibilityService.java`) embedded directly inside the Native Bridge companion app (`com.personalserver.bridge`).
 
 ```mermaid
 sequenceDiagram
-    participant SUP as Watchdog / Native Bridge
-    participant ANDROID as Android OS / Input System
+    participant SUP as Recovery Coordinator / Native Bridge
+    participant ANDROID as Android OS / Accessibility Manager
+    participant ACC as TailscaleAccessibilityService
     participant TS as Tailscale App (com.tailscale.ipn)
     
     SUP->>SUP: Detect Tailscale VPN offline (no 100.x.y.z IP)
     SUP->>ANDROID: Launch Intent: am start -n com.tailscale.ipn/.MainActivity
     Note over ANDROID,TS: Tailscale UI opens to foreground
-    SUP->>SUP: Wait 500ms for UI surface render
-    SUP->>ANDROID: Dispatch tap event to fixed toggle coordinates (e.g., input tap X Y)
-    ANDROID->>TS: Toggle switch activated (CONNECTING -> CONNECTED)
-    SUP->>SUP: Poll network interface for 100.x.y.z
+    ANDROID->>ACC: onAccessibilityEvent (TYPE_WINDOW_STATE_CHANGED)
+    ACC->>TS: Query view hierarchy: "Connect" or com.tailscale.ipn:id/connect_toggle
+    ACC->>TS: performAction(AccessibilityNodeInfo.ACTION_CLICK)
+    Note over TS: Toggle switch clicked; VPN establishes
+    SUP->>SUP: Poll network interface until 100.x.y.z active
     SUP->>ANDROID: Bring PersonalServer Bridge back to foreground
     Note over SUP: Node mesh restored to ONLINE
 ```
 
-### 4.3 Implementation Strategy:
-1. **Coordinate Mapping:** Calibrate standard toggle coordinates per device resolution (e.g. `X=140, Y=260` on 1080x2400 displays) or query the UI node via Android AccessibilityService / Companion Bridge.
-2. **Execution Vector:**
-   - **Method A (Termux with Accessibility / Input):** `input tap <X> <Y>` executed shortly after launching the intent.
-   - **Method B (Native Bridge Service):** Companion app uses an unprivileged Accessibility Service or standard UI automation helper to click the Toggle widget.
-3. **Re-Verification Gate:** After toggling, the watchdog verifies that `100.x.y.z` interface responds within 5 seconds before returning PersonalServer to foreground.
+### 4.3 Why Accessibility Inspection is Superior:
+1. **100% Screen & Hardware Immune:** Completely immune to screen resolution, DPI, aspect ratio, and portrait/landscape orientation differences across Vivo V2334 (FHD+ 2400x1080), Vivo Y31 (FHD+ 2408x1080), and Realme 5 Pro (FHD+ 2340x1080).
+2. **Resilient to UI Theme Shifts:** Finds the node by programmatic view ID (`com.tailscale.ipn:id/connect_toggle`) or localized content description, unaffected by dark mode or accent color shifts.
+3. **Scoped Security:** Configured with `packageNames="com.tailscale.ipn"` in its service metadata, ensuring it has zero visibility into any other application on the phone.
+
+#### Option B: Screen-Wake + Model-Calibrated Coordinate Tap (Fallback)
+If Accessibility permissions are not granted, the supervisor uses coordinate tapping with essential safety guards:
+1. **Screen Wake & Keyguard Dismiss:** Ensure display is turned on and keyguard dismissed before tapping (`input keyevent 26` or Android `wakeUp()` with `FLAG_DISMISS_KEYGUARD`).
+2. **Device-Specific Calibration:** Read `node.json` to lookup pre-calibrated coordinates for that specific phone model (e.g. `V2334: (140, 260)`, `R5P: (120, 240)`).
+3. **Dispatch Tap:** `input tap <X> <Y>` after a 500ms surface render delay.
 
 ---
 
-## 5. Thermal & Hardware Longevity Failsafe
+## 5. Storage, Concurrency & HA Consensus Failsafes
 
-Operating mobile phones continuously requires strict thermal safeguards to prevent battery swelling:
+### 5.1 Bounded Log Rotation (Preventing Disk `ENOSPC` Crashes)
+To prevent logs from consuming 100% of internal mobile storage over weeks of 24/7 operation:
+* All Python entry points (`services/node-api/app.py`, `agent/node-agent.py`) must configure `logging.handlers.RotatingFileHandler`:
+  - `maxBytes = 5 * 1024 * 1024` (5 MB per log file).
+  - `backupCount = 3` (retaining a maximum of 15 MB total per service).
+* Shell startup scripts (`scripts/start.sh`) must pass stdout/stderr through log-truncating pipes or cron cleaners rather than unbounded `>>` appends.
+
+### 5.2 Multi-Process Store Concurrency (`fcntl.flock`)
+The Controller JSON stores (`controller/stores/base.py`) must not rely solely on in-process thread locks (`threading.RLock()`). When `doctor.py --repair` or `controller/cli.py` executes in a separate process, they must acquire an OS-level file lock before mutating store files:
+```python
+import fcntl
+with open(lock_file_path, "w") as lock_file:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    try:
+        atomic_write_json_file(target_file, data)
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+```
+This guarantees zero lost writes or silent database overwrites across concurrent processes.
+
+### 5.3 HA Monotonic Time Consensus (`time.monotonic()`)
+Distributed consensus leases in `config/ha_manager.py` must decouple lease expiration from wall-clock `time.time()`. 
+* Network latency, clock drift, or automatic NTP updates between geographically distant nodes (Punjab ↔ Gujarat) can step wall-clock time backwards or forwards, triggering false lease expirations and Split-Brain conditions.
+* All lease countdowns, election backoffs, and leader heartbeats must compute validity durations using `time.monotonic()`.
+
+---
+
+## 6. Thermal Failsafe (Operational Limits)
+
+Operating mobile phones continuously requires thermal protection to prevent hardware shutdown:
 * **`NORMAL` (<= 39.0°C):** Full speed, on-demand 720p 15 FPS video available.
 * **`WARM` (39.1°C – 41.9°C):** Warning alert logged, background batch workers throttled.
 * **`THROTTLED` (42.0°C – 44.9°C):** On-demand video automatically throttled to 360p @ 5 FPS. Camera lock auto-released after 10s idle.
@@ -112,9 +148,11 @@ Operating mobile phones continuously requires strict thermal safeguards to preve
 
 ---
 
-## 6. Traceability & Requirements Mapping
+## 7. Traceability & Requirements Mapping
 
 * **FAIL-001:** Autonomous watchdog must invoke `scripts/doctor.sh fix` (`--repair`) to perform active remediation.
-* **FAIL-002:** Automated Tailscale toggle via fixed coordinate click / Accessibility automation when VPN drops.
-* **FAIL-003:** Thermal cutoff and hysteresis cooldown lock for battery longevity.
-* **FAIL-004:** Daemon anti-churn backoff (preventing rapid restart loops if a binary is fundamentally broken).
+* **FAIL-002:** Automated Tailscale toggle via dynamic Accessibility Service (Option A) or calibrated coordinate tap with screen wake (Option B).
+* **FAIL-003:** Bounded 5MB log rotation across all daemon logs to prevent `ENOSPC` disk exhaustion.
+* **FAIL-004:** Multi-process `fcntl.flock` protection in `controller/stores/base.py` to prevent concurrent write corruption.
+* **FAIL-005:** Monotonic clock countdowns in `config/ha_manager.py` to prevent clock-drift split-brain.
+* **FAIL-006:** Thermal cutoff and hysteresis cooldown lock for hardware protection.
