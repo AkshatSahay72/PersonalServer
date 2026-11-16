@@ -26,6 +26,7 @@ The Android Companion App bridges Android OS platform capabilities to unprivileg
 - **`TermuxCommandResultReceiver.java`:** Broadcast receiver capturing exit codes and stdout/stderr from Termux `RUN_COMMAND` actions.
 - **`LocalBridgeServer.java`:** Lightweight HTTP server on port 8765 handling local IPC requests from Python.
 - **`MediaStreamServer.java`:** High-throughput loopback streaming socket on port 8766 delivering JPEG frames to the Node API.
+- **Tailscale Zero-Touch Auto-Recovery:** Integrates automated UI toggling for Tailscale VPN: detects stalled or disconnected mesh interfaces, launches the Tailscale intent, and dispatches a tap event to the fixed top-left toggle button coordinates to re-enable VPN without manual operator intervention (see [Failsafe & Self-Healing](failsafe-recovery.md)).
 
 ---
 

@@ -25,10 +25,10 @@ This matrix maps all functional and operational requirements to their milestone,
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **NODE-001** | One-tap startup via RUN_COMMAND intent | P0 | M0 | `BridgeActivity.java`, `NodeStartupStateMachine.java` | Physical tap validation | **Verified** |
 | **NODE-002** | Persistent foreground service lifecycle | P0 | M0 | `BridgeService.java`, `AndroidManifest.xml` | Foreground notification check | **Verified** |
-| **NODE-003** | Tailscale connectivity detection & resume | P0 | M0 | `TailscaleRecoveryManager.java` | VPN state change test | **Verified** |
+| **NODE-003** | Tailscale detection & zero-touch coordinate toggle | P0 | M3 | `TailscaleRecoveryManager.java`, `docs/features/failsafe-recovery.md` | VPN disconnect & tap test | **In Progress** |
 | **NODE-004** | Cross-device Android 11 & 16 compatibility | P0 | M2 | `build.gradle`, `BridgeService.java` | Physical test on Y31 & R5P | **Scheduled** |
-| **NODE-005** | Thermal throttling when battery > 42°C | P1 | M3 | `agent/node-agent.py`, `node_telemetry.py` | Unit test with simulated thermal | **Scheduled** |
-| **NODE-006** | Auto-resurrection of crashed node services | P1 | M3 | `TermuxRecoveryManager.java`, `doctor.py` | Process kill recovery test | **Verified** |
+| **NODE-005** | Thermal throttling when battery > 42°C | P1 | M3 | `agent/node-agent.py`, `node_telemetry.py` | Unit test with simulated thermal | **Verified** |
+| **NODE-006** | Auto-resurrection via active doctor repair (`doctor.sh fix`) | P0 | M3 | `scripts/doctor.sh`, `scripts/doctor.py` | Process kill recovery test | **In Progress** |
 
 ---
 

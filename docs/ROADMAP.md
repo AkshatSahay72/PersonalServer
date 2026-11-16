@@ -49,12 +49,12 @@ flowchart LR
 ### Milestone M3: Node Health, Thermal Protection & Auto-Recovery
 - **Objective:** Guarantee 24/7 hardware longevity, thermal safety, and automated self-healing across mobile nodes before expanding to wider cluster devices.
 - **Scope:**
-  - Active battery temperature monitor in `Node Agent`: throttle or pause camera streams if battery temp exceeds 42°C.
-  - Dashboard thermal alerts, warnings, and safety notifications.
-  - Enhanced node supervisor: automatic detection and resurrection of crashed Node API or worker processes.
-  - Native watchdog self-healing for unprivileged Termux environments.
+  - **Thermal Protection Engine (Completed):** Active battery temperature monitor in `Node Agent` / `node_telemetry.py`: throttle on-demand streams at 42°C, emergency cutoff at 45°C with hysteresis cooldown lock.
+  - **Failsafe Remediation Refactor (`doctor.sh fix`):** Ensure autonomous supervisor and watchdog routines explicitly invoke `scripts/doctor.sh fix` (`--repair`) rather than passive diagnostic inspection, actively purging dead PID locks, resurrecting crashed daemons (Node API, Worker, Cloudflared), and repairing state stores.
+  - **Zero-Touch Tailscale Auto-Recovery:** Eliminate manual VPN toggling on Android by implementing an automated top-left coordinate tap / Accessibility UI toggle after intent launch (`am start -n com.tailscale.ipn/.MainActivity`) when `100.x.y.z` interface drops.
+  - **Dashboard Alerts & Supervisor Resilience:** Real-time thermal alerts on UI, process anti-churn backoff, and Termux service resurrection.
 - **Dependencies:** M1.
-- **Status:** **Immediate Next Priority**
+- **Status:** **Active Priority**
 
 ---
 
