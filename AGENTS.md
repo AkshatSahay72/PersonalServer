@@ -116,7 +116,24 @@ PersonalServer/
 
 ---
 
-## 5. Development Workflow Overview
+## 5. Three-Branch Git Strategy & Node Auto-Sync Policy
+
+The repository operates on exactly **3 standard branches**:
+
+1. **`main` (Production):**
+   - The authoritative production branch running on all cluster nodes (Punjab Vivo V2334, Gujarat Vivo Y31, Gujarat Realme 5 Pro).
+   - Contains only verified, stable code. Direct commits or unreviewed pushes are forbidden.
+   - **Cluster Auto-Sync:** Android companion app (`com.personalserver.bridge` v1.1.0) automatically triggers an update check and pull against `main` on app startup and every 24 hours via `RecoveryCoordinator.java` (`OP_PULL_PRODUCTION`), guaranteeing zero-configuration cluster-wide consistency.
+2. **`development` (Staging & Feature Integration):**
+   - The primary trunk for day-to-day engineering. All bug fixes, feature milestones (M4, M2), and subsystem updates are developed and verified here.
+   - Merged into `main` only after 100% automated test passing and physical node verification.
+3. **`experimental` (Research Sandbox & Spikes):**
+   - Exploratory sandbox for prototyping new concepts, hardware experiments, or risky architecture spikes without affecting `development` or `main`.
+   - Viable features are cleaned up and merged into `development`.
+
+---
+
+## 6. Development Workflow Overview
 
 Every significant feature must follow the 11-stage pipeline:
 ```text

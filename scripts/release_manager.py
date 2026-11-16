@@ -29,7 +29,7 @@ RELEASE_STATE_FILE = RUNTIME_DIR / "release_state.json"
 RELEASE_LOG_FILE = LOGS_DIR / "release_history.log"
 STAGING_DIR = RUNTIME_DIR / "staging"
 
-DEFAULT_CHANNEL = "release/stable"
+DEFAULT_CHANNEL = "main"
 DEFAULT_REMOTE = "origin"
 
 # Protected paths that must NEVER be overwritten, cleared, or deleted during updates
@@ -206,16 +206,21 @@ def fetch_release_target(channel: str, remote: str, timeout: int = 15) -> Tuple[
     code, stdout, _ = run_git_command(["rev-parse", "--verify", f"{channel}^{{commit}}"])
     local_commit = stdout if code == 0 else None
 
-    # Fetch from remote with bounded timeout
-    code, stdout, stderr = run_git_command(["fetch", "--quiet", remote, f"{channel}:{channel}"], timeout=timeout)
+    # Fetch from remote with bounded timeout (standard fetch to update remote-tracking ref)
+    code, stdout, stderr = run_git_command(["fetch", "--quiet", remote, channel], timeout=timeout)
     if code != 0:
-        # Check if fetch failed because of offline / network unreachable
-        # If remote fetch failed, but local branch exists, we can still operate on local release branch
-        if local_commit:
-            return True, local_commit, f"Remote fetch failed ({stderr or 'timeout'}); using local {channel}"
-        return False, None, f"Fetch failed: {stderr or 'network error or remote unreachable'}"
+        # Fallback refspec attempt if needed
+        code2, _, stderr2 = run_git_command(["fetch", "--quiet", remote, f"{channel}:{channel}"], timeout=timeout)
+        if code2 != 0:
+            if local_commit:
+                return True, local_commit, f"Remote fetch failed ({stderr or 'timeout'}); using local {channel}"
+            return False, None, f"Fetch failed: {stderr or 'network error or remote unreachable'}"
 
-    # Get the latest commit hash on the release branch
+    # Get the latest commit hash on the remote release branch or local ref
+    code, stdout, _ = run_git_command(["rev-parse", "--verify", f"{remote}/{channel}^{{commit}}"])
+    if code == 0 and stdout:
+        return True, stdout, "Fetch successful"
+
     code, stdout, stderr = run_git_command(["rev-parse", "--verify", f"{channel}^{{commit}}"])
     if code == 0 and stdout:
         return True, stdout, "Fetch successful"
@@ -277,7 +282,7 @@ def verify_staged_release(target_commit: str) -> Tuple[bool, str]:
     return True, "Integrity and syntax verification passed"
 
 
-def apply_release(target_commit: str, state: Dict[str, Any], force: bool = False) -> Tuple[bool, str]:
+def apply_release(target_commit: str, state: Dict[str, Any], force: bool = False, channel: Optional[str] = None) -> Tuple[bool, str]:
     """
     Safely apply target commit to active working tree:
     - Verifies local modifications are safe.
@@ -297,8 +302,11 @@ def apply_release(target_commit: str, state: Dict[str, Any], force: bool = False
     state["rollback_commit"] = current_commit
     state["target_commit"] = target_commit
 
-    # Checkout target commit into current working tree
-    code, stdout, stderr = run_git_command(["checkout", "--quiet", target_commit])
+    # Checkout target commit into current working tree (maintaining named branch when specified)
+    if channel:
+        code, stdout, stderr = run_git_command(["checkout", "--quiet", "-B", channel, target_commit])
+    else:
+        code, stdout, stderr = run_git_command(["checkout", "--quiet", target_commit])
     if code != 0:
         return False, f"Git checkout to {target_commit} failed: {stderr}"
 
@@ -535,7 +543,7 @@ def main():
             sys.exit(1)
 
         # Apply update
-        ok, msg = apply_release(target_commit, state, force=args.force)
+        ok, msg = apply_release(target_commit, state, force=args.force, channel=channel)
         res = {
             "success": ok,
             "status": "UPDATED" if ok else "APPLY_FAILED",

@@ -35,13 +35,15 @@ public class TermuxRecoveryManager {
     public static final String OP_RUN_DOCTOR = "RUN_DOCTOR";
     public static final String OP_START_SSHD = "START_SSHD";
     public static final String OP_SERVICE_STATUS = "SERVICE_STATUS";
+    public static final String OP_PULL_PRODUCTION = "PULL_PRODUCTION";
 
     public static final Set<String> ALLOWED_OPERATIONS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
             OP_START_SERVICES,
             OP_STOP_SERVICES,
             OP_RUN_DOCTOR,
             OP_START_SSHD,
-            OP_SERVICE_STATUS
+            OP_SERVICE_STATUS,
+            OP_PULL_PRODUCTION
     )));
 
     // Distinct recovery operation states
@@ -176,6 +178,11 @@ public class TermuxRecoveryManager {
             case OP_SERVICE_STATUS:
                 executable = "/data/data/com.termux/files/usr/bin/bash";
                 arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/status.sh"};
+                break;
+            case OP_PULL_PRODUCTION:
+                executable = "/data/data/com.termux/files/usr/bin/bash";
+                arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/update.sh"};
+                workDir = "/data/data/com.termux/files/home/PersonalServer";
                 break;
             default:
                 throw new IllegalArgumentException("Unhandled allowlist operation: " + operation);

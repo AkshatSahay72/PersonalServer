@@ -37,11 +37,14 @@ public class RecoveryCoordinator {
     public static final String KEY_RECOVERY_ENABLED = "recovery_enabled";
     public static final String KEY_MAX_RETRY_COUNT = "max_retry_count";
     public static final String KEY_COOLDOWN_SEC = "cooldown_sec";
+    public static final String KEY_AUTO_SYNC_PRODUCTION = "auto_sync_production";
+    public static final String KEY_LAST_DAILY_SYNC_MS = "last_daily_sync_ms";
 
     public static final int DEFAULT_MAX_RETRY = 3;
     public static final int DEFAULT_COOLDOWN_SEC = 60;
     public static final int SUPERVISOR_LOOP_SEC = 30;
     public static final int MAX_UNKNOWN_ATTEMPTS = 2;
+    public static final long DAILY_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000L; // 24 hours
 
     public interface ServiceHealthProbe {
         Boolean probeNodeApi();
@@ -141,6 +144,23 @@ public class RecoveryCoordinator {
         prefs.edit().putInt(KEY_COOLDOWN_SEC, sec).apply();
     }
 
+    public boolean isAutoSyncProductionEnabled() {
+        return prefs.getBoolean(KEY_AUTO_SYNC_PRODUCTION, true);
+    }
+
+    public void setAutoSyncProductionEnabled(boolean enabled) {
+        prefs.edit().putBoolean(KEY_AUTO_SYNC_PRODUCTION, enabled).apply();
+        recordEvent("CONFIG_CHANGED", "auto_sync_production set to " + enabled, null);
+    }
+
+    public long getLastDailySyncMs() {
+        return prefs.getLong(KEY_LAST_DAILY_SYNC_MS, 0L);
+    }
+
+    public void recordProductionSyncSuccess() {
+        prefs.edit().putLong(KEY_LAST_DAILY_SYNC_MS, System.currentTimeMillis()).apply();
+    }
+
     public int getTermuxRetryCount() {
         return termuxRetryCount;
     }
@@ -201,6 +221,9 @@ public class RecoveryCoordinator {
                 // UP: No recovery
                 termuxRetryCount = 0;
                 unknownTermuxCount = 0;
+
+                // Daily automated production (main branch) sync
+                checkDailyProductionSync(now);
             } else if ("DEGRADED".equals(termuxServices)) {
                 unknownTermuxCount = 0;
                 if (termuxRetryCount < maxRetries && (now - lastTermuxRecoveryMs) >= effectiveCooldownMs) {
@@ -708,6 +731,23 @@ public class RecoveryCoordinator {
                 recoveryEvents.remove(0);
             }
         } catch (Exception ignored) {}
+    }
+
+    public void checkDailyProductionSync(long now) {
+        if (!isAutoSyncProductionEnabled()) return;
+        long lastSync = getLastDailySyncMs();
+        if ((now - lastSync) >= DAILY_SYNC_INTERVAL_MS) {
+            if (termuxManager.isCommandIntegrationReady()) {
+                Log.i(TAG, "Triggering scheduled daily production sync from main branch...");
+                try {
+                    termuxManager.executeApprovedCommand(TermuxRecoveryManager.OP_PULL_PRODUCTION, null);
+                    recordProductionSyncSuccess();
+                    recordEvent("DAILY_SYNC", "Daily production branch sync dispatched to Termux (main branch)", null);
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to dispatch daily production sync: " + e.getMessage());
+                }
+            }
+        }
     }
 
     public JSONArray getRecoveryHistory() {

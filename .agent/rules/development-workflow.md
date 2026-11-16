@@ -63,3 +63,35 @@ Before declaring any feature, bug fix, or milestone complete, the following four
    For streaming features, retrieve live frame bytes (valid JPEG header `\xff\xd8` and trailer `\xff\xd9`) and multipart boundary detection.
 4. **Tier 4 — Clean Git History:**
    Working tree is clean; commit message clearly describes changes.
+
+---
+
+## 3. Standard 3-Branch Git Architecture
+
+The repository enforces a simplified, disciplined 3-branch branching model:
+
+```text
+       [ experimental ]  (Research spikes, prototypes, unproven concepts)
+              │ (refined & approved)
+              ▼
+       [ development ]   (Active integration, feature engineering, staging)
+              │ (acceptance gates pass)
+              ▼
+       [    main     ]   (Production: stable, tested, deployed across cluster)
+```
+
+1. **`main` (Production Branch):**
+   - Holds 100% stable, production-ready code running across all cluster nodes (Punjab V2334, Gujarat Y31, Gujarat R5P).
+   - Zero broken experiments or unverified changes.
+   - Protected: Only fast-forward or squash merged from `development` after all multi-tier verification gates pass.
+   - **Cluster Auto-Sync:** All nodes pull `main` on app startup and every 24 hours via `com.personalserver.bridge` (`OP_PULL_PRODUCTION`) to enforce cluster-wide consistency.
+
+2. **`development` (Integration / Staging Branch):**
+   - Primary trunk for active engineering, feature additions, and bug fixes.
+   - All feature work is staged, tested, and reviewed here.
+   - Must remain buildable with all automated tests passing.
+
+3. **`experimental` (Research Sandbox Branch):**
+   - Dedicated branch for high-risk spikes, prototypes, and exploratory code (e.g. alternative streaming protocols, experimental ML models).
+   - Can be rebased, reset, or discarded without impacting cluster stability.
+   - When an experiment proves viable, its clean implementation is brought into `development`.

@@ -596,6 +596,18 @@ public class BridgeActivity extends AppCompatActivity {
                 tailscaleState = "CONNECTED";
                 stateMachine.logStep("Tailscale VPN", "SUCCESS", "VPN transport active", 0);
 
+                // 3.5 Pull latest production branch updates for cross-node consistency
+                if (termuxRecoveryManager.isCommandIntegrationReady()) {
+                    long syncStart = System.currentTimeMillis();
+                    try {
+                        stateMachine.logStep("Production Sync", "STARTING", "Checking production (main) branch updates", 0);
+                        termuxRecoveryManager.executeApprovedCommand(TermuxRecoveryManager.OP_PULL_PRODUCTION, null);
+                        stateMachine.logStep("Production Sync", "SUCCESS", "Production update preflight dispatched", System.currentTimeMillis() - syncStart);
+                    } catch (Exception e) {
+                        stateMachine.logStep("Production Sync", "DEGRADED", "Sync preflight skipped: " + e.getMessage(), System.currentTimeMillis() - syncStart);
+                    }
+                }
+
                 // 4. Starting services (check if already running to ensure idempotency)
                 stateMachine.transitionTo(NodeStartupStateMachine.State.STARTING_SERVICES, "Starting local node services via Termux");
 
@@ -812,6 +824,28 @@ public class BridgeActivity extends AppCompatActivity {
                 }
             } catch (Exception e) {
                 lastStartupFailure = "Run Doctor failed: " + e.getMessage();
+                uiHandler.post(this::updateStatusView);
+            }
+        });
+    }
+
+    public void syncProductionAction() {
+        backgroundExecutor.execute(() -> {
+            try {
+                if (termuxRecoveryManager != null && termuxRecoveryManager.isCommandIntegrationReady()) {
+                    long start = System.currentTimeMillis();
+                    termuxRecoveryManager.executeApprovedCommand(TermuxRecoveryManager.OP_PULL_PRODUCTION, null);
+                    if (recoveryCoordinator != null) {
+                        recoveryCoordinator.recordProductionSyncSuccess();
+                    }
+                    Log.i(TAG, "Manual production sync (main branch) dispatched via Termux");
+                    uiHandler.post(() -> {
+                        stateMachine.logStep("Production Sync", "SUCCESS", "Manual production update dispatched", System.currentTimeMillis() - start);
+                        updateStatusView();
+                    });
+                }
+            } catch (Exception e) {
+                lastStartupFailure = "Sync Production failed: " + e.getMessage();
                 uiHandler.post(this::updateStatusView);
             }
         });
