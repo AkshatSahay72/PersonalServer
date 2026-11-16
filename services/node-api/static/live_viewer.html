@@ -199,6 +199,7 @@
         <span class="telemetry-pill" id="pill-res">720p</span>
         <span class="telemetry-pill" id="pill-fps">0 FPS</span>
         <span class="telemetry-pill" id="pill-cam">Rear (0)</span>
+        <span class="telemetry-pill" id="pill-thermal">🌡️ --°C</span>
       </div>
 
       <img id="stream-img" alt="CCTV Stream">
@@ -442,14 +443,37 @@
       fpsInterval = setInterval(async () => {
         if (!isStreaming) return;
         try {
-          const res = await fetch("/hardware/live-call/status", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-            body: JSON.stringify({ operation: "GET_LIVE_CALL_STATUS", params: {} })
+          const res = await fetch("/camera/status", {
+            headers: { ...getAuthHeaders() }
           });
           const data = await res.json();
-          const fps = (data.status && data.status.fps) ? data.status.fps : 15;
+          const sess = (data && data.session) || {};
+          const fps = (sess.quality && sess.quality.fps) ? sess.quality.fps : 15;
           document.getElementById("pill-fps").textContent = fps + " FPS";
+
+          const thm = (data && data.thermal) || {};
+          const thmPill = document.getElementById("pill-thermal");
+          if (thmPill && thm.temperature_c !== undefined && thm.temperature_c !== null) {
+            const st = thm.state || "NORMAL";
+            if (st === "CRITICAL") {
+              thmPill.textContent = "🚨 " + thm.temperature_c + "°C CRITICAL";
+              thmPill.style.color = "#ef4444";
+              thmPill.style.borderColor = "#ef4444";
+            } else if (st === "THROTTLED") {
+              thmPill.textContent = "🔥 " + thm.temperature_c + "°C THROTTLED";
+              thmPill.style.color = "#f97316";
+              thmPill.style.borderColor = "#f97316";
+              document.getElementById("pill-res").textContent = "360p (Throttled)";
+            } else if (st === "WARM") {
+              thmPill.textContent = "🌡️ " + thm.temperature_c + "°C WARM";
+              thmPill.style.color = "#fbbf24";
+              thmPill.style.borderColor = "#fbbf24";
+            } else {
+              thmPill.textContent = "🌡️ " + thm.temperature_c + "°C";
+              thmPill.style.color = "#38bdf8";
+              thmPill.style.borderColor = "rgba(255,255,255,0.1)";
+            }
+          }
         } catch (e) {}
       }, 3000);
     }

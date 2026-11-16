@@ -74,6 +74,7 @@ class LiveCallSession(HardwareSession):
         self.speaker_bytes_sent = 0
         self.mic_muted = False
         self.speaker_muted = False
+        self.thermal_throttled = False
 
     def check_watchdog_expiration(self) -> bool:
         return self.is_expired()
@@ -92,7 +93,8 @@ class LiveCallSession(HardwareSession):
             "audio_packets_received": self.audio_packets_received,
             "speaker_packets_sent": self.speaker_packets_sent,
             "mic_muted": self.mic_muted,
-            "speaker_muted": self.speaker_muted
+            "speaker_muted": self.speaker_muted,
+            "thermal_throttled": getattr(self, "thermal_throttled", False)
         })
         return d
 
@@ -259,7 +261,31 @@ class LiveCallProvider:
             audio_enabled = bool(params.get("audio_enabled", True))
             speaker_enabled = bool(params.get("speaker_enabled", True))
 
-            # 1. Prevent duplicate active sessions
+            # 1. Thermal protection check (NODE-005)
+            thermal_state = {"state": "NORMAL", "throttle_active": False, "camera_allowed": True}
+            try:
+                from config.node_telemetry import evaluate_battery_thermal_state
+                thermal_state = evaluate_battery_thermal_state()
+                if not thermal_state.get("camera_allowed", True):
+                    logger.warning("Rejecting START_LIVE_CALL due to thermal cutoff (%s°C)", thermal_state.get("temperature_c"))
+                    return LiveCallResult({
+                        "success": False,
+                        "error": "THERMAL_COOLDOWN_ACTIVE",
+                        "error_code": "THERMAL_COOLDOWN_ACTIVE",
+                        "thermal": thermal_state,
+                        "message": f"Battery temperature too high ({thermal_state.get('temperature_c')}°C). Camera cooling down."
+                    })
+                if thermal_state.get("throttle_active"):
+                    logger.warning("Starting stream under thermal throttling: forcing 360p / 5fps")
+                    quality.preset = "360p"
+                    quality.width = 480
+                    quality.height = 360
+                    quality.fps = 5
+                    params["jpeg_quality"] = min(int(params.get("jpeg_quality", 50)), 35)
+            except Exception as thm_err:
+                logger.debug("Thermal evaluation bypass: %s", thm_err)
+
+            # 2. Prevent duplicate active sessions
             if self.current_session and self.current_session.state == SessionState.ACTIVE:
                 if not self.current_session.is_expired():
                     return LiveCallResult({
@@ -281,6 +307,7 @@ class LiveCallProvider:
                 audio_enabled=audio_enabled,
                 speaker_enabled=speaker_enabled
             )
+            session.thermal_throttled = bool(thermal_state.get("throttle_active"))
             session.state = SessionState.REQUESTED
             self.current_session = session
             with self._audio_buffer_lock:
@@ -369,10 +396,48 @@ class LiveCallProvider:
             with self._lock:
                 if not self.current_session or self.current_session.state != SessionState.ACTIVE:
                     break
+
+                # 1. Inactivity check (15s without active viewers)
                 if self._last_frame_consumed_time > 0 and (time.time() - self._last_frame_consumed_time > 15.0):
                     logger.info("Inactivity watchdog: no consumers for 15s; auto-releasing camera to IDLE")
                     self.stop_session("Inactivity watchdog: no consumers for 15s")
                     break
+
+                # 2. Thermal health & protection monitor (NODE-005)
+                try:
+                    from config.node_telemetry import evaluate_battery_thermal_state
+                    thermal_state = evaluate_battery_thermal_state()
+                    temp_c = thermal_state.get("temperature_c")
+                    if temp_c is not None:
+                        # Stage 2: Emergency cutoff at >= 45°C
+                        if not thermal_state.get("camera_allowed", True):
+                            logger.warning("Thermal watchdog: battery temperature %s°C >= 45.0°C. Emergency cutoff!", temp_c)
+                            self.stop_session(f"Thermal cutoff: Battery temperature reached {temp_c}°C")
+                            break
+                        # Stage 1: Step down to 360p / 5fps at >= 42°C
+                        elif thermal_state.get("throttle_active") and not getattr(self.current_session, "thermal_throttled", False):
+                            logger.warning("Thermal watchdog: battery temperature %s°C >= 42.0°C. Throttling stream to 360p / 5fps", temp_c)
+                            self.current_session.thermal_throttled = True
+                            self.update_session({
+                                "quality": "360p",
+                                "width": 480,
+                                "height": 360,
+                                "fps": 5,
+                                "jpeg_quality": 35
+                            })
+                        # Normal recovery: restore default profile when temperature cools to <= 39°C
+                        elif not thermal_state.get("throttle_active") and getattr(self.current_session, "thermal_throttled", False):
+                            logger.info("Thermal watchdog: battery temperature %s°C cooled to normal. Restoring 480p profile.", temp_c)
+                            self.current_session.thermal_throttled = False
+                            self.update_session({
+                                "quality": "480p",
+                                "width": 640,
+                                "height": 480,
+                                "fps": 15,
+                                "jpeg_quality": 50
+                            })
+                except Exception as thm_e:
+                    logger.debug("Thermal watchdog iteration bypass: %s", thm_e)
 
     def stop_session(self, reason: str = "Requested by user/controller") -> LiveCallResult:
         """Terminates the live call session and guarantees release of all hardware resources."""
@@ -431,6 +496,13 @@ class LiveCallProvider:
                     mic_active = not self.current_session.mic_muted
                     speaker_active = not self.current_session.speaker_muted
 
+            thermal_info = None
+            try:
+                from config.node_telemetry import evaluate_battery_thermal_state
+                thermal_info = evaluate_battery_thermal_state()
+            except Exception:
+                thermal_info = {"state": "NORMAL", "thermal_status": "Normal"}
+
             return {
                 "available": available,
                 "reason": reason,
@@ -442,7 +514,8 @@ class LiveCallProvider:
                 "session": self.current_session.to_dict() if self.current_session else None,
                 "has_frame": self._latest_jpeg_frame is not None,
                 "frame_timestamp": self._frame_timestamp,
-                "capabilities": self.get_capabilities()
+                "capabilities": self.get_capabilities(),
+                "thermal": thermal_info
             }
 
     def update_session(self, parameters: Optional[Dict[str, Any]] = None, **kwargs) -> LiveCallResult:
@@ -474,6 +547,14 @@ class LiveCallProvider:
             if "mute_speaker" in params:
                 session.speaker_muted = bool(params["mute_speaker"])
                 params["mute_speaker"] = session.speaker_muted
+            if "quality" in params:
+                session.quality.preset = str(params["quality"])
+            if "width" in params:
+                session.quality.width = int(params["width"])
+            if "height" in params:
+                session.quality.height = int(params["height"])
+            if "fps" in params:
+                session.quality.fps = int(params["fps"])
 
             # Propagate to native bridge
             self._call_native_bridge("UPDATE_LIVE_CALL", params)

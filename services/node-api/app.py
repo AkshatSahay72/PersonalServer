@@ -1345,6 +1345,27 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed to retrieve recording: {e}"})
                 return
 
+        # 3b2b. Live Call / Camera Status & Thermals: GET /camera/status, /cctv/status, /hardware/live-call/status
+        if path in (
+            "/camera/status",
+            "/cctv/status",
+            "/hardware/live-call/status",
+            "/api/camera/status",
+            "/api/cctv/status"
+        ):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                st = mgr.live_call.get_status()
+                self.send_json(200, st)
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to get camera status: {e}"})
+                return
+
         # 3b3. On-Demand Live Call Video Stream (Continuous MJPEG) (E07): GET /hardware/live-call/stream, /camera/stream, /cctv/stream
         if path in (
             "/hardware/live-call/stream",
@@ -2569,6 +2590,8 @@ document.getElementById('cmd-box').textContent = code
                     res["success"] = True
                     res["already_active"] = True
                     res["status"] = "ACTIVE"
+                elif err_code == "THERMAL_COOLDOWN_ACTIVE":
+                    status_code = 429
                 elif err_code in ("PERMISSION_DENIED", "UNAUTHORIZED"):
                     status_code = 403
                 else:
