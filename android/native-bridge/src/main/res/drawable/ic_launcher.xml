@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Background: Deep Slate Circle -->
+    <path
+        android:fillColor="#0F172A"
+        android:pathData="M54,4 C26.386,4 4,26.386 4,54 C4,81.614 26.386,104 54,104 C81.614,104 104,81.614 104,54 C104,26.386 81.614,4 54,4 Z" />
+
+    <!-- Outer Emerald Glow Ring -->
+    <path
+        android:strokeColor="#059669"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,8 C28.595,8 8,28.595 8,54 C8,79.405 28.595,100 54,100 C79.405,100 100,79.405 100,54 C100,28.595 79.405,8 54,8 Z" />
+
+    <!-- Server Chassis Body -->
+    <path
+        android:fillColor="#1E293B"
+        android:strokeColor="#334155"
+        android:strokeWidth="1.5"
+        android:pathData="M28,34 L80,34 C82.2,34 84,35.8 84,38 L84,80 C84,82.2 82.2,84 80,84 L28,84 C25.8,84 24,82.2 24,80 L24,38 C24,35.8 25.8,34 28,34 Z" />
+
+    <!-- Server Rack Unit 1 -->
+    <path
+        android:fillColor="#0F172A"
+        android:strokeColor="#059669"
+        android:strokeWidth="1"
+        android:pathData="M28,38 L80,38 C81.1,38 82,38.9 82,40 L82,48 C82,49.1 81.1,50 80,50 L28,50 C26.9,50 26,49.1 26,48 L26,40 C26,38.9 26.9,38 28,38 Z" />
+
+    <!-- Rack 1 Status LEDs & Grill -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M32,44 C32,42.895 32.895,42 34,42 C35.105,42 36,42.895 36,44 C36,45.105 35.105,46 34,46 C32.895,46 32,45.105 32,44 Z" />
+    <path
+        android:fillColor="#06B6D4"
+        android:pathData="M39,44 C39,42.895 39.895,42 41,42 C42.105,42 43,42.895 43,44 C43,45.105 42.105,46 41,46 C39.895,46 39,45.105 39,44 Z" />
+    <path
+        android:fillColor="#334155"
+        android:pathData="M48,43 L76,43 C76.5,43 77,43.5 77,44 C77,44.5 76.5,45 76,45 L48,45 C47.5,45 47,44.5 47,44 C47,43.5 47.5,43 48,43 Z" />
+
+    <!-- Server Rack Unit 2 -->
+    <path
+        android:fillColor="#0F172A"
+        android:strokeColor="#0284C7"
+        android:strokeWidth="1"
+        android:pathData="M28,54 L80,54 C81.1,54 82,54.9 82,56 L82,64 C82,65.1 81.1,66 80,66 L28,66 C26.9,66 26,65.1 26,64 L26,56 C26,54.9 26.9,54 28,54 Z" />
+
+    <!-- Rack 2 Status LEDs & Grill -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M32,60 C32,58.895 32.895,58 34,58 C35.105,58 36,58.895 36,60 C36,61.105 35.105,62 34,62 C32.895,62 32,61.105 32,60 Z" />
+    <path
+        android:fillColor="#F59E0B"
+        android:pathData="M39,60 C39,58.895 39.895,58 41,58 C42.105,58 43,58.895 43,60 C43,61.105 42.105,62 41,62 C39.895,62 39,61.105 39,60 Z" />
+    <path
+        android:fillColor="#334155"
+        android:pathData="M48,59 L76,59 C76.5,59 77,59.5 77,60 C77,60.5 76.5,61 76,61 L48,61 C47.5,61 47,60.5 47,60 C47,59.5 47.5,59 48,59 Z" />
+
+    <!-- Server Rack Unit 3 -->
+    <path
+        android:fillColor="#0F172A"
+        android:strokeColor="#059669"
+        android:strokeWidth="1"
+        android:pathData="M28,70 L80,70 C81.1,70 82,70.9 82,72 L82,80 C82,81.1 81.1,82 80,82 L28,82 C26.9,82 26,81.1 26,80 L26,72 C26,70.9 26.9,70 28,70 Z" />
+
+    <!-- Rack 3 Status LEDs & Grill -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M32,76 C32,74.895 32.895,74 34,74 C35.105,74 36,74.895 36,76 C36,77.105 35.105,78 34,78 C32.895,78 32,77.105 32,76 Z" />
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M39,76 C39,74.895 39.895,74 41,74 C42.105,74 43,74.895 43,76 C43,77.105 42.105,78 41,78 C39.895,78 39,77.105 39,76 Z" />
+    <path
+        android:fillColor="#334155"
+        android:pathData="M48,75 L76,75 C76.5,75 77,75.5 77,76 C77,76.5 76.5,77 76,77 L48,77 C47.5,77 47,76.5 47,76 C47,75.5 47.5,75 48,75 Z" />
+
+    <!-- Wireless Mesh Signal Waves (Top Center) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#10B981"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M44,25 C50,20 58,20 64,25" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M38,20 C47,13 61,13 70,20" />
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M52,29 C52,27.895 52.895,27 54,27 C55.105,27 56,27.895 56,29 C56,30.105 55.105,31 54,31 C52.895,31 52,30.105 52,29 Z" />
+
+</vector>

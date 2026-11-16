@@ -1396,8 +1396,10 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                         time.sleep(0.2)
                     preset_q = query.get("quality", ["480p"])[0] or "480p"
                     cam_id = query.get("camera_id", ["0"])[0] or "0"
+                    target_fps = int(query.get("fps", [30])[0] or 30)
+                    enable_aud = query.get("audio", ["false"])[0].lower() in ("1", "true", "yes")
                     ok, res = mgr.live_call.start_session(
-                        parameters={"quality": preset_q, "camera_id": cam_id, "audio_enabled": False, "jpeg_quality": 50},
+                        parameters={"quality": preset_q, "camera_id": cam_id, "fps": target_fps, "audio_enabled": enable_aud, "jpeg_quality": 60},
                         timeout_sec=300.0
                     )
                     if not ok and res.get("error") != "SESSION_ALREADY_ACTIVE":
@@ -1430,7 +1432,7 @@ class NodeAPIHandler(BaseHTTPRequestHandler):
                         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
                             stream_active = False
                             break
-                    mgr.live_call.wait_for_next_frame(timeout=0.08)
+                    mgr.live_call.wait_for_next_frame(timeout=0.015)
                 return
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
                 self.close_connection = True
@@ -2621,6 +2623,39 @@ document.getElementById('cmd-box').textContent = code
                 return
             except Exception as e:
                 self.send_json(500, {"error": f"Failed writing to speaker: {e}"})
+                return
+
+        # 0a3b. Live Call Speaker Volume Control: POST /hardware/live-call/volume or /camera/volume
+        if path in ("/hardware/live-call/volume", "/api/hardware/live-call/volume", "/camera/volume", "/api/camera/volume"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            body = self.read_json_body() or {}
+            vol = float(body.get("volume", body.get("speaker_volume", query.get("volume", [1.0])[0])))
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                res = mgr.live_call.set_speaker_volume(vol)
+                self.send_json(200, res)
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed setting speaker volume: {e}"})
+                return
+
+        # 0a3c. Live Call Session Update: POST /hardware/live-call/update or /camera/update
+        if path in ("/hardware/live-call/update", "/api/hardware/live-call/update", "/camera/update", "/api/camera/update"):
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            body = self.read_json_body() or {}
+            try:
+                from agent.hardware.manager import HardwareCapabilityManager
+                mgr = HardwareCapabilityManager.get_instance()
+                res = mgr.live_call.update_session(parameters=body)
+                self.send_json(200, res)
+                return
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed updating live call session: {e}"})
                 return
 
         # 0a2. Continuous Live Camera Streaming: POST /live-camera or /api/live-camera

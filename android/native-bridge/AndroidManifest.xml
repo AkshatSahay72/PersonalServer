@@ -37,7 +37,8 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@android:drawable/ic_menu_info_details"
+        android:icon="@drawable/ic_launcher"
+        android:roundIcon="@drawable/ic_launcher"
         android:label="PersonalServer Native Bridge"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"

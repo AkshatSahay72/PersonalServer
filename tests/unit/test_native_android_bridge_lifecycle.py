@@ -748,6 +748,8 @@ public class AudioTrack {
     public void play() {}
     public void stop() {}
     public void release() {}
+    public int setVolume(float gain) { return 0; }
+    public int setStereoVolume(float leftGain, float rightGain) { return 0; }
     public int write(byte[] audioData, int offsetInBytes, int sizeInBytes) { return sizeInBytes; }
 }
 """,

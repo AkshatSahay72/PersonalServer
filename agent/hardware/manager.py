@@ -211,6 +211,11 @@ class HardwareCapabilityManager:
             res = self.live_call.update_session(parameters=params)
             return {"operation": op, "success": res.get("success", False), "result": res}
 
+        elif op in ("SET_SPEAKER_VOLUME", "LIVE_CALL_VOLUME"):
+            vol = float(params.get("volume", params.get("speaker_volume", 1.0)))
+            res = self.live_call.set_speaker_volume(vol)
+            return {"operation": op, "success": res.get("success", False), "result": res}
+
         elif op == "LIVE_CALL_SPEAK":
             pcm_b64 = params.get("pcm_base64", "")
             import base64

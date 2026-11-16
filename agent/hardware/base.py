@@ -89,17 +89,17 @@ class HardwareSession:
 class StreamQuality:
     """Configurable live video stream quality settings."""
     PRESETS = {
-        "720p": {"width": 1280, "height": 720, "fps": 15, "bitrate_kbps": 1500},
-        "480p": {"width": 640, "height": 480, "fps": 15, "bitrate_kbps": 800},
-        "360p": {"width": 480, "height": 360, "fps": 15, "bitrate_kbps": 400},
-        "vga": {"width": 640, "height": 480, "fps": 15, "bitrate_kbps": 800},
+        "720p": {"width": 1280, "height": 720, "fps": 30, "bitrate_kbps": 1500},
+        "480p": {"width": 640, "height": 480, "fps": 30, "bitrate_kbps": 800},
+        "360p": {"width": 480, "height": 360, "fps": 30, "bitrate_kbps": 400},
+        "vga": {"width": 640, "height": 480, "fps": 30, "bitrate_kbps": 800},
     }
 
     def __init__(
         self,
         width: int = 640,
         height: int = 480,
-        fps: int = 15,
+        fps: int = 30,
         bitrate_kbps: int = 800
     ):
         self.width = int(width)
@@ -118,7 +118,7 @@ class StreamQuality:
         return cls(
             width=data.get("width", 640),
             height=data.get("height", 480),
-            fps=data.get("fps", 15),
+            fps=data.get("fps", 30),
             bitrate_kbps=data.get("bitrate_kbps", 800)
         )
 

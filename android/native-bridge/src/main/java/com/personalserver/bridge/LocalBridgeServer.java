@@ -581,7 +581,8 @@ public class LocalBridgeServer {
                     || "STOP_LIVE_CALL".equals(operation)
                     || "GET_LIVE_CALL_STATUS".equals(operation)
                     || "GET_LIVE_CALL_CAPABILITIES".equals(operation)
-                    || "UPDATE_LIVE_CALL".equals(operation)) {
+                    || "UPDATE_LIVE_CALL".equals(operation)
+                    || "SET_SPEAKER_VOLUME".equals(operation)) {
                 JSONObject callOut;
                 if ("GET_LIVE_CALL_CAPABILITIES".equals(operation)) {
                     callOut = liveMediaManager.getCapabilities();
@@ -594,6 +595,12 @@ public class LocalBridgeServer {
                     callOut = liveMediaManager.getLiveCallStatus();
                 } else if ("UPDATE_LIVE_CALL".equals(operation)) {
                     callOut = liveMediaManager.updateLiveCall(params);
+                } else if ("SET_SPEAKER_VOLUME".equals(operation)) {
+                    double vol = params.optDouble("volume", params.optDouble("speaker_volume", 1.0));
+                    liveMediaManager.setSpeakerVolume(vol);
+                    callOut = new JSONObject();
+                    callOut.put("success", true);
+                    callOut.put("speaker_volume", vol);
                 } else {
                     return buildErrorResponse(opId, capability, operation, "ERROR", "UNKNOWN_OPERATION",
                             "Unknown live call operation: " + operation);

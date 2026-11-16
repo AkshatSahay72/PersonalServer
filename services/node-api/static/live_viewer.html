@@ -184,7 +184,22 @@
 <body>
   <header>
     <div class="header-title">
-      <span>📹 PersonalServer CCTV Node</span>
+      <svg width="26" height="26" viewBox="0 0 108 108" fill="none" style="vertical-align: middle; border-radius: 6px; box-shadow: 0 0 10px rgba(16, 185, 129, 0.3);">
+        <rect width="108" height="108" rx="22" fill="#0F172A"/>
+        <rect x="22" y="22" width="64" height="16" rx="4" fill="#1E293B" stroke="#059669" stroke-width="2"/>
+        <circle cx="32" cy="30" r="3.5" fill="#10B981"/>
+        <circle cx="42" cy="30" r="2" fill="#64748B"/>
+        <line x1="52" y1="30" x2="78" y2="30" stroke="#334155" stroke-width="2" stroke-linecap="round"/>
+        <rect x="22" y="46" width="64" height="16" rx="4" fill="#1E293B" stroke="#059669" stroke-width="2"/>
+        <circle cx="32" cy="54" r="3.5" fill="#06B6D4"/>
+        <circle cx="42" cy="54" r="2" fill="#64748B"/>
+        <line x1="52" y1="54" x2="78" y2="54" stroke="#334155" stroke-width="2" stroke-linecap="round"/>
+        <rect x="22" y="70" width="64" height="16" rx="4" fill="#1E293B" stroke="#059669" stroke-width="2"/>
+        <circle cx="32" cy="78" r="3.5" fill="#F59E0B"/>
+        <circle cx="42" cy="78" r="2" fill="#64748B"/>
+        <line x1="52" y1="78" x2="78" y2="78" stroke="#334155" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <span>PersonalServer CCTV & Duplex Media</span>
       <span id="badge-status" class="status-badge">STANDBY</span>
     </div>
     <div class="auth-container">
@@ -196,8 +211,8 @@
   <main>
     <div class="viewport-box" id="viewport-box">
       <div class="overlay-telemetry" id="telemetry" style="display: none;">
-        <span class="telemetry-pill" id="pill-res">720p</span>
-        <span class="telemetry-pill" id="pill-fps">0 FPS</span>
+        <span class="telemetry-pill" id="pill-res">480p</span>
+        <span class="telemetry-pill" id="pill-fps">30 FPS</span>
         <span class="telemetry-pill" id="pill-cam">Rear (0)</span>
         <span class="telemetry-pill" id="pill-thermal">🌡️ --°C</span>
       </div>
@@ -220,12 +235,20 @@
       <div class="controls-group">
         <label for="select-res" style="font-size: 12px; color: #9ca3af;">Quality:</label>
         <select id="select-res" onchange="changeQuality()">
-          <option value="480p" selected>480p (Fast, 640x480, 15 FPS)</option>
-          <option value="720p">720p (HD, 1280x720, 15 FPS)</option>
-          <option value="360p">360p (Ultra Fast, 480x360, 15 FPS)</option>
+          <option value="480p" selected>480p (Smooth, 640x480, 30 FPS)</option>
+          <option value="720p">720p (HD, 1280x720, 30 FPS)</option>
+          <option value="360p">360p (Ultra Fast, 480x360, 30 FPS)</option>
         </select>
         <button onclick="takeSnapshot()">📸 Snapshot</button>
         <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
+      </div>
+
+      <div class="controls-group">
+        <label for="speaker-vol" style="font-size: 12px; color: #9ca3af;">🔊 Volume:</label>
+        <input type="range" id="speaker-vol" min="0" max="100" value="100" style="width: 75px; accent-color: #10b981;" oninput="changeSpeakerVolume(this.value)">
+        <span id="vol-readout" style="font-size: 11px; font-family: monospace; color: #38bdf8;">100%</span>
+        <button id="btn-listen-mic" onclick="toggleListenMic()">🎙️ Listen Mic</button>
+        <button id="btn-push-talk" onmousedown="startTalk()" onmouseup="stopTalk()" ontouchstart="startTalk()" ontouchend="stopTalk()">🗣️ Push to Talk</button>
       </div>
     </div>
   </main>
@@ -280,8 +303,11 @@
             params: {
               camera_id: activeCamera,
               quality: quality,
-              jpeg_quality: 50,
-              audio_enabled: false,
+              fps: 30,
+              jpeg_quality: 75,
+              audio_enabled: true,
+              speaker_enabled: true,
+              speaker_volume: currentSpeakerVolume,
               timeout_sec: 300
             }
           })
@@ -480,6 +506,139 @@
 
     function stopFpsTracking() {
       if (fpsInterval) clearInterval(fpsInterval);
+    }
+
+    let currentSpeakerVolume = 1.0;
+    async function changeSpeakerVolume(val) {
+      currentSpeakerVolume = parseInt(val, 10) / 100.0;
+      document.getElementById("vol-readout").textContent = val + "%";
+      try {
+        await fetch("/hardware/live-call/volume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          body: JSON.stringify({ volume: currentSpeakerVolume })
+        });
+      } catch (e) {}
+    }
+
+    let isListeningMic = false;
+    let micAudioCtx = null;
+    let micPollInterval = null;
+
+    async function toggleListenMic() {
+      const btn = document.getElementById("btn-listen-mic");
+      if (isListeningMic) {
+        isListeningMic = false;
+        if (micPollInterval) clearInterval(micPollInterval);
+        btn.textContent = "🎙️ Listen Mic";
+        btn.classList.remove("btn-primary");
+      } else {
+        if (!isStreaming) {
+          alert("Start stream first to listen to microphone");
+          return;
+        }
+        isListeningMic = true;
+        btn.textContent = "🔊 Listening...";
+        btn.classList.add("btn-primary");
+        if (!micAudioCtx) {
+          micAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        }
+        if (micAudioCtx.state === "suspended") {
+          await micAudioCtx.resume();
+        }
+        startMicAudioPolling();
+      }
+    }
+
+    function startMicAudioPolling() {
+      let nextPlayTime = micAudioCtx ? micAudioCtx.currentTime : 0;
+      micPollInterval = setInterval(async () => {
+        if (!isListeningMic || !isStreaming) return;
+        try {
+          const res = await fetch("/hardware/live-call/audio", { headers: { ...getAuthHeaders() } });
+          if (res.ok) {
+            const buf = await res.arrayBuffer();
+            if (buf && buf.byteLength > 0 && micAudioCtx) {
+              const int16 = new Int16Array(buf);
+              const float32 = new Float32Array(int16.length);
+              for (let i = 0; i < int16.length; i++) {
+                float32[i] = int16[i] / 32768.0;
+              }
+              const audioBuffer = micAudioCtx.createBuffer(1, float32.length, 16000);
+              audioBuffer.copyToChannel(float32, 0);
+              const src = micAudioCtx.createBufferSource();
+              src.buffer = audioBuffer;
+              src.connect(micAudioCtx.destination);
+              const now = micAudioCtx.currentTime;
+              if (nextPlayTime < now) nextPlayTime = now;
+              src.start(nextPlayTime);
+              nextPlayTime += audioBuffer.duration;
+            }
+          }
+        } catch (e) {}
+      }, 100);
+    }
+
+    let talkStream = null;
+    let talkAudioCtx = null;
+
+    async function startTalk() {
+      const btn = document.getElementById("btn-push-talk");
+      btn.style.background = "#059669";
+      btn.textContent = "🔴 Transmitting...";
+      try {
+        if (!talkStream) {
+          talkStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });
+        }
+        if (!talkAudioCtx) {
+          talkAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        }
+        const source = talkAudioCtx.createMediaStreamSource(talkStream);
+        const processor = talkAudioCtx.createScriptProcessor(2048, 1, 1);
+        source.connect(processor);
+        processor.connect(talkAudioCtx.destination);
+
+        processor.onaudioprocess = async (e) => {
+          if (!talkStream) return;
+          const input = e.inputBuffer.getChannelData(0);
+          const pcm16 = new Int16Array(input.length);
+          for (let i = 0; i < input.length; i++) {
+            const s = Math.max(-1, Math.min(1, input[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          const bytes = new Uint8Array(pcm16.buffer);
+          let binary = "";
+          for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          const b64 = btoa(binary);
+          try {
+            await fetch("/hardware/live-call/speak", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+              body: JSON.stringify({ pcm_base64: b64, sample_rate: 16000, channels: 1 })
+            });
+          } catch (err) {}
+        };
+        btn._processor = processor;
+        btn._source = source;
+      } catch (err) {
+        console.warn("Failed accessing browser microphone:", err);
+      }
+    }
+
+    function stopTalk() {
+      const btn = document.getElementById("btn-push-talk");
+      btn.style.background = "";
+      btn.textContent = "🗣️ Push to Talk";
+      if (btn._processor && btn._source) {
+        try {
+          btn._processor.disconnect();
+          btn._source.disconnect();
+        } catch (e) {}
+        btn._processor = null;
+        btn._source = null;
+      }
     }
 
     async function takeSnapshot() {

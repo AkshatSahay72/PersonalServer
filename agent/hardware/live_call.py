@@ -547,6 +547,10 @@ class LiveCallProvider:
             if "mute_speaker" in params:
                 session.speaker_muted = bool(params["mute_speaker"])
                 params["mute_speaker"] = session.speaker_muted
+            if "speaker_volume" in params or "volume" in params:
+                vol = float(params.get("speaker_volume", params.get("volume", 1.0)))
+                session.extra_data["speaker_volume"] = max(0.0, min(1.0, vol))
+                params["speaker_volume"] = session.extra_data["speaker_volume"]
             if "quality" in params:
                 session.quality.preset = str(params["quality"])
             if "width" in params:
@@ -559,6 +563,11 @@ class LiveCallProvider:
             # Propagate to native bridge
             self._call_native_bridge("UPDATE_LIVE_CALL", params)
             return LiveCallResult({"success": True, "session": session.to_dict()})
+
+    def set_speaker_volume(self, volume: float) -> LiveCallResult:
+        """Sets the phone speaker volume (0.0 to 1.0)."""
+        vol = max(0.0, min(1.0, float(volume)))
+        return self.update_session({"speaker_volume": vol})
 
     def transmit_speaker_audio(self, pcm_base64: str, sample_rate: int = 16000, channels: int = 1) -> LiveCallResult:
         """Helper to decode base64 audio and send to speaker with accounting."""

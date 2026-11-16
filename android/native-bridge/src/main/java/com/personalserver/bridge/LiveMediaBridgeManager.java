@@ -20,6 +20,7 @@ import android.media.AudioTrack;
 import android.media.Image;
 import android.media.ImageReader;
 import android.media.MediaRecorder;
+import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.PowerManager;
@@ -54,8 +55,8 @@ public class LiveMediaBridgeManager {
 
     public static final int DEFAULT_WIDTH = 1280;
     public static final int DEFAULT_HEIGHT = 720;
-    public static final int DEFAULT_FPS = 15;
-    public static final int DEFAULT_JPEG_QUALITY = 70;
+    public static final int DEFAULT_FPS = 30;
+    public static final int DEFAULT_JPEG_QUALITY = 75;
     public static final int DEFAULT_SAMPLE_RATE = 16000;
     public static final long DEFAULT_MAX_DURATION_MS = 300_000L; // 5 minutes max session
     public static final long INACTIVITY_TIMEOUT_MS = 30_000L;     // 30 seconds without heartbeat
@@ -82,6 +83,7 @@ public class LiveMediaBridgeManager {
     private volatile long lastBroadcastFrameTs = 0L;
     private volatile boolean isMicMuted = false;
     private volatile boolean isSpeakerMuted = false;
+    private volatile float speakerVolume = 1.0f;
     private volatile LiveCallNotificationListener notificationListener;
     private PowerManager.WakeLock sessionWakeLock;
 
@@ -235,28 +237,31 @@ public class LiveMediaBridgeManager {
             String sessionId = params.optString("session_id", "cctv-" + System.currentTimeMillis());
             activeCameraId = params.optString("camera_id", "0");
 
-            // Quality preset parsing: 720p (default), 480p, 360p or custom dimensions
+            // Quality preset parsing: 720p (default), 480p, 360p or custom dimensions (boosted 30 FPS)
             String preset = params.optString("quality", params.optString("preset", "")).toLowerCase();
             if ("720p".equals(preset)) {
                 currentWidth = 1280;
                 currentHeight = 720;
-                currentFps = 15;
+                currentFps = params.optInt("fps", 30);
+                currentJpegQuality = params.optInt("jpeg_quality", 75);
             } else if ("480p".equals(preset) || "vga".equals(preset)) {
                 currentWidth = 640;
                 currentHeight = 480;
-                currentFps = 15;
+                currentFps = params.optInt("fps", 30);
+                currentJpegQuality = params.optInt("jpeg_quality", 70);
             } else if ("360p".equals(preset)) {
                 currentWidth = 480;
                 currentHeight = 360;
-                currentFps = 15;
+                currentFps = params.optInt("fps", 30);
+                currentJpegQuality = params.optInt("jpeg_quality", 65);
             } else {
                 currentWidth = params.optInt("width", DEFAULT_WIDTH);
                 currentHeight = params.optInt("height", DEFAULT_HEIGHT);
                 currentFps = params.optInt("fps", DEFAULT_FPS);
+                currentJpegQuality = params.optInt("jpeg_quality", params.optInt("quality_percent", DEFAULT_JPEG_QUALITY));
             }
             if (currentFps <= 0) currentFps = DEFAULT_FPS;
 
-            currentJpegQuality = params.optInt("jpeg_quality", params.optInt("quality_percent", DEFAULT_JPEG_QUALITY));
             if (currentJpegQuality < 10) currentJpegQuality = 10;
             if (currentJpegQuality > 100) currentJpegQuality = 100;
 
@@ -267,6 +272,7 @@ public class LiveMediaBridgeManager {
                 enableAudio = false;
             }
             boolean enableSpeaker = params.optBoolean("speaker_enabled", true);
+            speakerVolume = (float) Math.max(0.0, Math.min(1.0, params.optDouble("speaker_volume", params.optDouble("volume", 1.0))));
 
             activeSessionId = sessionId;
             isSessionActive = true;
@@ -412,6 +418,7 @@ public class LiveMediaBridgeManager {
                 res.put("jpeg_quality", currentJpegQuality);
                 res.put("mic_muted", isMicMuted);
                 res.put("speaker_muted", isSpeakerMuted);
+                res.put("speaker_volume", (double) speakerVolume);
                 res.put("captured_frames", capturedFrames.get());
                 res.put("audio_chunks_sent", capturedAudioChunks.get());
                 res.put("speaker_chunks_played", playedSpeakerChunks.get());
@@ -436,6 +443,10 @@ public class LiveMediaBridgeManager {
             if (params.has("mute_speaker")) {
                 isSpeakerMuted = params.getBoolean("mute_speaker");
             }
+            if (params.has("speaker_volume") || params.has("volume")) {
+                double vol = params.optDouble("speaker_volume", params.optDouble("volume", (double) speakerVolume));
+                setSpeakerVolume(vol);
+            }
             if (params.has("jpeg_quality") || params.has("quality_percent")) {
                 int nq = params.optInt("jpeg_quality", params.optInt("quality_percent", currentJpegQuality));
                 currentJpegQuality = Math.max(10, Math.min(100, nq));
@@ -457,11 +468,11 @@ public class LiveMediaBridgeManager {
                 int nh = currentHeight;
                 int nfps = currentFps;
                 if ("720p".equals(preset)) {
-                    nw = 1280; nh = 720; nfps = 15;
+                    nw = 1280; nh = 720; nfps = params.optInt("fps", 30);
                 } else if ("480p".equals(preset) || "vga".equals(preset)) {
-                    nw = 640; nh = 480; nfps = 15;
+                    nw = 640; nh = 480; nfps = params.optInt("fps", 30);
                 } else if ("360p".equals(preset)) {
-                    nw = 480; nh = 360; nfps = 15;
+                    nw = 480; nh = 360; nfps = params.optInt("fps", 30);
                 }
                 if (nw != currentWidth || nh != currentHeight || nfps != currentFps) {
                     currentWidth = nw;
@@ -482,11 +493,15 @@ public class LiveMediaBridgeManager {
             }
 
             if (needsReinit) {
-                releaseCamera();
-                try {
-                    Thread.sleep(150);
-                } catch (InterruptedException ignored) {}
-                initCamera(activeCameraId, currentWidth, currentHeight, currentFps);
+                if (cameraThread != null && cameraHandler != null && cameraThread.isAlive()) {
+                    switchCameraDevice(activeCameraId, currentWidth, currentHeight, currentFps);
+                } else {
+                    releaseCamera();
+                    try {
+                        Thread.sleep(100);
+                    } catch (InterruptedException ignored) {}
+                    initCamera(activeCameraId, currentWidth, currentHeight, currentFps);
+                }
             }
 
             JSONObject res = new JSONObject();
@@ -498,6 +513,7 @@ public class LiveMediaBridgeManager {
             res.put("jpeg_quality", currentJpegQuality);
             res.put("mic_muted", isMicMuted);
             res.put("speaker_muted", isSpeakerMuted);
+            res.put("speaker_volume", (double) speakerVolume);
             return res;
         }
     }
@@ -541,6 +557,105 @@ public class LiveMediaBridgeManager {
             Log.w(TAG, "Failed negotiating camera resolution: " + e.getMessage());
         }
         return new Size(targetW, targetH);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void switchCameraDevice(String cameraId, int width, int height, int fps) {
+        CameraManager cm = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+        if (cm == null) return;
+        try {
+            if (captureSession != null) {
+                try {
+                    captureSession.stopRepeating();
+                    captureSession.abortCaptures();
+                } catch (Exception ignored) {}
+                captureSession.close();
+                captureSession = null;
+            }
+            if (cameraDevice != null) {
+                try {
+                    cameraDevice.close();
+                } catch (Exception ignored) {}
+                cameraDevice = null;
+            }
+            if (imageReader != null) {
+                imageReader.close();
+                imageReader = null;
+            }
+
+            Size chosenSize = chooseBestResolution(cm, cameraId, width, height);
+            final int actualW = chosenSize.getWidth();
+            final int actualH = chosenSize.getHeight();
+            currentWidth = actualW;
+            currentHeight = actualH;
+            final long minFrameIntervalMs = (fps > 0) ? (1000L / fps) : 33L;
+
+            imageReader = ImageReader.newInstance(actualW, actualH, ImageFormat.JPEG, 2);
+            imageReader.setOnImageAvailableListener(reader -> {
+                Image img = null;
+                try {
+                    img = reader.acquireLatestImage();
+                    if (img != null) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastBroadcastFrameTs < minFrameIntervalMs) {
+                            img.close();
+                            img = null;
+                            return;
+                        }
+                        lastBroadcastFrameTs = now;
+                        lastActivityTimestamp = now;
+
+                        ByteBuffer buffer = img.getPlanes()[0].getBuffer();
+                        byte[] bytes = new byte[buffer.remaining()];
+                        buffer.get(bytes);
+
+                        capturedFrames.incrementAndGet();
+                        mediaStreamServer.broadcastVideoFrame(now, actualW, actualH, MediaStreamServer.CODEC_JPEG, bytes);
+                    }
+                } catch (Exception e) {
+                    Log.d(TAG, "Frame processing drop during switch: " + e.getMessage());
+                } finally {
+                    if (img != null) {
+                        img.close();
+                    }
+                }
+            }, cameraHandler);
+
+            cm.openCamera(cameraId, new CameraDevice.StateCallback() {
+                @Override
+                public void onOpened(@NonNull CameraDevice camera) {
+                    if (!cameraRunning.get()) {
+                        try {
+                            camera.close();
+                        } catch (Exception ignored) {}
+                        return;
+                    }
+                    cameraDevice = camera;
+                    startCameraPreviewSession();
+                    Log.i(TAG, "Camera fast-switched to ID: " + cameraId);
+                }
+
+                @Override
+                public void onDisconnected(@NonNull CameraDevice camera) {
+                    Log.w(TAG, "Camera disconnected during switch");
+                    try {
+                        camera.close();
+                    } catch (Exception ignored) {}
+                    cameraDevice = null;
+                }
+
+                @Override
+                public void onError(@NonNull CameraDevice camera, int error) {
+                    Log.e(TAG, "Camera error during switch: " + error);
+                    try {
+                        camera.close();
+                    } catch (Exception ignored) {}
+                    cameraDevice = null;
+                }
+            }, cameraHandler);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed fast-switching Camera2: " + e.getMessage());
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -862,12 +977,35 @@ public class LiveMediaBridgeManager {
             );
 
             if (audioTrack.getState() == AudioTrack.STATE_INITIALIZED) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    audioTrack.setVolume(speakerVolume);
+                } else {
+                    audioTrack.setStereoVolume(speakerVolume, speakerVolume);
+                }
                 audioTrack.play();
                 speakerActive.set(true);
-                Log.i(TAG, "AudioTrack initialized for speaker playback");
+                Log.i(TAG, "AudioTrack initialized for speaker playback with volume: " + speakerVolume);
             }
         } catch (Exception e) {
             Log.e(TAG, "Failed initializing AudioTrack: " + e.getMessage());
+        }
+    }
+
+    public void setSpeakerVolume(double volume) {
+        synchronized (stateLock) {
+            this.speakerVolume = (float) Math.max(0.0, Math.min(1.0, volume));
+            if (audioTrack != null && audioTrack.getState() == AudioTrack.STATE_INITIALIZED) {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                        audioTrack.setVolume(this.speakerVolume);
+                    } else {
+                        audioTrack.setStereoVolume(this.speakerVolume, this.speakerVolume);
+                    }
+                    Log.i(TAG, "Speaker volume updated to " + this.speakerVolume);
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed setting audioTrack volume: " + e.getMessage());
+                }
+            }
         }
     }
 
