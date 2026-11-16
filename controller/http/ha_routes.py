@@ -96,6 +96,23 @@ def handle_ha_get(handler: Any, path: str) -> bool:
         })
         return True
 
+    # GET /api/cluster/secrets/cloudflared-token or GET /ha/cloudflared-token
+    if path in ("/cluster/secrets/cloudflared-token", "/api/cluster/secrets/cloudflared-token", "/ha/cloudflared-token", "/ha/token"):
+        token = handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to view Cloudflare token status"})
+            return True
+        mgr = get_ha_manager()
+        cur_token = mgr._read_local_cloudflared_token()
+        handler.send_json(200, {
+            "configured": bool(cur_token),
+            "token_prefix": (cur_token[:10] + "...") if cur_token else None,
+            "token_length": len(cur_token) if cur_token else 0,
+            "state_version": mgr.state_version
+        })
+        return True
+
     return False
 
 
@@ -262,6 +279,24 @@ def handle_ha_post(handler: Any, path: str, body: Optional[Dict[str, Any]], toke
             "status": "ok",
             "cluster_mode": mgr.cluster_mode,
             "preferred_leader_id": mgr.preferred_leader_id
+        })
+        return True
+
+    if path in ("/cluster/secrets/cloudflared-token", "/api/cluster/secrets/cloudflared-token", "/ha/cloudflared-token", "/ha/token"):
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to update Cloudflare token"})
+            return True
+        new_token = (body or {}).get("token") or (body or {}).get("cloudflared_token")
+        if not new_token or not str(new_token).strip():
+            handler.send_json(400, {"error": "Missing required field 'token' or 'cloudflared_token'"})
+            return True
+        mgr = get_ha_manager()
+        ok = mgr.update_cloudflared_token(str(new_token).strip())
+        handler.send_json(200 if ok else 500, {
+            "status": "ok" if ok else "failed",
+            "message": "Cloudflare Tunnel token successfully updated and replicated across cluster" if ok else "Failed updating token",
+            "state_version": mgr.state_version
         })
         return True
 

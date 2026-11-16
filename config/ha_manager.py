@@ -144,6 +144,42 @@ def resolve_controller_node_id(node_id: Optional[str] = None, paths=None) -> str
     return socket.gethostname() or "node-master"
 
 
+def reload_cloudflared_process(paths=None) -> bool:
+    """
+    Terminates existing cloudflared process so node supervisor immediately respawns it with new token.
+    Safe on both Windows and POSIX (Android/Termux/Linux).
+    """
+    curr_paths = paths or get_controller_paths()
+    runtime_dir = getattr(curr_paths, "runtime_dir", BASE_DIR / "runtime")
+    pid_file = runtime_dir / "cloudflared.pid"
+    killed = False
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+            if pid > 0:
+                if os.name == "nt":
+                    import subprocess
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                else:
+                    import signal
+                    os.kill(pid, signal.SIGTERM)
+                killed = True
+                controller_logger.info("HA_CLOUDFLARED_RELOAD", "Terminated cloudflared (PID %d) for token reload", pid)
+        except Exception as e:
+            controller_logger.warning("HA_CLOUDFLARED_RELOAD_ERR", "Failed terminating cloudflared: %s", e)
+
+    if not killed and os.name != "nt":
+        try:
+            import subprocess
+            res = subprocess.run(["pkill", "-f", "cloudflared tunnel"], capture_output=True)
+            if res.returncode == 0:
+                killed = True
+                controller_logger.info("HA_CLOUDFLARED_RELOAD", "Terminated cloudflared via pkill for token reload")
+        except Exception:
+            pass
+    return killed
+
+
 class LeaderLease:
     """
     Lease object holding cluster leadership, election term,
@@ -447,6 +483,7 @@ class HAManager:
 
         self.on_promotion_callback = on_promotion_callback
         self.on_demotion_callback = on_demotion_callback
+        self._cached_cloudflared_token: Optional[str] = self._read_local_cloudflared_token()
 
         # Multi-signal failure detection & partition safety
         self.partition_safe = (
@@ -1171,6 +1208,43 @@ class HAManager:
         except Exception as e:
             controller_logger.debug("Failed updating controller.json: %s", e)
 
+    def _read_local_cloudflared_token(self) -> Optional[str]:
+        """Reads local config/secrets/cloudflared.token if present."""
+        try:
+            p = getattr(self, "paths", None) or get_controller_paths()
+            cf_token_file = getattr(p, "config_dir", BASE_DIR / "config") / "secrets" / "cloudflared.token"
+            if cf_token_file.exists():
+                return cf_token_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+        return None
+
+    def update_cloudflared_token(self, new_token: str) -> bool:
+        """
+        Updates the Cloudflare Tunnel token across the cluster.
+        Saves locally, reloads local tunnel if active, increments state version,
+        and broadcasts replication to all standbys.
+        """
+        token_str = str(new_token).strip()
+        if not token_str:
+            return False
+        p = getattr(self, "paths", None) or get_controller_paths()
+        cf_token_file = getattr(p, "config_dir", BASE_DIR / "config") / "secrets" / "cloudflared.token"
+        with self._lock:
+            try:
+                cf_token_file.parent.mkdir(parents=True, exist_ok=True)
+                cf_token_file.write_text(token_str, encoding="utf-8")
+                self._cached_cloudflared_token = token_str
+                self.state_version += 1
+                controller_logger.info("HA_TOKEN_UPDATE", "Updated Cloudflare token locally (version %d)", self.state_version)
+            except Exception as e:
+                controller_logger.error("HA_TOKEN_UPDATE_ERR", "Failed saving token: %s", e)
+                return False
+        reload_cloudflared_process(p)
+        if self.is_leader:
+            self._broadcast_state_replication_async()
+        return True
+
     def step_down(self, new_term: int, new_leader_id: str, new_leader_url: str):
         """Demotes local node from LEADER to STANDBY to avoid split-brain."""
         with self._lock:
@@ -1287,7 +1361,9 @@ class HAManager:
                     try:
                         cf_token_file.parent.mkdir(parents=True, exist_ok=True)
                         cf_token_file.write_text(new_token, encoding="utf-8")
+                        self._cached_cloudflared_token = new_token
                         controller_logger.info("HA_TOKEN_SYNC", "Synchronized updated Cloudflare Tunnel token from leader")
+                        reload_cloudflared_process(p)
                     except Exception as e:
                         controller_logger.warning("HA_TOKEN_SYNC_ERROR", "Failed saving cloudflared token: %s", e)
 
@@ -1324,13 +1400,8 @@ class HAManager:
                         pass
                 return default_val
 
-            cf_token_file = getattr(p, "config_dir", BASE_DIR / "config") / "secrets" / "cloudflared.token"
-            cf_token_val = None
-            if cf_token_file.exists():
-                try:
-                    cf_token_val = cf_token_file.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
+            cf_token_val = self._read_local_cloudflared_token()
+            self._cached_cloudflared_token = cf_token_val
 
             return {
                 "term": self.current_term,
@@ -1568,6 +1639,12 @@ class HAManager:
             with self._lock:
                 if self.state == HAState.LEADER:
                     self.renew_lease()
+                    curr_token = self._read_local_cloudflared_token()
+                    if curr_token and curr_token != self._cached_cloudflared_token:
+                        controller_logger.info("HA_TOKEN_CHANGE", "Cloudflare token modified on disk. Propagating to cluster.")
+                        self._cached_cloudflared_token = curr_token
+                        self.state_version += 1
+                        self._broadcast_state_replication_async()
                 self._eval_in_progress = False
                 return
 
