@@ -135,6 +135,12 @@ if [ "$cloudflared_running" = false ]; then
             cloudflared_running="not_configured"
         else
             export GODEBUG="netdns=go"
+            if [ -f "/data/data/com.termux/files/usr/etc/tls/cert.pem" ]; then
+                export SSL_CERT_FILE="/data/data/com.termux/files/usr/etc/tls/cert.pem"
+                export SSL_CERT_DIR="/data/data/com.termux/files/usr/etc/tls"
+            elif [ -f "/etc/ssl/certs/ca-certificates.crt" ]; then
+                export SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+            fi
             nohup cloudflared tunnel --no-prechecks run --token-file "$TOKEN_FILE" >> "$CLOUDFLARED_LOG" 2>&1 &
             new_cf_pid=$!
             echo "$new_cf_pid" > "$CLOUDFLARED_PID_FILE"

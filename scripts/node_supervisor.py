@@ -240,6 +240,17 @@ class NodeProcessSupervisor:
 
         try:
             logger.info("Resurrecting service %s: %s", name, " ".join(cmd))
+            env = dict(os.environ)
+            if "SSL_CERT_FILE" not in env:
+                for cert_candidate in [
+                    Path("/data/data/com.termux/files/usr/etc/tls/cert.pem"),
+                    Path("/etc/ssl/certs/ca-certificates.crt"),
+                ]:
+                    if cert_candidate.exists():
+                        env["SSL_CERT_FILE"] = str(cert_candidate)
+                        env["SSL_CERT_DIR"] = str(cert_candidate.parent)
+                        break
+
             with open(log_path, "a") as log_out:
                 log_out.write(f"\n--- [Supervisor Resurrected at {datetime.now(timezone.utc).isoformat()}] ---\n")
                 log_out.flush()
@@ -250,7 +261,8 @@ class NodeProcessSupervisor:
                         stdout=log_out,
                         stderr=log_out,
                         cwd=str(self.base_dir),
-                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                        env=env
                     )
                 else:
                     proc = subprocess.Popen(
@@ -258,7 +270,8 @@ class NodeProcessSupervisor:
                         stdout=log_out,
                         stderr=log_out,
                         cwd=str(self.base_dir),
-                        start_new_session=True
+                        start_new_session=True,
+                        env=env
                     )
 
             self.write_pid(svc["pid_file"], proc.pid)

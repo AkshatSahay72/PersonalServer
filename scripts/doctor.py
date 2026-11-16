@@ -478,6 +478,16 @@ def spawn_background_process(cmd: List[str], log_file: Path, cwd: Path) -> Optio
     """Spawns a detached background process redirecting output to log_file."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
     out_f = open(log_file, "a", encoding="utf-8", errors="replace")
+    env = dict(os.environ)
+    if "SSL_CERT_FILE" not in env:
+        for cert_candidate in [
+            Path("/data/data/com.termux/files/usr/etc/tls/cert.pem"),
+            Path("/etc/ssl/certs/ca-certificates.crt"),
+        ]:
+            if cert_candidate.exists():
+                env["SSL_CERT_FILE"] = str(cert_candidate)
+                env["SSL_CERT_DIR"] = str(cert_candidate.parent)
+                break
     try:
         if sys.platform == "win32":
             # 0x00000008 = DETACHED_PROCESS, 0x00000200 = CREATE_NEW_PROCESS_GROUP
@@ -488,7 +498,8 @@ def spawn_background_process(cmd: List[str], log_file: Path, cwd: Path) -> Optio
                 stdout=out_f,
                 stderr=subprocess.STDOUT,
                 creationflags=flags,
-                close_fds=True
+                close_fds=True,
+                env=env
             )
             return proc.pid
         else:
@@ -498,7 +509,8 @@ def spawn_background_process(cmd: List[str], log_file: Path, cwd: Path) -> Optio
                 stdout=out_f,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                close_fds=True
+                close_fds=True,
+                env=env
             )
             return proc.pid
     except Exception:
