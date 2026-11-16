@@ -835,9 +835,12 @@ public class BridgeActivity extends AppCompatActivity {
                 if (termuxRecoveryManager != null && termuxRecoveryManager.isCommandIntegrationReady()) {
                     long start = System.currentTimeMillis();
                     termuxRecoveryManager.executeApprovedCommand(TermuxRecoveryManager.OP_PULL_PRODUCTION, null);
-                    if (recoveryCoordinator != null) {
-                        recoveryCoordinator.recordProductionSyncSuccess();
-                    }
+                    try {
+                        getSharedPreferences(RecoveryCoordinator.PREFS_NAME, MODE_PRIVATE)
+                                .edit()
+                                .putLong(RecoveryCoordinator.KEY_LAST_DAILY_SYNC_MS, System.currentTimeMillis())
+                                .apply();
+                    } catch (Exception ignored) {}
                     Log.i(TAG, "Manual production sync (main branch) dispatched via Termux");
                     uiHandler.post(() -> {
                         stateMachine.logStep("Production Sync", "SUCCESS", "Manual production update dispatched", System.currentTimeMillis() - start);

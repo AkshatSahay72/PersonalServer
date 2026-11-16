@@ -253,6 +253,8 @@ public class Log {
     "android/os/Build.java": """
 package android.os;
 public class Build {
+    public static final String MANUFACTURER = "TestManufacturer";
+    public static final String MODEL = "TestModel";
     public static class VERSION {
         public static int SDK_INT = 34;
         public static String RELEASE = "14";
@@ -345,6 +347,7 @@ public class PowerManager {
     public WakeLock newWakeLock(int levelAndFlags, String tag) { return new WakeLock(); }
     public int getCurrentThermalStatus() { return THERMAL_STATUS_NONE; }
     public float getThermalHeadroom(int forecastSeconds) { return 1.0f; }
+    public boolean isIgnoringBatteryOptimizations(String packageName) { return false; }
 }
 """,
     "android/content/Context.java": """
@@ -365,6 +368,7 @@ public class Context {
     private final PackageManager pkgMgr = new PackageManager();
     private final android.app.NotificationManager nm = new android.app.NotificationManager();
     public Context getApplicationContext() { return this; }
+    public String getPackageName() { return "com.personalserver.bridge"; }
     public PackageManager getPackageManager() { return pkgMgr; }
     public File getCacheDir() { return new File(System.getProperty("java.io.tmpdir"), "bridge_test_cache"); }
     public Object getSystemService(String name) {
@@ -426,6 +430,20 @@ public class Intent {
     public String getStringExtra(String k) { Object v = extras.get(k); return v instanceof String ? (String) v : null; }
     public int getIntExtra(String k, int def) { return def; }
     public boolean getBooleanExtra(String k, boolean def) { return def; }
+    public Intent setData(android.net.Uri uri) { return this; }
+}
+""",
+    "android/net/Uri.java": """
+package android.net;
+public class Uri {
+    public static Uri parse(String s) { return new Uri(); }
+}
+""",
+    "android/provider/Settings.java": """
+package android.provider;
+public class Settings {
+    public static final String ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS = "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS";
+    public static final String ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS = "android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS";
 }
 """,
     "android/content/IntentFilter.java": "package android.content; public class IntentFilter { public IntentFilter(String a) {} }",
@@ -441,6 +459,8 @@ public class ContextCompat {
     "android/os/Build.java": """
 package android.os;
 public class Build {
+    public static final String MANUFACTURER = "TestManufacturer";
+    public static final String MODEL = "TestModel";
     public static class VERSION {
         public static final int SDK_INT = 34;
         public static final String RELEASE = "14";
