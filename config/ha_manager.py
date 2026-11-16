@@ -306,6 +306,13 @@ DEFAULT_CLUSTER_VOTERS: Dict[str, Dict[str, Any]] = {
         "votes": 1,
         "role": "voter"
     },
+    "server-95bad5ff01424d4c8d184330d6d2e394": {
+        "node_id": "server-95bad5ff01424d4c8d184330d6d2e394",
+        "name": "Realme 5 Pro",
+        "url": "http://100.73.52.72:8000",
+        "votes": 1,
+        "role": "voter"
+    },
     "server-v2334-a531": {
         "node_id": "server-v2334-a531",
         "name": "Vivo V2334",
@@ -458,7 +465,7 @@ class HAManager:
         # must occur via controlled handover (POST /ha/handover) or explicit admin promotion.
         self.auto_promotion_enabled: bool = (
             auto_promotion_enabled if auto_promotion_enabled is not None
-            else (str(os.environ.get("PERSONALSERVER_HA_AUTO_PROMOTION", "0")).lower() in ("1", "true", "yes"))
+            else (str(os.environ.get("PERSONALSERVER_HA_AUTO_PROMOTION", "1")).lower() in ("1", "true", "yes"))
         )
         self.authority_mechanism: str = "cooperative_lease_no_external_grant"
 
@@ -893,6 +900,8 @@ class HAManager:
                 if not self._is_running:
                     self.start_monitor()
 
+                self._update_controller_json_local(self.node_url)
+
                 if self.on_promotion_callback:
                     try:
                         self.on_promotion_callback()
@@ -900,6 +909,47 @@ class HAManager:
                         controller_logger.error("HA_CALLBACK_ERROR", "Error in on_promotion_callback: %s", e)
 
                 self._broadcast_state_replication_async()
+                return True
+            elif self.auto_promotion_enabled and len(remote_voters) > 0 and votes == 1 and (not self.current_lease.is_valid() or self.missed_checks >= self.max_missed_checks):
+                # Sole survivor promotion: all remote peers are dead and current leader lease expired
+                now = time.time()
+                self.current_lease = LeaderLease(
+                    term=new_term,
+                    leader_id=self.node_id,
+                    leader_url=self.node_url,
+                    lease_expires_at=now + self.lease_duration_sec,
+                    state_version=self.state_version,
+                    last_renewed_at=get_current_iso_timestamp()
+                )
+                self.current_lease.save_to_file(self.lease_file)
+                self.state = HAState.LEADER
+                self.missed_checks = 0
+
+                self.last_transition = {
+                    "timestamp": get_current_iso_timestamp(),
+                    "reason": f"Sole survivor promotion: all {len(remote_voters)} remote voters unreachable, leader dead",
+                    "from_node": self.current_leader_id if self.current_leader_id != self.node_id else None,
+                    "to_node": self.node_id,
+                    "term": new_term
+                }
+
+                controller_logger.warning(
+                    "HA_SOLE_SURVIVOR_PROMOTION",
+                    "All %d remote voters unreachable and leader lease expired. Node %s is assuming LEADER as sole survivor (Term %d).",
+                    len(remote_voters), self.node_id, new_term
+                )
+
+                self._update_controller_json_local(self.node_url)
+
+                if not self._is_running:
+                    self.start_monitor()
+
+                if self.on_promotion_callback:
+                    try:
+                        self.on_promotion_callback()
+                    except Exception as e:
+                        controller_logger.error("HA_CALLBACK_ERROR", "Error in on_promotion_callback: %s", e)
+
                 return True
             else:
                 self.state = HAState.STANDBY
@@ -1091,12 +1141,35 @@ class HAManager:
             if not self._is_running:
                 self.start_monitor()
 
+            self._update_controller_json_local(self.node_url)
+
             # Execute promotion hook
             if self.on_promotion_callback:
                 try:
                     self.on_promotion_callback()
                 except Exception as e:
                     controller_logger.error("HA_CALLBACK_ERROR", "Error in on_promotion_callback: %s", e)
+
+    def _update_controller_json_local(self, leader_url: str):
+        """Updates local config/controller.json so router and agents point to active leader."""
+        try:
+            p = getattr(self, "paths", None) or get_controller_paths()
+            cfg_dir = getattr(p, "config_dir", BASE_DIR / "config")
+            ctrl_file = cfg_dir / "controller.json"
+            clean_url = leader_url.rstrip("/")
+            candidates = list(getattr(self, "candidate_urls", [clean_url]))
+            if clean_url not in candidates:
+                candidates.insert(0, clean_url)
+            data = {
+                "url": clean_url,
+                "urls": candidates,
+                "dashboard_url": clean_url.replace(":8000", ":8080")
+            }
+            with open(ctrl_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            controller_logger.info("HA_CONFIG_SYNC", "Updated config/controller.json -> %s", clean_url)
+        except Exception as e:
+            controller_logger.debug("Failed updating controller.json: %s", e)
 
     def step_down(self, new_term: int, new_leader_id: str, new_leader_url: str):
         """Demotes local node from LEADER to STANDBY to avoid split-brain."""
@@ -1117,6 +1190,8 @@ class HAManager:
                 "Stepping down to STANDBY (Term %d). Active leader is %s at %s.",
                 new_term, new_leader_id, new_leader_url
             )
+
+            self._update_controller_json_local(new_leader_url)
 
             if was_leader and self.on_demotion_callback:
                 try:
@@ -1199,6 +1274,25 @@ class HAManager:
             )
             self.current_lease.save_to_file(self.lease_file)
 
+            if "cloudflared_token" in payload and payload["cloudflared_token"]:
+                new_token = str(payload["cloudflared_token"]).strip()
+                cf_token_file = getattr(p, "config_dir", BASE_DIR / "config") / "secrets" / "cloudflared.token"
+                existing_token = None
+                if cf_token_file.exists():
+                    try:
+                        existing_token = cf_token_file.read_text(encoding="utf-8").strip()
+                    except Exception:
+                        pass
+                if new_token and new_token != existing_token:
+                    try:
+                        cf_token_file.parent.mkdir(parents=True, exist_ok=True)
+                        cf_token_file.write_text(new_token, encoding="utf-8")
+                        controller_logger.info("HA_TOKEN_SYNC", "Synchronized updated Cloudflare Tunnel token from leader")
+                    except Exception as e:
+                        controller_logger.warning("HA_TOKEN_SYNC_ERROR", "Failed saving cloudflared token: %s", e)
+
+            self._update_controller_json_local(leader_url)
+
             controller_logger.info(
                 "HA_SYNC",
                 "Synchronized cluster state from leader %s (State Version: %d, Term: %d)",
@@ -1230,6 +1324,14 @@ class HAManager:
                         pass
                 return default_val
 
+            cf_token_file = getattr(p, "config_dir", BASE_DIR / "config") / "secrets" / "cloudflared.token"
+            cf_token_val = None
+            if cf_token_file.exists():
+                try:
+                    cf_token_val = cf_token_file.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
+
             return {
                 "term": self.current_term,
                 "state_version": self.state_version,
@@ -1243,6 +1345,7 @@ class HAManager:
                 "artifacts": read_json_safe(p.artifacts_file, {"artifacts": {}}),
                 "onboarding_codes": read_json_safe(p.onboarding_codes_file, {"codes": {}}),
                 "voters": read_json_safe(getattr(p, "voters_file", p.data_dir / "voters.json"), {"voters": {}}),
+                "cloudflared_token": cf_token_val,
                 "timestamp": get_current_iso_timestamp()
             }
 

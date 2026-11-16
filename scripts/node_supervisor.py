@@ -21,6 +21,7 @@ import signal
 import socket
 import logging
 import argparse
+import shutil
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
@@ -152,6 +153,20 @@ class NodeProcessSupervisor:
                 "port": 8088,
                 "log_file": self.logs_dir / "app-router.log",
                 "match_pattern": "router/app_router.py",
+                "enabled": True
+            }
+
+        # Check Cloudflare Tunnel
+        cf_token = self.config_dir / "secrets" / "cloudflared.token"
+        cf_bin = shutil.which("cloudflared") or ("/data/data/com.termux/files/usr/bin/cloudflared" if Path("/data/data/com.termux/files/usr/bin/cloudflared").exists() else None)
+        if cf_token.exists() and cf_bin:
+            services["cloudflared"] = {
+                "name": "Cloudflare Tunnel",
+                "cmd": [str(cf_bin), "tunnel", "--no-prechecks", "run", "--token-file", str(cf_token)],
+                "pid_file": self.runtime_dir / "cloudflared.pid",
+                "port": None,
+                "log_file": self.logs_dir / "cloudflared.log",
+                "match_pattern": "cloudflared",
                 "enabled": True
             }
 
