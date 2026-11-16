@@ -22,8 +22,8 @@
 
 | Component | Active Version | Verification Evidence |
 | :--- | :--- | :--- |
-| **Android Native Bridge APK** | `1.0.8` (code `9`) | Built via `gradlew assembleDebug` (3,190,399 bytes). SHA-256: `50F6FFF2427F98F1BBD12C2D92428A6AE853E240090743EB5D8B9DC2145537EF`. Installed on Vivo V2334. |
-| **Camera2 720p 15 FPS Video** | Active | Physically tested: 390 KB valid JPEG frames captured via Camera2 HAL; dynamic front/rear flip; clean release to `IDLE`. |
+| **Android Native Bridge APK** | `1.1.0` (code `10`) | Built via `gradlew assembleDebug` (3,294,393 bytes). SHA-256: `17F5C3359F76F0068E9FB88C929B8A831BC9FD11F313136AC49FF866AD24B46E`. Features: 30 FPS Camera2 streaming, instant camera flip, two-way duplex audio with volume slider, Tailscale accessibility failsafe, boot auto-start, Termux doctor healer, daily production sync, and custom vector launcher logo. Installed and physically verified on Vivo V2334. |
+| **Camera2 720p/480p 30 FPS Video** | Active | Physically tested: 30 FPS Camera2 streaming with 15ms frame wait timeout; instant front/rear flip; clean release to `IDLE`. |
 | **Dedicated Session WakeLock** | Active | `PersonalServer:CCTVSessionWakeLock` verified active during streaming sessions in `LiveMediaBridgeManager.java`. |
 | **Standalone CCTV Web Viewer** | `1.0.0` | Accessible over Tailscale at `http://100.113.234.61:8080/cctv` and `/camera`. |
 | **Universal Node Bootstrapper** | `0.1.0` | `bootstrap/*.sh` modular scripts verified via `tests/unit/test_bootstrapper.py`. |
@@ -69,7 +69,18 @@ Implemented and verified on November 16, 2026:
 
 ---
 
+### 3.5 Android Companion App & Native Bridge v1.1.0 Final Stabilization
+Implemented, compiled, and physically verified on November 17, 2026:
+- **Tailscale Accessibility Service (`TailscaleAccessibilityService.java`):** Zero-touch, DPI/resolution-immune tunnel auto-reconnect via Compose hierarchy inspection and parent container ascension.
+- **Termux Environment Healer (`TermuxRecoveryManager.java`):** Routes automatic node daemon repair through `bash scripts/doctor.sh fix`.
+- **Daily Production Sync (`RecoveryCoordinator.java`):** Checks and pulls the authoritative production branch on app boot and every 24 hours.
+- **30 FPS Low-Latency Camera & Audio Duplex (`LiveMediaBridgeManager.java`):** Boosted frame rate to 30 FPS across 720p/480p/360p presets, reduced loop sleep to 15ms, implemented instant camera flip (<150ms), and added two-way duplex audio with volume control.
+- **Dedicated Vector Launcher Icon (`ic_launcher.xml`):** Custom server chassis branding with status LEDs.
+- **Physical Test Evidence:** Verified on Vivo V2334 (Android 16); SHA-256 `17F5C3359F76F0068E9FB88C929B8A831BC9FD11F313136AC49FF866AD24B46E`.
+
+---
+
 ## 4. Known Gaps & In-Flight Priorities
 
-1. **Application Deployment Subsystem Bugs (M4 — Immediate Next Focus):** Resolve reported deployment bugs in `controller/deployment_manager.py` and verify atomic rollback mechanics.
-2. **Gujarat Node APK Rollout (M2 — Deferred after M4):** Deploy APK v1.0.9+ across Android 11 devices (Vivo Y31, Realme 5 Pro) once node health and deployment stability are verified.
+1. **Application Deployment Subsystem (M4):** Resolve application deployment lifecycle issues in `controller/deployment_manager.py` and verify multi-runtime rollbacks.
+2. **Gujarat Multi-Node Rollout (M2):** Deploy finalized Native Bridge APK v1.1.0 to Gujarat cluster nodes (Vivo Y31 and Realme 5 Pro).
