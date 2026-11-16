@@ -98,18 +98,21 @@ PersonalServer/
 
 ## 4. Current Milestone Priorities
 
-1. **M0 — Project Intelligence & Documentation Foundation (Current):**
+1. **M0 — Project Intelligence & Documentation Foundation:**
    - Establish `AGENTS.md`, `.agent/rules/`, `.agent/workflows/`, and `docs/`.
    - Lock in requirements from the user interview.
-2. **M1 — CCTV & Camera Dashboard Integration:**
-   - Embed live 720p 15 FPS Camera2 video feed and controls directly into the central Operations Dashboard (`server.akshatsahay.space` / `:8080`).
-   - Integrate front/rear camera flip and real-time telemetry overlay.
-3. **M2 — Cross-Device APK Stabilization:**
-   - Deploy and physically validate APK v1.0.8 on Gujarat nodes (Vivo Y31, Realme 5 Pro).
-4. **M3 — Node Health, Thermal Protection & Auto-Recovery:**
+2. **M1 — CCTV & Camera Dashboard Integration (Completed & Stabilized on V2334):**
+   - Embed live 720p/480p Camera2 video feed and controls directly into the central Operations Dashboard (`server.akshatsahay.space` / `:8080`).
+   - Integrated front/rear camera flip, strict on-demand auto-release, and real-time telemetry overlay.
+3. **M3 — Node Health, Thermal Protection & Auto-Recovery (Current Focus):**
    - Enforce active battery thermal throttling (> 42°C) and background process resurrection.
-5. **M4 — Deployment Pipeline Fixes:**
-   - Reconfigure and resolve application deployment bugs.
+   - Guard mobile hardware longevity and self-healing across nodes before multi-device rollout.
+4. **M4 — Deployment Pipeline Fixes:**
+   - Reconfigure and resolve application deployment bugs in `controller/deployment_manager.py`.
+   - Ensure clean atomic rollbacks when health checks fail across multi-runtime applications.
+5. **M2 — Cross-Device APK Stabilization & Multi-Node Rollout:**
+   - Deploy and physically validate unified Native Bridge APK v1.0.9 on Gujarat nodes (Vivo Y31, Realme 5 Pro).
+   - Cross-verify Android 11 vs Android 16 platform differences after health & deployment systems are solid.
 
 ---
 

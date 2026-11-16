@@ -60,8 +60,8 @@ Tested directly on live Vivo V2334 hardware (`100.113.234.61:8080`) on November 
 
 ---
 
-## 4. Known Gaps & In-Flight Items
+## 4. Known Gaps & In-Flight Priorities
 
-1. **Dashboard Embedding (M1):** The live video viewer currently exists as a standalone HTML page (`live_viewer.html`); it needs to be cleanly embedded into the main Operations Console (`index.html`).
-2. **Gujarat Node APK Rollout (M2):** APK v1.0.8 has been physically proven on Android 16 (Vivo V2334), but needs distribution and testing on the Android 11 nodes (Vivo Y31, Realme 5 Pro).
-3. **Application Deployment Subsystem Bugs (M4):** Known deployment bugs reported in `controller/deployment_manager.py` scheduled for resolution in Milestone M4.
+1. **Node Health & Thermal Protection (M3 — Immediate Next):** Implement battery thermal monitoring (> 42°C active throttling) and enhance node process resurrection before expanding to more devices.
+2. **Application Deployment Subsystem Bugs (M4):** Resolve reported deployment bugs in `controller/deployment_manager.py` and verify atomic rollback mechanics.
+3. **Gujarat Node APK Rollout (M2 — Deferred after M3/M4):** Deploy APK v1.0.9+ across Android 11 devices (Vivo Y31, Realme 5 Pro) once node health and deployment stability are verified.
