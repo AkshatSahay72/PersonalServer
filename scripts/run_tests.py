@@ -34,10 +34,27 @@ UNIT_TEST_FILES = [
     "tests/unit/test_doctor.py",
     "tests/unit/test_worker_lifecycle_safety.py",
     "tests/unit/test_capability_probes.py",
-    "tests/unit/test_build_worker.py",
     "tests/unit/test_app_manifest.py",
     "tests/unit/test_process_identity_safety.py",
     "tests/unit/test_dns_utils.py",
+    "tests/unit/test_bootstrapper.py",
+    "tests/unit/test_device_runtime.py",
+    "tests/unit/test_e06_a_native_independence.py",
+    "tests/unit/test_e06_b_autonomous_recovery.py",
+    "tests/unit/test_e07_live_call.py",
+    "tests/unit/test_explicit_targeting_safety.py",
+    "tests/unit/test_hardware_capabilities.py",
+    "tests/unit/test_integrated_lifecycle_j3_j4_j5.py",
+    "tests/unit/test_native_android_bridge.py",
+    "tests/unit/test_native_android_bridge_lifecycle.py",
+    "tests/unit/test_native_android_microphone.py",
+    "tests/unit/test_native_android_sensor_runtime.py",
+    "tests/unit/test_node_supervisor.py",
+    "tests/unit/test_production_auto_sync.py",
+    "tests/unit/test_result_manager_j5.py",
+    "tests/unit/test_thermal_protection.py",
+    "tests/unit/test_universal_execution_engine_j4.py",
+    "tests/unit/test_universal_scheduler_j3.py",
 ]
 
 # Integration test suites: Protocol boundaries, multi-node simulator, job lifecycle, routing, HA
@@ -106,6 +123,14 @@ INTEGRATION_TEST_FILES = [
     "tests/ui/test_dashboard_js_syntax.py",
     "tests/ui/test_shell_layout_stability.py",
     "tests/ui/test_workload_control_ui.py",
+    # Adapter & hardening suites
+    "tests/deployment/test_r5_nodejs_adapter.py",
+    "tests/deployment/test_r6_static_adapter.py",
+    "tests/deployment/test_r7_container_adapter.py",
+    "tests/deployment/test_r8_lifecycle_hardening.py",
+    "tests/deployment/test_r9_interface_acceptance.py",
+    "tests/ha/test_j6_quorum_consensus.py",
+    "tests/integration/test_vivo_cctv_streaming.py",
 ]
 
 

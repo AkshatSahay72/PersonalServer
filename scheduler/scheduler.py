@@ -517,9 +517,13 @@ class ResourceScheduler:
         # Check Docker Engine requirement specifically (J3.2 §3.2(7): udocker NEVER satisfies docker)
         req_runtime = str(reqs.get("runtime", "")).lower()
         if "container_runtime:docker" in req_caps or "docker" in req_caps or req_runtime in ("docker", "container/docker", "container_runtime:docker"):
-            has_docker = verified_caps.get("container_runtime:docker", False) or verified_caps.get("docker", False)
+            has_docker = (
+                verified_caps.get("container_runtime:docker", False)
+                or verified_caps.get("docker", False)
+                or (not require_verified and (advertised_caps.get("container_runtime:docker", False) or advertised_caps.get("docker", False)))
+            )
             if not has_docker:
-                return False, f"{REJECTION_DOCKER_ENGINE_NOT_AVAILABLE}: Genuine Docker Engine required (udocker does not satisfy)"
+                return False, f"{REJECTION_DOCKER_ENGINE_NOT_AVAILABLE}: Genuine Docker Engine (container_runtime:docker) required (udocker does not satisfy)"
 
         # Check general capability presence
         missing = [c for c in req_caps if not advertised_caps.get(c, False) and not verified_caps.get(c, False)]

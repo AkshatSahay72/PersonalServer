@@ -63,6 +63,19 @@
                 android:value="Local loopback IPC service for device telemetry and sensor acquisition" />
         </service>
 
+        <service
+            android:name=".TailscaleAccessibilityService"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/tailscale_accessibility_service_config" />
+        </service>
+
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"

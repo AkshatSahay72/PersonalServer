@@ -55,8 +55,9 @@ public class Intent {
     public String getAction() { return action; }
     public Intent setClassName(String pkg, String cls) { return this; }
     public Intent addFlags(int flags) { return this; }
+    public Intent setData(android.net.Uri uri) { return this; }
     public String getStringExtra(String name) { Object v = extras.get(name); return v instanceof String ? (String) v : null; }
-    public Intent putExtra(String name, String val) { extras.put(name, val); return this; }
+    public Intent putExtra(String name, Object val) { extras.put(name, val); return this; }
     public Intent putExtra(String name, String[] val) { extras.put(name, val); return this; }
     public Intent putExtra(String name, int val) { extras.put(name, val); return this; }
     public Intent putExtra(String name, boolean val) { extras.put(name, val); return this; }
@@ -131,6 +132,8 @@ public class Context {
     private final Map<String, SharedPreferences> prefsMap = new HashMap<>();
     private File cacheDir = new File(System.getProperty("java.io.tmpdir"), "e06_bridge_cache");
     public Context getApplicationContext() { return this; }
+    public String getPackageName() { return "com.personalserver.bridge"; }
+    public android.content.ContentResolver getContentResolver() { return new android.content.ContentResolver(); }
     public Object getSystemService(String name) {
         if (POWER_SERVICE.equals(name)) return pm;
         if (SENSOR_SERVICE.equals(name)) return sm;
@@ -233,6 +236,8 @@ public class ContextCompat {
     "android/os/Build.java": """
 package android.os;
 public class Build {
+    public static final String MANUFACTURER = "TestManufacturer";
+    public static final String MODEL = "TestModel";
     public static class VERSION {
         public static final int SDK_INT = 34;
         public static final String RELEASE = "14";
@@ -271,6 +276,7 @@ public class PowerManager {
     public WakeLock newWakeLock(int levelAndFlags, String tag) { return new WakeLock(); }
     public int getCurrentThermalStatus() { return THERMAL_STATUS_LIGHT; }
     public float getThermalHeadroom(int forecastSeconds) { return 0.91f; }
+    public boolean isIgnoringBatteryOptimizations(String packageName) { return false; }
 }
 """,
     "android/hardware/Sensor.java": """

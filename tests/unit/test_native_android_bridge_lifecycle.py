@@ -380,6 +380,7 @@ public class Context {
         return null;
     }
     public <T> T getSystemService(Class<T> serviceClass) { return null; }
+    public ContentResolver getContentResolver() { return new ContentResolver(); }
     public Intent registerReceiver(Object r, IntentFilter f) { return null; }
     public int checkSelfPermission(String perm) { return 0; }
     public int checkCallingOrSelfPermission(String p) { return 0; }
@@ -439,11 +440,78 @@ public class Uri {
     public static Uri parse(String s) { return new Uri(); }
 }
 """,
+    "android/content/ContentResolver.java": "package android.content; public class ContentResolver {}",
+    "android/text/TextUtils.java": """
+package android.text;
+import java.util.Iterator;
+public class TextUtils {
+    public static class SimpleStringSplitter implements Iterator<String> {
+        private String[] parts = new String[0];
+        private int idx = 0;
+        public SimpleStringSplitter(char delimiter) {}
+        public void setString(String string) {
+            if (string == null) parts = new String[0];
+            else parts = string.split(":");
+            idx = 0;
+        }
+        @Override public boolean hasNext() { return idx < parts.length; }
+        @Override public String next() { return parts[idx++]; }
+    }
+}
+""",
+    "android/accessibilityservice/AccessibilityService.java": """
+package android.accessibilityservice;
+import android.content.Context;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
+public abstract class AccessibilityService extends Context {
+    protected void onServiceConnected() {}
+    public abstract void onAccessibilityEvent(AccessibilityEvent event);
+    public abstract void onInterrupt();
+    public AccessibilityNodeInfo getRootInActiveWindow() { return null; }
+    public void onDestroy() {}
+}
+""",
+    "android/accessibilityservice/AccessibilityServiceInfo.java": "package android.accessibilityservice; public class AccessibilityServiceInfo {}",
+    "android/view/accessibility/AccessibilityEvent.java": """
+package android.view.accessibility;
+public class AccessibilityEvent {
+    public static final int TYPE_WINDOW_STATE_CHANGED = 32;
+    public static final int TYPE_WINDOW_CONTENT_CHANGED = 2048;
+    public CharSequence getPackageName() { return null; }
+    public int getEventType() { return 0; }
+}
+""",
+    "android/view/accessibility/AccessibilityNodeInfo.java": """
+package android.view.accessibility;
+import java.util.*;
+public class AccessibilityNodeInfo {
+    public static final int ACTION_CLICK = 16;
+    public List<AccessibilityNodeInfo> findAccessibilityNodeInfosByViewId(String viewId) { return new ArrayList<>(); }
+    public List<AccessibilityNodeInfo> findAccessibilityNodeInfosByText(String text) { return new ArrayList<>(); }
+    public boolean isClickable() { return false; }
+    public boolean isChecked() { return false; }
+    public boolean performAction(int action) { return true; }
+    public AccessibilityNodeInfo getParent() { return null; }
+    public CharSequence getClassName() { return null; }
+    public int getChildCount() { return 0; }
+    public AccessibilityNodeInfo getChild(int index) { return null; }
+    public void recycle() {}
+}
+""",
     "android/provider/Settings.java": """
 package android.provider;
+import android.content.ContentResolver;
 public class Settings {
     public static final String ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS = "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS";
     public static final String ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS = "android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS";
+    public static final String ACTION_ACCESSIBILITY_SETTINGS = "android.settings.ACCESSIBILITY_SETTINGS";
+    public static class Secure {
+        public static final String ACCESSIBILITY_ENABLED = "accessibility_enabled";
+        public static final String ENABLED_ACCESSIBILITY_SERVICES = "enabled_accessibility_services";
+        public static int getInt(ContentResolver cr, String name, int def) { return 0; }
+        public static String getString(ContentResolver cr, String name) { return null; }
+    }
 }
 """,
     "android/content/IntentFilter.java": "package android.content; public class IntentFilter { public IntentFilter(String a) {} }",

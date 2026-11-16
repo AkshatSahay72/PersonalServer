@@ -65,6 +65,10 @@ public class BridgeActivity extends AppCompatActivity {
     private LinearLayout batteryAttentionCard;
     private Button exemptBatteryBtn;
 
+    // Accessibility Attention Panel
+    private LinearLayout accessibilityAttentionCard;
+    private Button enableAccessibilityBtn;
+
     // Subsystem Indicators
     private TextView subsystemSummaryText;
 
@@ -280,6 +284,37 @@ public class BridgeActivity extends AppCompatActivity {
         batteryAttentionCard.addView(exemptBatteryBtn);
 
         root.addView(batteryAttentionCard);
+
+        // Accessibility Attention Panel
+        accessibilityAttentionCard = new LinearLayout(this);
+        accessibilityAttentionCard.setOrientation(LinearLayout.VERTICAL);
+        accessibilityAttentionCard.setBackgroundColor(Color.parseColor("#1B2A1E"));
+        accessibilityAttentionCard.setPadding(24, 18, 24, 18);
+        accessibilityAttentionCard.setVisibility(View.GONE);
+
+        TextView a11yTitle = new TextView(this);
+        a11yTitle.setText("🛡️ Tailscale Zero-Touch Auto-Recovery");
+        a11yTitle.setTextColor(Color.parseColor("#34D399"));
+        a11yTitle.setTextSize(16f);
+        a11yTitle.setPadding(0, 0, 0, 6);
+        accessibilityAttentionCard.addView(a11yTitle);
+
+        TextView a11yMessage = new TextView(this);
+        a11yMessage.setText("To enable automatic zero-touch VPN reconnection across network drops and reboots without physical touches, enable PersonalServer in Accessibility Settings.");
+        a11yMessage.setTextColor(Color.parseColor("#D1FAE5"));
+        a11yMessage.setTextSize(13f);
+        a11yMessage.setPadding(0, 0, 0, 12);
+        accessibilityAttentionCard.addView(a11yMessage);
+
+        enableAccessibilityBtn = new Button(this);
+        enableAccessibilityBtn.setText("Enable Accessibility Service");
+        enableAccessibilityBtn.setTextColor(Color.WHITE);
+        enableAccessibilityBtn.setBackgroundColor(Color.parseColor("#059669"));
+        enableAccessibilityBtn.setPadding(16, 10, 16, 10);
+        enableAccessibilityBtn.setOnClickListener(v -> openAccessibilitySettings());
+        accessibilityAttentionCard.addView(enableAccessibilityBtn);
+
+        root.addView(accessibilityAttentionCard);
 
         // Subsystems Status Overview Card
         LinearLayout subsystemCard = new LinearLayout(this);
@@ -970,6 +1005,16 @@ public class BridgeActivity extends AppCompatActivity {
         }
     }
 
+    public void openAccessibilitySettings() {
+        try {
+            Intent intent = new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to open accessibility settings: " + e.getMessage());
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
@@ -1144,6 +1189,12 @@ public class BridgeActivity extends AppCompatActivity {
                 isOptimized = pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName());
             }
             batteryAttentionCard.setVisibility(isOptimized ? View.VISIBLE : View.GONE);
+        }
+
+        // 3c. Accessibility Attention Panel visibility
+        if (accessibilityAttentionCard != null) {
+            boolean a11yGranted = TailscaleAccessibilityService.isAccessibilityPermissionGranted(this);
+            accessibilityAttentionCard.setVisibility(a11yGranted ? View.GONE : View.VISIBLE);
         }
 
         // 4. Subsystems Summary block

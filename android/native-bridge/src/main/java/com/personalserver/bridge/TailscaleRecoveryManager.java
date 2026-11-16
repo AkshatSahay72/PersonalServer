@@ -195,10 +195,13 @@ public class TailscaleRecoveryManager {
         boolean launchDispatched = false;
         String launchError = null;
 
+        // Arm unprivileged Accessibility Service for zero-touch view inspection & toggle click
+        TailscaleAccessibilityService.requestAutoToggle();
+
         try {
             context.startActivity(launchIntent);
             launchDispatched = true;
-            Log.i(TAG, "Dispatched launch intent for " + TAILSCALE_PACKAGE);
+            Log.i(TAG, "Dispatched launch intent for " + TAILSCALE_PACKAGE + " with accessibility auto-toggle armed");
         } catch (Exception e) {
             launchError = e.getMessage();
             Log.w(TAG, "Direct background launch of Tailscale activity was restricted: " + launchError);

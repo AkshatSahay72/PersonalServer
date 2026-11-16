@@ -207,6 +207,9 @@ public class BridgeService extends Service {
             if (bridgeServer.getRecoveryCoordinator() != null) {
                 bridgeServer.getRecoveryCoordinator().start();
             }
+            if (intent != null && "BOOT_COMPLETED".equals(intent.getStringExtra("source"))) {
+                scheduleUnattendedBootStartup();
+            }
             Notification activeNotification = buildNotification("Loopback IPC active on 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT);
             startForegroundWithCompat(activeNotification);
             Log.i(TAG, "PersonalServer Bridge Service started on 127.0.0.1:" + LocalBridgeServer.DEFAULT_PORT);
@@ -276,6 +279,31 @@ public class BridgeService extends Service {
                 wakeLock.release();
             }
         } catch (Exception ignored) {}
+    }
+
+    private void scheduleUnattendedBootStartup() {
+        new Thread(() -> {
+            try {
+                Log.i(TAG, "Unattended boot recovery: waiting 10s for OS network stack and Tailscale to settle...");
+                Thread.sleep(10000L);
+
+                TermuxRecoveryManager termuxMgr = new TermuxRecoveryManager(this);
+                TailscaleRecoveryManager tailscaleMgr = new TailscaleRecoveryManager(this);
+
+                if (tailscaleMgr.isTailscaleInstalled() && !tailscaleMgr.isVpnActive()) {
+                    Log.i(TAG, "Unattended boot recovery: Tailscale disconnected; triggering auto-reconnect...");
+                    tailscaleMgr.triggerReconnection();
+                    Thread.sleep(5000L);
+                }
+
+                if (termuxMgr.isCommandIntegrationReady()) {
+                    Log.i(TAG, "Unattended boot recovery: dispatching start.sh to awaken PersonalServer services...");
+                    termuxMgr.executeApprovedCommand(TermuxRecoveryManager.OP_START_SERVICES, null);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Unattended boot startup encountered error: " + e.getMessage());
+            }
+        }, "UnattendedBootStartupThread").start();
     }
 
     @Override

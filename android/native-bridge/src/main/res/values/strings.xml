@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PersonalServer Native Bridge</string>
+    <string name="accessibility_service_description">Automates Tailscale mesh VPN reconnection for unattended PersonalServer edge nodes.</string>
+</resources>

@@ -167,8 +167,8 @@ public class TermuxRecoveryManager {
                 arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/stop.sh"};
                 break;
             case OP_RUN_DOCTOR:
-                executable = "/data/data/com.termux/files/usr/bin/python3";
-                arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/doctor.py", "--json"};
+                executable = "/data/data/com.termux/files/usr/bin/bash";
+                arguments = new String[]{"/data/data/com.termux/files/home/PersonalServer/scripts/doctor.sh", "fix"};
                 workDir = "/data/data/com.termux/files/home/PersonalServer";
                 break;
             case OP_START_SSHD:
