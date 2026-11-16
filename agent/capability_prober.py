@@ -571,6 +571,75 @@ def run_capability_probes(
     if static_res.get("verified"):
         verified_dict["static"] = True
 
+    # 7. Hardware Capabilities Probes (Camera, Microphone, Speaker)
+    try:
+        from agent.hardware.manager import HardwareCapabilityManager
+        hw_mgr = HardwareCapabilityManager.get_instance()
+        cam_ok, cam_err = hw_mgr.camera.is_available()
+        mic_ok, mic_err = hw_mgr.microphone.is_available()
+        spk_ok, spk_err = hw_mgr.speaker.is_available()
+
+        now_iso = get_current_iso_timestamp()
+        probe_results["camera"] = {"verified": cam_ok, "capability": "camera", "error": cam_err, "timestamp": now_iso}
+        if cam_ok:
+            verified_dict["camera"] = True
+            adv_dict["camera"] = True
+            verified_dict["live_camera"] = True
+            adv_dict["live_camera"] = True
+            probe_results["live_camera"] = {
+                "verified": True,
+                "capability": "live_camera",
+                "encoder": "MediaCodec:video/avc",
+                "transport": "WebRTC",
+                "target_resolution": "720p @ 15fps",
+                "timestamp": now_iso
+            }
+        else:
+            verified_dict.pop("camera", None)
+            verified_dict.pop("live_camera", None)
+
+        probe_results["microphone"] = {"verified": mic_ok, "capability": "microphone", "error": mic_err, "timestamp": now_iso}
+        if mic_ok:
+            verified_dict["microphone"] = True
+            adv_dict["microphone"] = True
+        else:
+            verified_dict.pop("microphone", None)
+
+        probe_results["speaker"] = {"verified": spk_ok, "capability": "speaker", "error": spk_err, "timestamp": now_iso}
+        if spk_ok:
+            verified_dict["speaker"] = True
+            adv_dict["speaker"] = True
+        else:
+            verified_dict.pop("speaker", None)
+    except Exception:
+        pass
+
+    # 8. Device Runtime Capabilities (D1)
+    try:
+        from agent.device_runtime.runtime import DeviceRuntime
+        d1_runtime = DeviceRuntime.get_instance()
+        d1_telem = d1_runtime.get_telemetry()
+        d1_caps = d1_telem.get("capabilities", {})
+        for cap_name, cap_desc in d1_caps.items():
+            st = cap_desc.get("state", "UNAVAILABLE")
+            is_avail = (st == "READY")
+            verified_dict[cap_name] = {
+                "state": st,
+                "is_available": is_avail,
+                "details": cap_desc.get("details", {})
+            }
+            if is_avail:
+                adv_dict[cap_name] = True
+            probe_results[cap_name] = {
+                "verified": is_avail,
+                "capability": cap_name,
+                "state": st,
+                "details": cap_desc.get("details", {}),
+                "timestamp": now_iso
+            }
+    except Exception as e:
+        pass
+
     return {
         "advertised_capabilities": adv_dict,
         "verified_capabilities": verified_dict,

@@ -194,7 +194,8 @@ class TestPart8AcceptanceCriteria(unittest.TestCase):
             lease_expires_at=time.time() - 5.0
         )
 
-        with patch.object(ha_realme, "check_remote_leader", return_value=(False, HAFailureMode.PROCESS_DEAD)):
+        with patch.object(ha_realme, "check_remote_leader", return_value=(False, HAFailureMode.PROCESS_DEAD)), \
+             patch.object(ha_realme, "campaign_for_leadership", side_effect=lambda reason="": ha_realme.elect_self(reason)):
             ha_realme.trigger_failover_evaluation()
             self.assertEqual(ha_realme.state, HAState.LEADER)
             self.assertEqual(ha_realme.current_term, 2)

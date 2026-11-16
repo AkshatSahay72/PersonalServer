@@ -83,6 +83,19 @@ def handle_ha_get(handler: Any, path: str) -> bool:
         handler.send_json(200, snapshot)
         return True
 
+    # GET /ha/voters or GET /api/ha/voters
+    if path in ("/ha/voters", "/api/ha/voters"):
+        mgr = get_ha_manager()
+        handler.send_json(200, {
+            "voters": mgr.voting_members,
+            "total_voters": len(mgr.voting_members),
+            "quorum_size": mgr.quorum_size,
+            "current_term": mgr.current_term,
+            "voted_for": mgr.voted_for,
+            "timestamp": get_current_iso_timestamp()
+        })
+        return True
+
     return False
 
 
@@ -157,6 +170,79 @@ def handle_ha_post(handler: Any, path: str, body: Optional[Dict[str, Any]], toke
         res = mgr.controlled_handover(target_id, admin_token=token)
         code = 200 if res.get("status") == "success" else 400
         handler.send_json(code, res)
+        return True
+
+    if path in ("/ha/vote", "/api/ha/vote"):
+        token = token or handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        mgr = get_ha_manager()
+        candidate_id = (body or {}).get("candidate_id")
+        voters = mgr.load_voting_members()
+        is_known_voter = bool(candidate_id and candidate_id in voters)
+        if not is_known_voter and not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to vote in HA election"})
+            return True
+        res = mgr.handle_vote_request(body or {})
+        handler.send_json(200, res)
+        return True
+
+    if path in ("/ha/voters/add", "/api/ha/voters/add"):
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to modify voters"})
+            return True
+        mgr = get_ha_manager()
+        nid = (body or {}).get("node_id")
+        url = (body or {}).get("url")
+        name = (body or {}).get("name")
+        if not nid or not url:
+            handler.send_json(400, {"error": "Missing required fields 'node_id' and 'url'"})
+            return True
+        ok = mgr.add_voting_member(nid, url, name)
+        handler.send_json(200 if ok else 500, {
+            "status": "ok" if ok else "failed",
+            "voters": mgr.voting_members,
+            "quorum_size": mgr.quorum_size
+        })
+        return True
+
+    if path in ("/ha/voters/remove", "/api/ha/voters/remove"):
+        enrollment_token = get_or_create_enrollment_token()
+        if not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required to modify voters"})
+            return True
+        mgr = get_ha_manager()
+        nid = (body or {}).get("node_id")
+        if not nid:
+            handler.send_json(400, {"error": "Missing required field 'node_id'"})
+            return True
+        ok = mgr.remove_voting_member(nid)
+        handler.send_json(200 if ok else 404, {
+            "status": "ok" if ok else "not_found",
+            "voters": mgr.voting_members,
+            "quorum_size": mgr.quorum_size
+        })
+        return True
+
+    if path in ("/ha/replicate", "/api/ha/replicate"):
+        token = token or handler.parse_auth_token()
+        enrollment_token = get_or_create_enrollment_token()
+        mgr = get_ha_manager()
+        leader_id = (body or {}).get("leader_id")
+        voters = mgr.load_voting_members()
+        is_known_voter = bool(leader_id and leader_id in voters)
+        if not is_known_voter and not handler.is_authenticated_admin_or_node() and not constant_time_compare(token, enrollment_token):
+            handler.send_json(401, {"error": "Unauthorized: Authentication required for HA state replication"})
+            return True
+        mgr = get_ha_manager()
+        sender_url = (body or {}).get("leader_url") or handler.client_address[0]
+        with mgr._lock:
+            ok = mgr._apply_sync_snapshot_locked(body or {}, str(sender_url))
+        handler.send_json(200 if ok else 400, {
+            "status": "synchronized" if ok else "ignored_or_failed",
+            "term": mgr.current_term,
+            "state_version": mgr.state_version
+        })
         return True
 
     if path in ("/ha/mode", "/api/ha/mode"):

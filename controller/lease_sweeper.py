@@ -38,6 +38,7 @@ from controller.constants import (
 from controller.ha_helper import get_ha_manager
 from controller.notifications import notify_job_failure
 from controller.stores import load_jobs_db, load_nodes_db, save_jobs_db, load_workflows_db, save_workflows_db
+from controller.workflow_engine import evaluate_workflow_progress
 from controller.stores.reservations import sweep_reservation_ledger, release_reservation, create_or_update_reservation, ReservationState
 from scheduler.scheduler import ResourceScheduler, compute_node_liveness
 

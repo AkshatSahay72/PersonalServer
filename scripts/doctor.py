@@ -1584,7 +1584,18 @@ class DiagnosticEngine:
                 if dry_run:
                     actions.append("Would start Controller on port 8000")
                 else:
-                    cmd = [sys.executable, str(ctrl_script), "start", "--host", "0.0.0.0", "--port", "8000"]
+                    role_flag = []
+                    node_conf = self.base_dir / "config" / "node.conf"
+                    if node_conf.exists():
+                        try:
+                            for line in node_conf.read_text(encoding="utf-8").splitlines():
+                                if line.strip().startswith("PERSONALSERVER_HA_ROLE="):
+                                    r_val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                    if r_val:
+                                        role_flag = ["--role", r_val]
+                        except Exception:
+                            pass
+                    cmd = [sys.executable, str(ctrl_script), "start", "--host", "0.0.0.0", "--port", "8000"] + role_flag
                     c_pid = spawn_background_process(cmd, CONTROLLER_LOG, self.base_dir)
                     if c_pid:
                         CONTROLLER_PID_FILE.write_text(f"{c_pid}\n", encoding="utf-8")

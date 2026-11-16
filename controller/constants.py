@@ -18,7 +18,7 @@ STATE_UNHEALTHY = "UNHEALTHY"
 STATE_UNKNOWN = "UNKNOWN"
 STATE_REMOVED = "REMOVED"
 
-VALID_ROLES = ["compute", "storage", "gateway", "controller", "hybrid", "build", "build-worker"]
+VALID_ROLES = ["compute", "storage", "gateway", "controller", "hybrid", "build", "build-worker", "experimental-worker"]
 
 # Centralized Job States (V2.0 Extended Lifecycle)
 JOB_STATE_QUEUED = "QUEUED"

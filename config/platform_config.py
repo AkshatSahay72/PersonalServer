@@ -300,6 +300,9 @@ class ControllerPaths:
         self.backup_shares_file = self.data_dir / "shares.json.bak"
         self.leader_lease_file = self.data_dir / "leader_lease.json"
         self.ha_state_file = self.data_dir / "ha_state.json"
+        self.voters_file = self.data_dir / "voters.json"
+        self.backup_voters_file = self.data_dir / "voters.json.bak"
+        self.ha_election_state_file = self.data_dir / "ha_election_state.json"
         self.artifacts_dir = self.storage_dir / "artifacts"
 
     def ensure_directories(self):
@@ -343,6 +346,7 @@ class ControllerPaths:
             "enrollment_token_file": str(self.enrollment_token_file),
             "leader_lease_file": str(self.leader_lease_file),
             "ha_state_file": str(self.ha_state_file),
+            "voters_file": str(self.voters_file),
         }
 
 

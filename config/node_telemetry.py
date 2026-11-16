@@ -1,3 +1,25 @@
+_TERMUX_API_FAIL_UNTIL = 0.0
+
+
+def _run_termux_api_cmd(cmd_list, timeout=2):
+    """Safely runs a termux-api CLI command with a circuit breaker to avoid zombie process leaks."""
+    global _TERMUX_API_FAIL_UNTIL
+    if time.time() < _TERMUX_API_FAIL_UNTIL:
+        return None
+    try:
+        res = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout
+    except subprocess.TimeoutExpired:
+        _TERMUX_API_FAIL_UNTIL = time.time() + 300.0
+        try:
+            subprocess.run(["pkill", "-9", "-f", "termux-api"], capture_output=True, timeout=1)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
 """
 PersonalServer Node Telemetry & Hardware Diagnostics
 ====================================================
@@ -17,8 +39,10 @@ import socket
 import shutil
 import re
 import subprocess
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Dict, Any, Optional, Tuple
 
 # ------------------------------------------------------------------------------
 # 1. Battery Telemetry
@@ -48,15 +72,10 @@ def collect_battery_info():
 
     # Method A: Termux / Android via termux-battery-status
     if shutil.which("termux-battery-status"):
-        try:
-            res = subprocess.run(
-                ["termux-battery-status"],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                data = json.loads(res.stdout)
+        stdout = _run_termux_api_cmd(["termux-battery-status"], timeout=2)
+        if stdout:
+            try:
+                data = json.loads(stdout)
                 battery["percentage"] = int(data.get("percentage", 0))
                 battery["status"] = str(data.get("status", "UNKNOWN")).upper()
                 battery["plugged"] = str(data.get("plugged", "UNKNOWN")).upper()
@@ -66,8 +85,8 @@ def collect_battery_info():
                 if "current" in data and data["current"] is not None:
                     battery["current_ma"] = int(data["current"])
                 return battery
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     # Method B: Linux sysfs (/sys/class/power_supply)
     sys_power = Path("/sys/class/power_supply")
@@ -171,6 +190,36 @@ def collect_battery_info():
         except Exception:
             pass
 
+    # Method D: Android Native Bridge via loopback IPC (port 8765)
+    # Retrieves high-precision BatteryManager kernel metrics if temp is still None on Android
+    if battery.get("temperature_c") is None and (os.path.exists("/data/data/com.termux") or "com.termux" in os.environ.get("PREFIX", "")):
+        try:
+            with socket.create_connection(("127.0.0.1", 8765), timeout=0.2) as s:
+                s.settimeout(0.4)
+                req_payload = (json.dumps({
+                    "version": 1,
+                    "protocol_version": 1,
+                    "capability": "battery",
+                    "operation": "get_status"
+                }) + "\n").encode("utf-8")
+                s.sendall(req_payload)
+                raw_resp = s.recv(4096).decode("utf-8").strip()
+                if raw_resp:
+                    res_json = json.loads(raw_resp)
+                    bdata = res_json.get("data", {})
+                    if "temperature_c" in bdata and bdata["temperature_c"] is not None:
+                        battery["temperature_c"] = round(float(bdata["temperature_c"]), 1)
+                    if battery.get("percentage") is None and "percentage" in bdata and bdata["percentage"] >= 0:
+                        battery["percentage"] = int(bdata["percentage"])
+                    if battery.get("status") in (None, "UNKNOWN") and "status" in bdata:
+                        battery["status"] = str(bdata["status"]).upper()
+                    if battery.get("plugged") in (None, "UNKNOWN") and "plugged" in bdata:
+                        battery["plugged"] = str(bdata["plugged"]).upper()
+                    if battery.get("health") in (None, "UNKNOWN") and "health" in bdata:
+                        battery["health"] = str(bdata["health"]).upper()
+        except Exception:
+            pass
+
     return battery
 
 
@@ -234,13 +283,32 @@ def collect_network_info():
         except Exception:
             pass
 
+    # If tailscale binary not in PATH (e.g. Android Termux VPN), probe Tailscale mesh interface
+    if not net_info.get("tailscale_ip"):
+        for probe_dest in ("100.100.100.100", "100.64.0.1"):
+            try:
+                s_ts = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s_ts.settimeout(0.5)
+                s_ts.connect((probe_dest, 53))
+                ts_cand = s_ts.getsockname()[0]
+                s_ts.close()
+                if ts_cand and ts_cand.startswith("100."):
+                    net_info["tailscale_ip"] = ts_cand
+                    break
+            except Exception:
+                pass
+
+    # Ensure tailscale IP takes priority over cellular/CGNAT IPs for mesh communication
+    if net_info.get("tailscale_ip"):
+        net_info["ip"] = net_info["tailscale_ip"]
+
     # 2. Platform-specific Wi-Fi and Signal Metrics
     # Method A: Termux / Android via termux-wifi-connectioninfo
     if shutil.which("termux-wifi-connectioninfo"):
-        try:
-            res = subprocess.run(["termux-wifi-connectioninfo"], capture_output=True, text=True, timeout=2)
-            if res.returncode == 0 and res.stdout.strip():
-                wdata = json.loads(res.stdout)
+        stdout = _run_termux_api_cmd(["termux-wifi-connectioninfo"], timeout=2)
+        if stdout:
+            try:
+                wdata = json.loads(stdout)
                 ssid = wdata.get("ssid", "").strip('"')
                 if ssid and ssid != "<unknown ssid>":
                     net_info["wifi_ssid"] = ssid
@@ -257,8 +325,8 @@ def collect_network_info():
 
                 if not net_info.get("ip") and wdata.get("ip"):
                     net_info["ip"] = wdata["ip"]
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     # Method B: Windows netsh wlan show interfaces
     elif sys.platform == "win32":
@@ -620,3 +688,167 @@ def run_live_diagnostics(target_host=None, test_speed=True):
         "cpu": telemetry["cpu_details"],
         "thermals": telemetry["thermals"]
     }
+
+
+# ------------------------------------------------------------------------------
+# 5. Thermal Protection & Hardware Safety (NODE-005)
+# ------------------------------------------------------------------------------
+
+TEMP_NORMAL_MAX = 39.0      # <= 39.0°C: Optimal operations (720p / 15fps)
+TEMP_WARM_MAX = 41.9        # 39.1°C - 41.9°C: Warm, informational warning
+TEMP_THROTTLE_MIN = 42.0    # 42.0°C - 44.9°C: Stage 1 Throttling (force 360p / 5fps)
+TEMP_CRITICAL_MIN = 45.0    # >= 45.0°C: Stage 2 Emergency Cutoff (stop Camera2 & lock)
+TEMP_COOLDOWN_CLEAR = 39.0  # Must drop <= 39.0°C to release emergency lockout
+
+
+class ThermalProtectionManager:
+    """
+    Evaluates battery and CPU thermal state for hardware longevity (NODE-005).
+    Maintains hysteresis lock state so that once critical cutoff is reached (>=45°C),
+    camera and heavy hardware access remain locked until temperature cools below 39.0°C.
+    """
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self.cooldown_locked = False
+        self.last_state = "NORMAL"
+        self.last_temp_c: Optional[float] = None
+        self.simulated_temp: Optional[float] = None
+        self.last_evaluated_at: float = 0.0
+
+    @classmethod
+    def get_instance(cls) -> "ThermalProtectionManager":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def set_simulated_temp(self, temp: Optional[float]):
+        """Sets a simulated temperature override for testing or diagnostics."""
+        self.simulated_temp = float(temp) if temp is not None else None
+
+    def evaluate_thermal_state(self, temp_override: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Evaluates current thermal status.
+        Priority:
+        1. Explicit temp_override parameter
+        2. Simulated temperature override
+        3. Real battery / CPU sensor telemetry
+        """
+        if temp_override is not None:
+            temp_c = float(temp_override)
+        elif self.simulated_temp is not None:
+            temp_c = float(self.simulated_temp)
+        else:
+            bat = collect_battery_info()
+            temp_c = bat.get("temperature_c")
+            if temp_c is None:
+                cpu_thm = collect_cpu_thermal_info()
+                temp_c = cpu_thm.get("temperature_c")
+
+        self.last_evaluated_at = time.time()
+        if temp_c is not None:
+            self.last_temp_c = temp_c
+
+        # Handle Cooldown Lock Hysteresis FIRST:
+        if self.cooldown_locked:
+            if temp_c is not None and temp_c <= TEMP_COOLDOWN_CLEAR:
+                self.cooldown_locked = False
+            else:
+                curr = temp_c if temp_c is not None else self.last_temp_c
+                curr_str = f"{curr}°C" if curr is not None else "elevated"
+                return {
+                    "temperature_c": curr,
+                    "state": "CRITICAL",
+                    "thermal_status": "CooldownLock",
+                    "throttle_active": True,
+                    "camera_allowed": False,
+                    "cooldown_locked": True,
+                    "recommended_preset": "360p",
+                    "recommended_fps": 0,
+                    "recommended_jpeg_quality": 30,
+                    "message": f"Hardware cooling down ({curr_str}). Must reach <= {TEMP_COOLDOWN_CLEAR}°C to resume."
+                }
+
+        # Default fallback if temperature cannot be determined on this platform
+        if temp_c is None:
+            return {
+                "temperature_c": None,
+                "state": "NORMAL",
+                "thermal_status": "Unknown",
+                "throttle_active": False,
+                "camera_allowed": True,
+                "cooldown_locked": self.cooldown_locked,
+                "recommended_preset": "480p",
+                "recommended_fps": 15,
+                "recommended_jpeg_quality": 50,
+                "message": "Temperature reading unavailable; operating normally."
+            }
+
+        # Evaluate States
+        if temp_c >= TEMP_CRITICAL_MIN:
+            self.cooldown_locked = True
+            state = "CRITICAL"
+            thermal_status = "CriticalOverheat"
+            throttle_active = True
+            camera_allowed = False
+            preset = "360p"
+            fps = 0
+            quality = 30
+            msg = f"EMERGENCY: Battery temperature {temp_c}°C reached critical cutoff (>= {TEMP_CRITICAL_MIN}°C)."
+        elif temp_c >= TEMP_THROTTLE_MIN:
+            state = "THROTTLED"
+            thermal_status = "Throttled"
+            throttle_active = True
+            camera_allowed = True
+            preset = "360p"
+            fps = 5
+            quality = 35
+            msg = f"WARNING: Battery temperature {temp_c}°C exceeded throttle threshold (>= {TEMP_THROTTLE_MIN}°C). Stream stepped down."
+        elif temp_c > TEMP_NORMAL_MAX:
+            state = "WARM"
+            thermal_status = "Warm"
+            throttle_active = False
+            camera_allowed = True
+            preset = "480p"
+            fps = 15
+            quality = 50
+            msg = f"Battery temperature {temp_c}°C is elevated (Warm)."
+        else:
+            state = "NORMAL"
+            thermal_status = "Normal"
+            throttle_active = False
+            camera_allowed = True
+            preset = "720p"
+            fps = 15
+            quality = 60
+            msg = f"Battery temperature {temp_c}°C is optimal."
+
+        self.last_state = state
+
+        return {
+            "temperature_c": temp_c,
+            "state": state,
+            "thermal_status": thermal_status,
+            "throttle_active": throttle_active,
+            "camera_allowed": camera_allowed,
+            "cooldown_locked": self.cooldown_locked,
+            "recommended_preset": preset,
+            "recommended_fps": fps,
+            "recommended_jpeg_quality": quality,
+            "message": msg
+        }
+
+    def reset(self):
+        """Resets the thermal manager lock state (primarily for test isolation)."""
+        self.cooldown_locked = False
+        self.simulated_temp = None
+        self.last_state = "NORMAL"
+        self.last_temp_c = None
+        self.last_evaluated_at = 0.0
+
+
+def evaluate_battery_thermal_state(temp_override: Optional[float] = None) -> Dict[str, Any]:
+    """Module-level helper to evaluate the global thermal protection state."""
+    return ThermalProtectionManager.get_instance().evaluate_thermal_state(temp_override)

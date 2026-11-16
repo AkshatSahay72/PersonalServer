@@ -74,3 +74,9 @@ Thumbs.db
 
 # Internal private documentation (strictly git-ignored)
 /docs-internal/
+
+# Android build outputs & local configuration
+android/native-bridge/.gradle/
+android/native-bridge/build/
+android/native-bridge/local.properties
+*.apk

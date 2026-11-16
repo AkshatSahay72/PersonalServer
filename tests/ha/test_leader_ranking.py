@@ -69,7 +69,7 @@ class TestLeaderRanking(unittest.TestCase):
     def test_default_metadata_application(self):
         raw_win = {"node_id": "test-win", "platform": "win32", "status": "ONLINE"}
         apply_default_leadership_metadata("test-win", raw_win)
-        self.assertFalse(raw_win["leader_eligible"], "Windows platform should default to leader_eligible=False")
+        self.assertTrue(raw_win["leader_eligible"], "Windows platform should default to leader_eligible=True in J6")
         self.assertTrue(raw_win["build_worker_enabled"])
 
         raw_phone = {"node_id": "test-phone", "platform": "linux", "status": "ONLINE"}

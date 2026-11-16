@@ -105,10 +105,12 @@ class BaseHandler(BaseHTTPRequestHandler):
         """
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        # Exempt HA election and heartbeat management routes
+        # Exempt HA election, voting, consensus replication, and heartbeat management routes
         if path in (
-            "/ha/promote", "/ha/failover", "/ha/heartbeat", "/ha/renew",
-            "/api/ha/promote", "/api/ha/failover", "/api/ha/heartbeat", "/api/ha/renew"
+            "/ha/promote", "/ha/failover", "/ha/heartbeat", "/ha/renew", "/ha/vote", "/ha/replicate",
+            "/ha/voters/add", "/ha/voters/remove", "/ha/handover",
+            "/api/ha/promote", "/api/ha/failover", "/api/ha/heartbeat", "/api/ha/renew", "/api/ha/vote",
+            "/api/ha/replicate", "/api/ha/voters/add", "/api/ha/voters/remove", "/api/ha/handover"
         ):
             return True
 

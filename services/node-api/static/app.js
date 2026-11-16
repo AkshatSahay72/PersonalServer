@@ -67,7 +67,8 @@ function navigate() {
     jobs: { main: "Jobs", sub: "Workload execution & lifecycle" },
     storage: { main: "Storage", sub: "Personal file manager" },
     apps: { main: "Applications", sub: "Containerized application manager" },
-    settings: { main: "Settings", sub: "Cluster configuration" }
+    settings: { main: "Settings", sub: "Cluster configuration" },
+    "live-call": { main: "Live Call", sub: "On-demand camera & two-way audio communication" }
   };
 
   const meta = titles[hash] || { main: "Dashboard", sub: "Cluster overview" };
@@ -84,6 +85,8 @@ function navigate() {
     loadStorageNodes().then(() => loadStorage(currentPath, selectedStorageNode));
   } else if (hash === "apps") {
     loadApps();
+  } else if (hash === "live-call") {
+    loadLiveCall();
   }
 }
 
@@ -498,12 +501,48 @@ async function loadDashboard() {
 }
 
 // High Availability (HA) Status & Failover Controller
+let cachedClusterState = null;
 let cachedHAStatus = null;
 let isUpdatingHA = false;
 let lastHAUpdateTimestamp = 0;
 let haUpdatePromise = null;
 
 function resolveLeaderInfo(ha) {
+  // If unified cluster state contract is available, strictly adhere to its authoritative leader
+  if (typeof cachedClusterState !== "undefined" && cachedClusterState && cachedClusterState.leader) {
+    const ldr = cachedClusterState.leader;
+    const isLeaseValid = ldr.lease_valid === true;
+    const hasLeader = !!ldr.node_id && isLeaseValid;
+    const leaderName = ldr.name || (hasLeader ? ldr.node_id : "Electing...");
+    const isLocal = ldr.is_local === true;
+
+    if (!hasLeader) {
+      return {
+        rawLeaderId: null,
+        leaderName: "Electing...",
+        isRegistered: false,
+        isOnline: false,
+        isVerified: false,
+        displayText: "Electing...",
+        statusText: "Election",
+        dotClass: "ha-dot-election",
+        badgeClass: "ha-status-election"
+      };
+    }
+
+    return {
+      rawLeaderId: ldr.node_id,
+      leaderName: leaderName,
+      isRegistered: true,
+      isOnline: true,
+      isVerified: true,
+      displayText: leaderName,
+      statusText: isLocal ? "Active" : "Active (Mesh)",
+      dotClass: "ha-dot-active",
+      badgeClass: "ha-status-active"
+    };
+  }
+
   if (!ha || typeof ha !== "object") {
     return {
       rawLeaderId: null,
@@ -574,8 +613,8 @@ function resolveLeaderInfo(ha) {
     dotClass = "ha-dot-fenced";
     badgeClass = "ha-status-fenced";
     displayText = "Fenced";
-  } else if (ha.role === "candidate" || ha.role === "promoting" || ha.lease_valid === false) {
-    statusText = "Election";
+  } else if (ha.role === "candidate" || ha.role === "promoting" || ha.role === "electing" || ha.lease_valid === false || ha.read_only_fallback) {
+    statusText = ha.read_only_fallback ? "Read-Only (Electing)" : "Election";
     dotClass = "ha-dot-election";
     badgeClass = "ha-status-election";
     displayText = "Electing...";
@@ -940,7 +979,9 @@ function renderHADetailsModalContent(ha) {
 
   const partEl = document.getElementById("ha-modal-partition-safe");
   if (partEl) {
-    partEl.textContent = `Partition Safe: ${ha.partition_safe !== false ? "True" : "Partition Suspected"}`;
+    const qSize = ha.quorum_size || 2;
+    const vTotal = ha.total_voters || (ha.voters ? ha.voters.length : 3);
+    partEl.textContent = `Consensus: Raft Quorum (${qSize}/${vTotal} votes) · Partition Safe: ${ha.partition_safe !== false ? "True" : "Partition Suspected"}`;
   }
 
   // Standbys list
@@ -1009,6 +1050,17 @@ async function updateHAStatus(force = false) {
   isUpdatingHA = true;
   haUpdatePromise = (async () => {
     try {
+      // 1. Authoritative Cluster State Contract
+      try {
+        const clusterState = await apiFetch("/api/cluster/state");
+        if (clusterState && clusterState.leader) {
+          cachedClusterState = clusterState;
+          if (Array.isArray(clusterState.nodes) && clusterState.nodes.length > 0) {
+            cachedNodes = clusterState.nodes.filter(n => n.status !== "REMOVED");
+          }
+        }
+      } catch (_) {}
+
       if (!cachedNodes || cachedNodes.length === 0) {
         try {
           const clusterRes = await apiFetch("/api/cluster");
@@ -1190,15 +1242,16 @@ function renderLeaderManagementUI(haStatus, nodes) {
   const transReasonEl = document.getElementById("leader-ui-last-transition-reason");
   const transTimeEl = document.getElementById("leader-ui-last-transition-time");
 
-  const leaderId = haStatus?.leader_id || "";
+  const authLeader = cachedClusterState?.leader;
+  const isLeaseValid = (authLeader?.lease_valid !== undefined) ? authLeader.lease_valid : !!haStatus?.lease_valid;
+  const leaderId = authLeader?.node_id || haStatus?.leader_id || "";
   const leaderNode = (nodes || []).find(n => n.node_id === leaderId);
-  const leaderName = haStatus?.leader_name || (leaderNode ? leaderNode.name : (leaderId || "Unknown"));
+  const leaderName = authLeader?.name || haStatus?.leader_name || (leaderNode ? leaderNode.name : (leaderId || (isLeaseValid ? "Leader" : "Electing...")));
 
   if (leaderNameEl) leaderNameEl.textContent = leaderName;
-  if (leaderIdEl) leaderIdEl.textContent = leaderId ? `ID: ${leaderId}` : "No active leader lease";
+  if (leaderIdEl) leaderIdEl.textContent = leaderId ? `ID: ${leaderId}` : (isLeaseValid ? "Authoritative Leader Lease" : "No active leader lease");
   if (termEl) {
-    const isLeaseValid = !!haStatus?.lease_valid;
-    const termVal = haStatus?.term !== undefined ? haStatus.term : "-";
+    const termVal = authLeader?.term !== undefined ? authLeader.term : (haStatus?.term !== undefined ? haStatus.term : "-");
     termEl.className = "mono";
     termEl.innerHTML = `Term ${termVal} · <span style="color: ${isLeaseValid ? '#3fb950' : '#f85149'};">${isLeaseValid ? 'Valid Lease' : 'Fenced / Expired'}</span>`;
   }
@@ -1570,8 +1623,8 @@ async function loadNodes() {
       }
 
       let haTag = "";
-      const isLeaderIdentified = cachedHAStatus && cachedHAStatus.lease_valid !== false && (n.node_id === cachedHAStatus.leader_id || (n.node_id === cachedHAStatus.node_id && cachedHAStatus.role === "leader"));
-      if (isLeaderIdentified) {
+      const isAuthoritativeLeader = (n.is_leader === true) || (cachedClusterState?.leader?.lease_valid && n.node_id === cachedClusterState?.leader?.node_id);
+      if (isAuthoritativeLeader) {
         if (isOnline) {
           haTag = `<span class="node-role-pill leader" title="Active Cluster Leader">Leader</span>`;
         } else {
@@ -1583,9 +1636,19 @@ async function loadNodes() {
         haTag = `<span class="node-role-pill worker" title="Compute Worker">Worker</span>`;
       }
 
+      let meritHtml = "";
+      if (n.merit_score !== undefined && n.merit_score !== null) {
+        if (n.leader_eligible !== false) {
+          meritHtml = `<div class="cell-muted" style="font-size: 11px; margin-top: 2px;">Merit: <span class="mono" style="color: #58a6ff;">${n.merit_score}</span></div>`;
+        } else {
+          const reasonTip = n.ineligibility_reason ? `title="${escapeHtml(n.ineligibility_reason)}"` : "";
+          meritHtml = `<div class="cell-muted" style="font-size: 11px; margin-top: 2px;" ${reasonTip}>Ineligible: <span style="color: #f85149;">${escapeHtml(n.ineligibility_reason || 'Excluded')}</span></div>`;
+        }
+      }
+
       return `
         <tr>
-          <td><strong class="cell-main">${n.name || n.node_id}</strong>${haTag}</td>
+          <td><strong class="cell-main">${n.name || n.node_id}</strong>${haTag}${meritHtml}</td>
           <td>${renderStatusPill(n.status)}</td>
           <td>${batHtml}</td>
           <td>${netHtml}</td>
@@ -5964,6 +6027,763 @@ document.getElementById("ha-details-modal-backdrop")?.addEventListener("click", 
 setInterval(() => {
   updateHAStatus(false);
 }, 15000);
+
+// ==========================================
+// E07 - On-Demand Live Call & Media Controller
+// ==========================================
+
+let activeLiveCallSession = null;
+let liveCallFrameLoopActive = false;
+let liveCallDurationTimer = null;
+let liveCallStatusTimer = null;
+let liveCallCurrentFacing = "front";
+let liveCallMicEnabled = true;
+let liveCallStartTime = null;
+let liveCallAudioContext = null;
+let liveCallAudioStream = null;
+let liveCallAudioProcessor = null;
+let liveCallIsPushToTalkActive = false;
+let liveCallFpsCounter = 0;
+let liveCallFpsTimer = null;
+let liveCallFetchAbortController = null;
+let liveCallAudioPlayContext = null;
+let liveCallAudioNextPlayTime = 0;
+let liveCallAudioReceiverActive = false;
+let isSendingSpeak = false;
+let speakSendQueue = [];
+let liveCallLastFramesReceived = 0;
+let liveCallLastStatusTime = 0;
+
+async function loadLiveCall() {
+  await populateCallDevices();
+  if (activeLiveCallSession && activeLiveCallSession.status === "ACTIVE") {
+    updateCallControlsUI(true);
+  } else {
+    updateCallControlsUI(false);
+  }
+}
+
+async function populateCallDevices() {
+  const select = document.getElementById("call-device-select");
+  if (!select) return;
+
+  const currentVal = select.value;
+  try {
+    const data = await apiFetch("/api/cluster");
+    const nodes = (data.nodes || []).filter(n => n && n.node_id && n.status !== "REMOVED");
+    
+    select.innerHTML = '<option value="">Select Android Device...</option>';
+    
+    let defaultSelected = null;
+    nodes.forEach(node => {
+      const isOnline = (node.status || "").toUpperCase() === "ONLINE";
+      const isAndroid = (node.platform || "").toLowerCase().includes("android") || 
+                        (node.os || "").toLowerCase().includes("android") ||
+                        (node.hostname || "").toLowerCase().includes("v2334") ||
+                        (node.hostname || "").toLowerCase().includes("termux") ||
+                        (node.node_id || "").toLowerCase().includes("v2334");
+      
+      const opt = document.createElement("option");
+      opt.value = node.node_id;
+      const statusIcon = isOnline ? "🟢" : "⚪";
+      const typeLabel = isAndroid ? " [Android Node]" : "";
+      opt.textContent = `${statusIcon} ${node.name || node.hostname || node.node_id} (${node.node_id})${typeLabel}`;
+      if (!isOnline) {
+        opt.disabled = true;
+      }
+      select.appendChild(opt);
+
+      // Prefer online Android device (e.g. Vivo V2334) if nothing chosen yet
+      if (!defaultSelected && isOnline && isAndroid) {
+        defaultSelected = node.node_id;
+      }
+    });
+
+    if (currentVal && Array.from(select.options).some(o => o.value === currentVal)) {
+      select.value = currentVal;
+    } else if (defaultSelected) {
+      select.value = defaultSelected;
+    }
+
+    updateCallTargetNodeText();
+  } catch (err) {
+    console.error("Failed to populate call devices:", err);
+    showCallError(`Failed to load devices: ${err.message}`);
+  }
+}
+
+function updateCallTargetNodeText() {
+  const select = document.getElementById("call-device-select");
+  const targetText = document.getElementById("call-target-node-text");
+  if (!targetText || !select) return;
+  const val = select.value;
+  if (!val) {
+    targetText.textContent = "Device: None";
+  } else {
+    const selectedOpt = select.options[select.selectedIndex];
+    targetText.textContent = `Target: ${selectedOpt ? selectedOpt.text.replace(/^[🟢⚪]\s*/, "") : val}`;
+  }
+}
+
+document.getElementById("call-device-select")?.addEventListener("change", () => {
+  updateCallTargetNodeText();
+});
+
+function showCallError(msg) {
+  const errEl = document.getElementById("call-error-banner");
+  if (errEl) {
+    errEl.textContent = msg;
+    errEl.style.display = "block";
+  }
+}
+
+function clearCallError() {
+  const errEl = document.getElementById("call-error-banner");
+  if (errEl) {
+    errEl.textContent = "";
+    errEl.style.display = "none";
+  }
+  const permWarning = document.getElementById("call-permission-warning");
+  if (permWarning) {
+    permWarning.style.display = "none";
+  }
+}
+
+function showPermissionWarning() {
+  const permWarning = document.getElementById("call-permission-warning");
+  if (permWarning) {
+    permWarning.style.display = "block";
+  }
+}
+
+function updateCallControlsUI(isActive) {
+  const badge = document.getElementById("call-status-badge");
+  const startBtn = document.getElementById("call-start-btn");
+  const endBtn = document.getElementById("call-end-btn");
+  const switchCamBtn = document.getElementById("call-switch-cam-btn");
+  const toggleMicBtn = document.getElementById("call-toggle-mic-btn");
+  const talkBtn = document.getElementById("call-talk-btn");
+  const deviceSelect = document.getElementById("call-device-select");
+  const placeholder = document.getElementById("call-placeholder");
+  const videoStream = document.getElementById("call-video-stream");
+  const telemetry = document.getElementById("call-telemetry-overlay");
+  const hwPills = document.getElementById("call-hardware-pills");
+
+  if (isActive) {
+    if (badge) {
+      badge.textContent = "ACTIVE";
+      badge.className = "badge badge-success mono";
+    }
+    if (startBtn) startBtn.style.display = "none";
+    if (endBtn) endBtn.style.display = "inline-flex";
+    if (switchCamBtn) switchCamBtn.style.display = "inline-flex";
+    if (toggleMicBtn) toggleMicBtn.style.display = "inline-flex";
+    if (talkBtn) talkBtn.style.display = "inline-flex";
+    if (deviceSelect) deviceSelect.disabled = true;
+    if (placeholder) placeholder.style.display = "none";
+    if (videoStream) videoStream.style.display = "block";
+    if (telemetry) telemetry.style.display = "flex";
+    if (hwPills) hwPills.style.display = "flex";
+  } else {
+    if (badge) {
+      badge.textContent = "IDLE";
+      badge.className = "badge badge-secondary mono";
+    }
+    if (startBtn) {
+      startBtn.style.display = "inline-flex";
+      startBtn.disabled = false;
+      startBtn.innerHTML = "<span>📞 Start Live Call</span>";
+    }
+    if (endBtn) endBtn.style.display = "none";
+    if (switchCamBtn) switchCamBtn.style.display = "none";
+    if (toggleMicBtn) toggleMicBtn.style.display = "none";
+    if (talkBtn) talkBtn.style.display = "none";
+    if (deviceSelect) deviceSelect.disabled = false;
+    if (placeholder) placeholder.style.display = "flex";
+    if (videoStream) {
+      videoStream.style.display = "none";
+      if (videoStream.src && videoStream.src.startsWith("blob:")) {
+        URL.revokeObjectURL(videoStream.src);
+      }
+      videoStream.src = "";
+    }
+    if (telemetry) telemetry.style.display = "none";
+    if (hwPills) hwPills.style.display = "none";
+  }
+}
+
+async function startLiveCallSession() {
+  clearCallError();
+  const select = document.getElementById("call-device-select");
+  const nodeId = select ? select.value : "";
+  if (!nodeId) {
+    showCallError("Please select an online target Android device first.");
+    return;
+  }
+
+  const startBtn = document.getElementById("call-start-btn");
+  const badge = document.getElementById("call-status-badge");
+  if (startBtn) {
+    startBtn.disabled = true;
+    startBtn.innerHTML = "<span>⏳ Connecting...</span>";
+  }
+  if (badge) {
+    badge.textContent = "CONNECTING";
+    badge.className = "badge badge-warning mono";
+  }
+
+  try {
+    const payload = {
+      camera: liveCallCurrentFacing,
+      quality: "480p",
+      fps: 15,
+      with_mic: liveCallMicEnabled,
+      with_speaker: true
+    };
+
+    const res = await apiFetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const isAlready = Boolean(res && (res.already_active || res.error === "SESSION_ALREADY_ACTIVE" || (res.result && res.result.error === "SESSION_ALREADY_ACTIVE")));
+    if (!res || (!res.success && !isAlready)) {
+      const err = res?.error || "Failed to establish live call session.";
+      if (err.includes("PERMISSION_DENIED") || err.includes("permission")) {
+        showPermissionWarning();
+      }
+      throw new Error(err);
+    }
+
+    activeLiveCallSession = {
+      nodeId: nodeId,
+      sessionId: res.session_id,
+      status: "ACTIVE",
+      facing: liveCallCurrentFacing,
+      micEnabled: liveCallMicEnabled
+    };
+
+    updateCallControlsUI(true);
+    startLiveCallDurationTimer();
+    startLiveCallStreamOrLoop(nodeId);
+    startLiveCallAudioReceiver(nodeId);
+    startLiveCallStatusPolling(nodeId);
+  } catch (err) {
+    console.error("Start live call error:", err);
+    showCallError(`Call failed: ${err.message}`);
+    updateCallControlsUI(false);
+  }
+}
+
+async function endLiveCallSession() {
+  if (!activeLiveCallSession) {
+    updateCallControlsUI(false);
+    return;
+  }
+
+  const nodeId = activeLiveCallSession.nodeId;
+  const endBtn = document.getElementById("call-end-btn");
+  if (endBtn) {
+    endBtn.disabled = true;
+    endBtn.textContent = "Ending...";
+  }
+
+  // Stop frame loops & audio context first
+  stopLiveCallLoops();
+  stopPushToTalk();
+
+  try {
+    await apiFetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+  } catch (err) {
+    console.warn("Stop live call remote call error:", err);
+  } finally {
+    activeLiveCallSession = null;
+    updateCallControlsUI(false);
+    if (endBtn) endBtn.disabled = false;
+  }
+}
+
+function stopLiveCallLoops() {
+  liveCallFrameLoopActive = false;
+  liveCallAudioReceiverActive = false;
+  if (liveCallFetchAbortController) {
+    liveCallFetchAbortController.abort();
+    liveCallFetchAbortController = null;
+  }
+  if (liveCallDurationTimer) {
+    clearInterval(liveCallDurationTimer);
+    liveCallDurationTimer = null;
+  }
+  if (liveCallStatusTimer) {
+    clearInterval(liveCallStatusTimer);
+    liveCallStatusTimer = null;
+  }
+  if (liveCallFpsTimer) {
+    clearInterval(liveCallFpsTimer);
+    liveCallFpsTimer = null;
+  }
+  if (liveCallAudioPlayContext) {
+    try { liveCallAudioPlayContext.close(); } catch (e) {}
+    liveCallAudioPlayContext = null;
+  }
+  speakSendQueue = [];
+  isSendingSpeak = false;
+}
+
+function startLiveCallDurationTimer() {
+  liveCallStartTime = Date.now();
+  const durationBadge = document.getElementById("call-duration-badge");
+  if (liveCallDurationTimer) clearInterval(liveCallDurationTimer);
+  liveCallDurationTimer = setInterval(() => {
+    if (!liveCallStartTime) return;
+    const elapsedSec = Math.floor((Date.now() - liveCallStartTime) / 1000);
+    const mm = String(Math.floor(elapsedSec / 60)).padStart(2, "0");
+    const ss = String(elapsedSec % 60).padStart(2, "0");
+    if (durationBadge) durationBadge.textContent = `${mm}:${ss}`;
+  }, 1000);
+}
+
+function startLiveCallStreamOrLoop(nodeId) {
+  liveCallFrameLoopActive = true;
+  liveCallFpsCounter = 0;
+
+  const fpsBadge = document.getElementById("call-fps-badge");
+  const resBadge = document.getElementById("call-res-badge");
+  if (resBadge) resBadge.textContent = "640x480";
+
+  const videoStream = document.getElementById("call-video-stream");
+  if (videoStream) {
+    // Connect to continuous MJPEG stream over single HTTP connection
+    const streamUrl = `/api/nodes/${encodeURIComponent(nodeId)}/live-call/stream?t=${Date.now()}`;
+    videoStream.src = streamUrl;
+    videoStream.style.display = "block";
+
+    videoStream.onload = () => {
+      liveCallFpsCounter++;
+    };
+
+    videoStream.onerror = () => {
+      console.warn("MJPEG stream error or unsupported; falling back to frame loop");
+      if (liveCallFrameLoopActive) {
+        startLiveCallFrameLoopFallback(nodeId);
+      }
+    };
+
+    // Watchdog fallback: if no frames rendered after 2.5s, engage rapid frame loop
+    setTimeout(() => {
+      if (liveCallFrameLoopActive && liveCallFpsCounter === 0) {
+        console.info("MJPEG stream watchdog: No frames received in 2.5s; engaging frame loop fallback");
+        startLiveCallFrameLoopFallback(nodeId);
+      }
+    }, 2500);
+  }
+
+  if (liveCallFpsTimer) clearInterval(liveCallFpsTimer);
+  liveCallFpsTimer = setInterval(() => {
+    if (fpsBadge && liveCallFpsCounter > 0) {
+      fpsBadge.textContent = `${liveCallFpsCounter} FPS`;
+    }
+    liveCallFpsCounter = 0;
+  }, 1000);
+}
+
+function startLiveCallFrameLoopFallback(nodeId) {
+  if (!liveCallFrameLoopActive || !activeLiveCallSession) return;
+  let isFetching = false;
+  const loop = async () => {
+    if (!liveCallFrameLoopActive || !activeLiveCallSession) return;
+    if (!isFetching) {
+      isFetching = true;
+      const startT = performance.now();
+      try {
+        liveCallFetchAbortController = new AbortController();
+        const url = `/api/nodes/${encodeURIComponent(nodeId)}/live-call/frame?t=${Date.now()}`;
+        const res = await fetch(url, { signal: liveCallFetchAbortController.signal });
+        if (res.ok) {
+          const blob = await res.blob();
+          if (blob.size > 0 && liveCallFrameLoopActive) {
+            const objectUrl = URL.createObjectURL(blob);
+            const img = document.getElementById("call-video-stream");
+            if (img) {
+              const oldSrc = img.src;
+              img.src = objectUrl;
+              if (oldSrc && oldSrc.startsWith("blob:")) {
+                URL.revokeObjectURL(oldSrc);
+              }
+            }
+            liveCallFpsCounter++;
+            const latency = Math.round(performance.now() - startT);
+            const latencyBadge = document.getElementById("call-latency-badge");
+            if (latencyBadge) latencyBadge.textContent = `${latency} ms`;
+          }
+        } else if (res.status === 404 || res.status === 410) {
+          handleRemoteSessionTermination();
+          return;
+        }
+      } catch (err) {
+        if (err.name !== "AbortError") {
+          console.debug("Frame loop tick error:", err);
+        }
+      } finally {
+        isFetching = false;
+      }
+    }
+    if (liveCallFrameLoopActive) {
+      setTimeout(loop, 40);
+    }
+  };
+  loop();
+}
+
+function startLiveCallAudioReceiver(nodeId) {
+  liveCallAudioReceiverActive = true;
+  liveCallAudioNextPlayTime = 0;
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!liveCallAudioPlayContext || liveCallAudioPlayContext.state === "closed") {
+    liveCallAudioPlayContext = new AudioContextClass();
+  }
+  if (liveCallAudioPlayContext.state === "suspended") {
+    liveCallAudioPlayContext.resume();
+  }
+
+  let isFetchingAudio = false;
+  const pollAudio = async () => {
+    if (!liveCallAudioReceiverActive || !activeLiveCallSession) return;
+    if (!isFetchingAudio && liveCallMicEnabled) {
+      isFetchingAudio = true;
+      try {
+        const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/audio`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.pcm_base64 && data.bytes > 0 && liveCallAudioPlayContext) {
+            playRawPcmChunk(data.pcm_base64, data.sample_rate || 16000, data.channels || 1);
+          }
+        }
+      } catch (e) {
+        console.debug("Audio poll tick error:", e);
+      } finally {
+        isFetchingAudio = false;
+      }
+    }
+    if (liveCallAudioReceiverActive) {
+      setTimeout(pollAudio, 150);
+    }
+  };
+  pollAudio();
+}
+
+function playRawPcmChunk(b64, sampleRate, channels) {
+  try {
+    const binary = atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const int16 = new Int16Array(bytes.buffer);
+    const numSamples = int16.length / channels;
+    if (!liveCallAudioPlayContext || liveCallAudioPlayContext.state === "closed") return;
+    const audioBuf = liveCallAudioPlayContext.createBuffer(channels, numSamples, sampleRate);
+
+    for (let ch = 0; ch < channels; ch++) {
+      const channelData = audioBuf.getChannelData(ch);
+      for (let i = 0; i < numSamples; i++) {
+        channelData[i] = int16[i * channels + ch] / 32768.0;
+      }
+    }
+
+    const source = liveCallAudioPlayContext.createBufferSource();
+    source.buffer = audioBuf;
+    source.connect(liveCallAudioPlayContext.destination);
+
+    const currentTime = liveCallAudioPlayContext.currentTime;
+    if (liveCallAudioNextPlayTime < currentTime) {
+      liveCallAudioNextPlayTime = currentTime + 0.02; // Small 20ms jitter buffer
+    }
+    source.start(liveCallAudioNextPlayTime);
+    liveCallAudioNextPlayTime += audioBuf.duration;
+  } catch (err) {
+    console.debug("Error playing raw PCM chunk:", err);
+  }
+}
+
+function startLiveCallStatusPolling(nodeId) {
+  if (liveCallStatusTimer) clearInterval(liveCallStatusTimer);
+  liveCallLastFramesReceived = 0;
+  liveCallLastStatusTime = performance.now();
+
+  liveCallStatusTimer = setInterval(async () => {
+    if (!activeLiveCallSession) return;
+    try {
+      const res = await apiFetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/status`);
+      const statusData = res?.status || res;
+      if (statusData && statusData.session_active === false) {
+        handleRemoteSessionTermination();
+        return;
+      }
+      if (statusData) {
+        // Calculate measured FPS from node frames_received
+        const sess = statusData.session || {};
+        const frames = sess.frames_received || statusData.captured_frames || 0;
+        const now = performance.now();
+        const dt = (now - liveCallLastStatusTime) / 1000.0;
+        if (dt > 0.5 && liveCallLastFramesReceived > 0) {
+          const deltaFrames = frames - liveCallLastFramesReceived;
+          const measuredFps = Math.max(0, Math.round(deltaFrames / dt));
+          const fpsBadge = document.getElementById("call-fps-badge");
+          if (fpsBadge) {
+            fpsBadge.textContent = `${measuredFps} FPS`;
+          }
+        }
+        liveCallLastFramesReceived = frames;
+        liveCallLastStatusTime = now;
+
+        // Calculate latency if frame_timestamp available
+        const frameTs = statusData.frame_timestamp || 0;
+        if (frameTs > 0) {
+          const latencyMs = Math.max(8, Math.round(Date.now() - (frameTs * 1000)));
+          const latencyBadge = document.getElementById("call-latency-badge");
+          if (latencyBadge && latencyMs < 2000) {
+            latencyBadge.textContent = `${latencyMs} ms`;
+          }
+        }
+
+        const resBadge = document.getElementById("call-res-badge");
+        if (resBadge && (statusData.resolution || (sess.quality && sess.quality.width))) {
+          resBadge.textContent = statusData.resolution || `${sess.quality.width}x${sess.quality.height}`;
+        }
+
+        // Hardware pills
+        const pillCam = document.getElementById("pill-cam-state");
+        const pillMic = document.getElementById("pill-mic-state");
+        const pillSpk = document.getElementById("pill-spk-state");
+        if (pillCam) {
+          const camOn = statusData.camera_active !== false && statusData.session_active;
+          pillCam.className = camOn ? "hw-pill pill-active" : "hw-pill pill-muted";
+          const facing = statusData.camera_facing || (statusData.camera_id === "1" ? "front" : "back");
+          pillCam.textContent = camOn ? `● Camera (${facing})` : "○ Camera (Off)";
+        }
+        if (pillMic) {
+          pillMic.className = statusData.mic_active ? "hw-pill pill-active" : "hw-pill pill-muted";
+          pillMic.textContent = statusData.mic_active ? "● Mic (Active)" : "○ Mic (Muted)";
+        }
+        if (pillSpk) {
+          pillSpk.className = statusData.speaker_active ? "hw-pill pill-active" : "hw-pill pill-muted";
+          pillSpk.textContent = statusData.speaker_active ? "● Speaker (Active)" : "○ Speaker (Idle)";
+        }
+      }
+    } catch (e) {
+      console.debug("Status polling error:", e);
+    }
+  }, 1000);
+}
+
+function handleRemoteSessionTermination() {
+  stopLiveCallLoops();
+  stopPushToTalk();
+  activeLiveCallSession = null;
+  updateCallControlsUI(false);
+  showCallError("Live call session was terminated by remote device or timeout.");
+}
+
+async function switchCallCamera() {
+  if (!activeLiveCallSession) return;
+  const nodeId = activeLiveCallSession.nodeId;
+  const newFacing = (liveCallCurrentFacing === "front") ? "back" : "front";
+  const switchBtn = document.getElementById("call-switch-cam-btn");
+  if (switchBtn) switchBtn.disabled = true;
+
+  try {
+    const res = await apiFetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ camera: newFacing, camera_id: newFacing === "front" ? "1" : "0" })
+    });
+    if (res && res.success) {
+      liveCallCurrentFacing = newFacing;
+      activeLiveCallSession.facing = newFacing;
+      const pillCam = document.getElementById("pill-cam-state");
+      if (pillCam) {
+        pillCam.textContent = `● Camera (${newFacing})`;
+      }
+    }
+  } catch (err) {
+    console.error("Failed to switch camera:", err);
+    showCallError(`Switch camera failed: ${err.message}`);
+  } finally {
+    if (switchBtn) switchBtn.disabled = false;
+  }
+}
+
+async function toggleNodeMic() {
+  if (!activeLiveCallSession) return;
+  const nodeId = activeLiveCallSession.nodeId;
+  const newMicState = !liveCallMicEnabled;
+  const toggleBtn = document.getElementById("call-toggle-mic-btn");
+  const label = document.getElementById("call-toggle-mic-label");
+  if (toggleBtn) toggleBtn.disabled = true;
+
+  try {
+    const res = await apiFetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ with_mic: newMicState })
+    });
+    if (res && res.success) {
+      liveCallMicEnabled = newMicState;
+      activeLiveCallSession.micEnabled = newMicState;
+      if (label) {
+        label.textContent = newMicState ? "🔊 Mute Phone Mic" : "🔈 Unmute Phone Mic";
+      }
+      const pillMic = document.getElementById("pill-mic-state");
+      if (pillMic) {
+        pillMic.className = newMicState ? "hw-pill pill-active" : "hw-pill pill-muted";
+        pillMic.textContent = newMicState ? "● Mic (Active)" : "○ Mic (Muted)";
+      }
+    }
+  } catch (err) {
+    console.error("Failed to toggle phone mic:", err);
+    showCallError(`Toggle mic failed: ${err.message}`);
+  } finally {
+    if (toggleBtn) toggleBtn.disabled = false;
+  }
+}
+
+async function startPushToTalk() {
+  if (!activeLiveCallSession) return;
+  if (liveCallIsPushToTalkActive) return;
+  liveCallIsPushToTalkActive = true;
+
+  const talkBtn = document.getElementById("call-talk-btn");
+  const talkLabel = document.getElementById("call-talk-label");
+  if (talkBtn) talkBtn.classList.add("talk-active");
+  if (talkLabel) talkLabel.textContent = "🎙️ Transmitting...";
+
+  try {
+    liveCallAudioStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        sampleRate: 16000,
+        echoCancellation: true,
+        noiseSuppression: true
+      }
+    });
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    liveCallAudioContext = new AudioContextClass({ sampleRate: 16000 });
+    const source = liveCallAudioContext.createMediaStreamSource(liveCallAudioStream);
+
+    // Buffer size 2048 at 16kHz is ~128ms per chunk
+    liveCallAudioProcessor = liveCallAudioContext.createScriptProcessor(2048, 1, 1);
+
+    liveCallAudioProcessor.onaudioprocess = (event) => {
+      if (!liveCallIsPushToTalkActive || !activeLiveCallSession) return;
+      const inputBuffer = event.inputBuffer.getChannelData(0);
+
+      // Convert Float32 [-1.0, 1.0] to 16-bit Signed PCM [-32768, 32767]
+      const pcm16 = new Int16Array(inputBuffer.length);
+      for (let i = 0; i < inputBuffer.length; i++) {
+        const s = Math.max(-1, Math.min(1, inputBuffer[i]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+
+      // Convert to base64
+      let binary = "";
+      const bytes = new Uint8Array(pcm16.buffer);
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const b64 = btoa(binary);
+
+      if (speakSendQueue.length > 2) {
+        speakSendQueue.shift(); // Drop oldest to avoid latency buildup
+      }
+      speakSendQueue.push(b64);
+
+      if (!isSendingSpeak) {
+        sendNextSpeakChunk();
+      }
+    };
+
+    source.connect(liveCallAudioProcessor);
+    liveCallAudioProcessor.connect(liveCallAudioContext.destination);
+  } catch (err) {
+    console.error("Microphone capture error:", err);
+    showCallError(`Push-to-Talk error: ${err.message}`);
+    stopPushToTalk();
+  }
+}
+
+async function sendNextSpeakChunk() {
+  if (!liveCallIsPushToTalkActive || !activeLiveCallSession || speakSendQueue.length === 0) {
+    isSendingSpeak = false;
+    return;
+  }
+  isSendingSpeak = true;
+  const chunk = speakSendQueue.shift();
+  const nodeId = activeLiveCallSession.nodeId;
+  try {
+    await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/live-call/speak`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pcm_base64: chunk, sample_rate: 16000 })
+    });
+  } catch (err) {
+    console.debug("Speak transmission error:", err);
+  } finally {
+    isSendingSpeak = false;
+    if (speakSendQueue.length > 0) {
+      sendNextSpeakChunk();
+    }
+  }
+}
+
+function stopPushToTalk() {
+  if (!liveCallIsPushToTalkActive) return;
+  liveCallIsPushToTalkActive = false;
+
+  const talkBtn = document.getElementById("call-talk-btn");
+  const talkLabel = document.getElementById("call-talk-label");
+  if (talkBtn) talkBtn.classList.remove("talk-active");
+  if (talkLabel) talkLabel.textContent = "🎙️ Push to Talk";
+
+  if (liveCallAudioProcessor) {
+    try { liveCallAudioProcessor.disconnect(); } catch (e) {}
+    liveCallAudioProcessor = null;
+  }
+  if (liveCallAudioContext) {
+    try { liveCallAudioContext.close(); } catch (e) {}
+    liveCallAudioContext = null;
+  }
+  if (liveCallAudioStream) {
+    liveCallAudioStream.getTracks().forEach(track => {
+      try { track.stop(); } catch (e) {}
+    });
+    liveCallAudioStream = null;
+  }
+  speakSendQueue = [];
+  isSendingSpeak = false;
+}
+
+// Guarantee session cleanup if user reloads or navigates away
+window.addEventListener("beforeunload", () => {
+  if (activeLiveCallSession && activeLiveCallSession.nodeId) {
+    const url = `/api/nodes/${encodeURIComponent(activeLiveCallSession.nodeId)}/live-call/stop`;
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, JSON.stringify({}));
+      } else {
+        fetch(url, { method: "POST", keepalive: true, body: "{}" });
+      }
+    } catch (e) {}
+  }
+});
 
 // Initialize
 navigate();

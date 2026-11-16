@@ -163,12 +163,19 @@ def compute_node_liveness(node, timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT):
             last_hb = {}
         services = last_hb.get("services", {})
         role = node.get("role", "compute")
-        if role == "compute":
-            # For compute workers, worker daemon availability is critical
+        worker_enabled = node.get("worker_enabled", True)
+        if role == "compute" and worker_enabled:
+            # For active compute workers, worker daemon availability is critical
             if services and services.get("node_worker") in ("unresponsive", "degraded", "stopped"):
                 return STATE_UNHEALTHY
+        elif role == "experimental-worker":
+            # For experimental nodes, heartbeat daemon presence is the critical health signal
+            if services and services.get("node_heartbeat") in ("unresponsive", "degraded", "stopped"):
+                return STATE_UNHEALTHY
         else:
-            if services and any(v in ("unresponsive", "degraded", "stopped") for v in services.values()):
+            # For gateways and controllers, check relevant running services
+            crit_services = [v for k, v in services.items() if k not in ("node_worker", "cloudflare") or (k == "node_worker" and worker_enabled)]
+            if crit_services and any(v in ("unresponsive", "degraded", "stopped") for v in crit_services):
                 return STATE_UNHEALTHY
 
         node_status = node.get("status")
@@ -336,10 +343,21 @@ def extract_node_capabilities(node: Dict[str, Any]) -> Tuple[Dict[str, bool], Di
     elif isinstance(raw_verified, dict):
         for k, v in raw_verified.items():
             if isinstance(v, dict):
-                if v.get("verified") is True:
+                st = str(v.get("state", "")).upper()
+                is_avail = v.get("is_available")
+                if is_avail is True or st in ("READY", "AVAILABLE", "ACTIVE") or v.get("verified") is True:
                     verified[str(k)] = True
+                elif is_avail is False or st in ("UNAVAILABLE", "PERMISSION_REQUIRED", "PERMISSION_DENIED", "ERROR"):
+                    verified[str(k)] = False
             elif bool(v):
                 verified[str(k)] = True
+            else:
+                verified[str(k)] = False
+
+    # Reconcile: If verified_capabilities explicitly marks capability as unavailable/unpermitted, advertised cannot claim it is available
+    for k, v in verified.items():
+        if v is False and k in advertised:
+            advertised[k] = False
 
     return advertised, verified
 
@@ -412,6 +430,14 @@ class ResourceScheduler:
             if cap in disabled_caps:
                 return False, f"{REJECTION_POLICY_DISABLED_CAPABILITY}: Capability '{cap}' is administratively disabled on node"
 
+        # Administrative enablement & experimental worker gate
+        # Explicit targeting may select a candidate, but must never override eligibility or permission checks.
+        worker_enabled = bool(node.get("worker_enabled", True))
+        scheduler_eligible = bool(node.get("scheduler_eligible", True))
+        participation_state = str(node.get("participation_state", "AVAILABLE")).upper()
+        if not worker_enabled or not scheduler_eligible or participation_state == "OFF":
+            return False, f"ADMINISTRATIVE_LOCK: Node is administratively disabled from scheduling (worker_enabled={worker_enabled}, scheduler_eligible={scheduler_eligible}, participation_state={participation_state})"
+
         # Anti-affinity hints
         hints = reqs.get("hints", {})
         anti_affinity = hints.get("node_anti_affinity", [])
@@ -422,11 +448,19 @@ class ResourceScheduler:
                     return False, f"{REJECTION_ANTI_AFFINITY_CONFLICT}: Node label '{label_key}' matches job anti-affinity constraint"
 
         # Role compatibility
-        req_role = reqs.get("role")
+        req_role = reqs.get("role") or reqs.get("target_role")
+        node_role = node.get("role", "compute").lower()
+        target_node = reqs.get("target_node") or reqs.get("preferred_node")
+        is_explicitly_targeted = bool(target_node and target_node == node.get("node_id"))
+
         if req_role:
-            node_role = node.get("role", "compute").lower()
             if node_role != req_role.lower() and node_role != "hybrid":
                 return False, f"{REJECTION_ROLE_MISMATCH}: Node role '{node_role}' does not match required '{req_role}'"
+        else:
+            # If no role requested, production jobs target general compute or hybrid nodes only
+            if node_role in ("experimental-worker", "build-worker", "gateway", "controller"):
+                if not is_explicitly_targeted:
+                    return False, f"{REJECTION_ROLE_MISMATCH}: Specialized role '{node_role}' requires explicit job role request"
 
         # =========================================================================
         # Stage 3 (Availability Class Gate)
@@ -504,6 +538,30 @@ class ResourceScheduler:
         missing_verified = [c for c in req_verified if not verified_caps.get(c, False)]
         if missing_verified:
             return False, f"{REJECTION_UNSATISFIABLE_CAPABILITY}: Missing required verified capabilities {missing_verified}"
+
+        # Permissions & Capability State Gate
+        req_perms = reqs.get("permissions") or reqs.get("required_permissions") or []
+        if isinstance(req_perms, str):
+            req_perms = [p.strip() for p in req_perms.split(",") if p.strip()]
+        if req_perms:
+            node_perms = node.get("permissions") or node.get("telemetry", {}).get("permissions", {}) or {}
+            if isinstance(node_perms, dict) and "permissions" in node_perms and isinstance(node_perms["permissions"], dict):
+                node_perms = node_perms["permissions"]
+            for perm in req_perms:
+                if not isinstance(node_perms, dict) or not node_perms.get(perm, False):
+                    return False, f"{REJECTION_HARDWARE_PERIPHERAL_UNPERMITTED}: Required permission '{perm}' is unavailable or denied"
+
+        # Check if any required capability in verified_capabilities is in PERMISSION_REQUIRED / PERMISSION_DENIED / UNAVAILABLE state
+        raw_verified_dict = node.get("verified_capabilities", {})
+        if isinstance(raw_verified_dict, dict):
+            for cap in req_caps:
+                cap_info = raw_verified_dict.get(cap)
+                if isinstance(cap_info, dict):
+                    cap_st = str(cap_info.get("state", "")).upper()
+                    if cap_st in ("PERMISSION_REQUIRED", "PERMISSION_DENIED"):
+                        return False, f"{REJECTION_HARDWARE_PERIPHERAL_UNPERMITTED}: Capability '{cap}' requires permission or permission was denied (state={cap_st})"
+                    if cap_st in ("UNAVAILABLE", "ERROR") or cap_info.get("is_available") is False:
+                        return False, f"{REJECTION_UNSATISFIABLE_CAPABILITY}: Capability '{cap}' is unavailable on node (state={cap_st or 'UNAVAILABLE'})"
 
         # =========================================================================
         # Stage 5 (Hardware Peripheral State Gate)

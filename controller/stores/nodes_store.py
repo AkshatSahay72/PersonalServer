@@ -11,13 +11,13 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 
 from config.platform_config import get_controller_paths
-from controller.stores.base import DB_LOCK, atomic_save_json
+from controller.stores.base import DB_LOCK, atomic_save_json, atomic_write_json_file
 
 
 def load_nodes_db(paths: Optional[Any] = None) -> Dict[str, Any]:
     """
     Loads registered cluster nodes database.
-    Rolls back to `.bak` if primary file is corrupted.
+    Rolls back to `.bak` and heals primary if primary file is corrupted.
     Returns default empty cluster schema if files are absent or unrecoverable.
     """
     curr_paths = paths or get_controller_paths()
@@ -28,15 +28,23 @@ def load_nodes_db(paths: Optional[Any] = None) -> Dict[str, Any]:
         if nodes_file.exists():
             try:
                 with open(nodes_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
             except Exception as e:
                 print(f"Warning: Corrupt {nodes_file} ({e}). Attempting rollback to backup...", file=sys.stderr)
-                if backup_file.exists():
+        if backup_file.exists():
+            try:
+                with open(backup_file, "r", encoding="utf-8") as bf:
+                    recovered = json.load(bf)
+                if isinstance(recovered, dict):
                     try:
-                        with open(backup_file, "r", encoding="utf-8") as bf:
-                            return json.load(bf)
+                        atomic_write_json_file(nodes_file, recovered)
                     except Exception:
                         pass
+                    return recovered
+            except Exception:
+                pass
         return {"cluster_name": "PersonalServer", "nodes": {}}
 
 

@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>PersonalServer CCTV Live Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #0b0f19;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background-color: #111827;
+      border-bottom: 1px solid #1f2937;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .status-badge {
+      font-size: 11px;
+      font-family: monospace;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      background: #1f2937;
+      color: #9ca3af;
+      border: 1px solid #374151;
+    }
+    .status-badge.live {
+      background: rgba(16, 185, 129, 0.15);
+      color: #10b981;
+      border-color: rgba(16, 185, 129, 0.3);
+    }
+    .status-badge.error {
+      background: rgba(239, 68, 68, 0.15);
+      color: #ef4444;
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+    .auth-container {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    input, select, button {
+      background: #1f2937;
+      border: 1px solid #374151;
+      color: #f3f4f6;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 13px;
+      outline: none;
+      transition: all 0.15s ease;
+    }
+    input:focus, select:focus {
+      border-color: #3b82f6;
+    }
+    button {
+      cursor: pointer;
+      font-weight: 500;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button:hover {
+      background: #374151;
+    }
+    button.btn-primary {
+      background: #2563eb;
+      border-color: #3b82f6;
+      color: #fff;
+    }
+    button.btn-primary:hover {
+      background: #1d4ed8;
+    }
+    button.btn-danger {
+      background: #dc2626;
+      border-color: #ef4444;
+      color: #fff;
+    }
+    button.btn-danger:hover {
+      background: #b91c1c;
+    }
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      position: relative;
+    }
+    .viewport-box {
+      width: 100%;
+      max-width: 1280px;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #1f2937;
+    }
+    #stream-img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+      display: none;
+    }
+    .overlay-telemetry {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      display: flex;
+      gap: 8px;
+      z-index: 10;
+      pointer-events: none;
+    }
+    .telemetry-pill {
+      background: rgba(15, 23, 42, 0.8);
+      backdrop-filter: blur(4px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #38bdf8;
+      font-size: 11px;
+      font-family: monospace;
+      padding: 3px 8px;
+      border-radius: 4px;
+    }
+    .placeholder-state {
+      text-align: center;
+      color: #6b7280;
+      padding: 24px;
+    }
+    .placeholder-icon {
+      font-size: 48px;
+      margin-bottom: 12px;
+      opacity: 0.8;
+    }
+    .controls-bar {
+      margin-top: 16px;
+      width: 100%;
+      max-width: 1280px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: #111827;
+      border: 1px solid #1f2937;
+      padding: 12px 16px;
+      border-radius: 8px;
+    }
+    .controls-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    @media (max-width: 768px) {
+      .viewport-box { aspect-ratio: auto; height: 50vh; }
+      .controls-bar { flex-direction: column; align-items: stretch; }
+      .controls-group { justify-content: center; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-title">
+      <span>📹 PersonalServer CCTV Node</span>
+      <span id="badge-status" class="status-badge">STANDBY</span>
+    </div>
+    <div class="auth-container">
+      <input type="password" id="auth-token" placeholder="Bearer Token (optional)" style="width: 180px;">
+      <button onclick="saveToken()">Save</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="viewport-box" id="viewport-box">
+      <div class="overlay-telemetry" id="telemetry" style="display: none;">
+        <span class="telemetry-pill" id="pill-res">720p</span>
+        <span class="telemetry-pill" id="pill-fps">0 FPS</span>
+        <span class="telemetry-pill" id="pill-cam">Rear (0)</span>
+        <span class="telemetry-pill" id="pill-thermal">🌡️ --°C</span>
+      </div>
+
+      <img id="stream-img" alt="CCTV Stream">
+
+      <div class="placeholder-state" id="placeholder">
+        <div class="placeholder-icon">📷</div>
+        <h3>CCTV Camera Stream Idle</h3>
+        <p style="font-size: 13px; margin-top: 6px; color: #9ca3af;">Click "Start Stream" to initiate live video capture</p>
+      </div>
+    </div>
+
+    <div class="controls-bar">
+      <div class="controls-group">
+        <button id="btn-toggle" class="btn-primary" onclick="toggleStream()">▶ Start Stream</button>
+        <button id="btn-switch-cam" onclick="switchCamera()">🔄 Flip Camera</button>
+      </div>
+
+      <div class="controls-group">
+        <label for="select-res" style="font-size: 12px; color: #9ca3af;">Quality:</label>
+        <select id="select-res" onchange="changeQuality()">
+          <option value="480p" selected>480p (Fast, 640x480, 15 FPS)</option>
+          <option value="720p">720p (HD, 1280x720, 15 FPS)</option>
+          <option value="360p">360p (Ultra Fast, 480x360, 15 FPS)</option>
+        </select>
+        <button onclick="takeSnapshot()">📸 Snapshot</button>
+        <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let isStreaming = false;
+    let activeCamera = "0";
+    let token = localStorage.getItem("ps_cctv_token") || new URLSearchParams(window.location.search).get("token") || "";
+    let fpsCounter = 0;
+    let fpsInterval = null;
+
+    if (token) {
+      document.getElementById("auth-token").value = token;
+    }
+
+    function saveToken() {
+      token = document.getElementById("auth-token").value.trim();
+      localStorage.setItem("ps_cctv_token", token);
+      alert("Token saved");
+    }
+
+    function getAuthHeaders() {
+      const h = {};
+      if (token) h["Authorization"] = "Bearer " + token;
+      return h;
+    }
+
+    function updateBadge(text, type) {
+      const b = document.getElementById("badge-status");
+      b.textContent = text;
+      b.className = "status-badge " + (type || "");
+    }
+
+    async function toggleStream() {
+      if (isStreaming) {
+        await stopStream();
+      } else {
+        await startStream();
+      }
+    }
+
+    async function startStream() {
+      updateBadge("CONNECTING...", "");
+      const quality = document.getElementById("select-res").value;
+      
+      try {
+        const res = await fetch("/hardware", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          body: JSON.stringify({
+            operation: "START_LIVE_CALL",
+            params: {
+              camera_id: activeCamera,
+              quality: quality,
+              jpeg_quality: 50,
+              audio_enabled: false,
+              timeout_sec: 300
+            }
+          })
+        });
+
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (e) {}
+
+        const resErr = (data && data.result && (data.result.error || data.result.error_code)) || (data && data.error) || "";
+        const isAlreadyActive = Boolean(data && (data.already_active || resErr === "SESSION_ALREADY_ACTIVE"));
+        const isOk = (res.ok && data.success) || isAlreadyActive;
+        if (isOk) {
+          isStreaming = true;
+          document.getElementById("btn-toggle").textContent = "⏹ Stop Stream";
+          document.getElementById("btn-toggle").className = "btn-danger";
+          updateBadge("LIVE", "live");
+          document.getElementById("placeholder").style.display = "none";
+          document.getElementById("telemetry").style.display = "flex";
+
+          const activeSess = (data && data.result && data.result.session) || (data && data.session) || {};
+          if (activeSess.camera_id !== undefined && activeSess.camera_id !== null) {
+            activeCamera = String(activeSess.camera_id);
+          }
+
+          const img = document.getElementById("stream-img");
+          const streamUrl = `/camera/stream?t=${Date.now()}` + (token ? `&token=${encodeURIComponent(token)}` : "");
+          img.src = streamUrl;
+          img.style.display = "block";
+          document.getElementById("pill-res").textContent = quality;
+          document.getElementById("pill-cam").textContent = activeCamera === "1" ? "Front (1)" : "Rear (0)";
+
+          img.onerror = () => {
+            console.warn("MJPEG stream error or unsupported in img; falling back to frame polling");
+            startFramePollingFallback();
+          };
+
+          // Watchdog: If no frames rendered after 2.5s, engage frame polling fallback
+          setTimeout(() => {
+            if (isStreaming && fpsCount === 0) {
+              console.info("Watchdog engaging frame polling fallback");
+              startFramePollingFallback();
+            }
+          }, 2500);
+
+          startFpsTracking();
+        } else {
+          updateBadge("ERROR", "error");
+          alert("Failed to start stream: " + (data.error || JSON.stringify(data)));
+        }
+      } catch (err) {
+        // Even if POST /hardware fails, attempt direct /camera/stream connection
+        try {
+          isStreaming = true;
+          document.getElementById("placeholder").style.display = "none";
+          document.getElementById("telemetry").style.display = "flex";
+          const img = document.getElementById("stream-img");
+          img.src = `/camera/stream?t=${Date.now()}`;
+          img.style.display = "block";
+          updateBadge("LIVE", "live");
+          document.getElementById("btn-toggle").textContent = "⏹ Stop Stream";
+          document.getElementById("btn-toggle").className = "btn-danger";
+          startFpsTracking();
+          startFramePollingFallback();
+          return;
+        } catch (e) {}
+        updateBadge("FAILED", "error");
+        alert("Connection failed: " + err.message);
+      }
+    }
+
+    let framePollingActive = false;
+    function startFramePollingFallback() {
+      if (framePollingActive || !isStreaming) return;
+      framePollingActive = true;
+      const pollLoop = async () => {
+        if (!isStreaming || !framePollingActive) return;
+        try {
+          const frameUrl = `/camera/frame?t=${Date.now()}` + (token ? `&token=${encodeURIComponent(token)}` : "");
+          const r = await fetch(frameUrl);
+          if (r.ok) {
+            const blob = await r.blob();
+            if (blob.size > 0 && isStreaming) {
+              const objUrl = URL.createObjectURL(blob);
+              const img = document.getElementById("stream-img");
+              const old = img.src;
+              img.src = objUrl;
+              img.style.display = "block";
+              if (old && old.startsWith("blob:")) URL.revokeObjectURL(old);
+              fpsCount++;
+            }
+          }
+        } catch (e) {}
+        if (isStreaming && framePollingActive) {
+          setTimeout(pollLoop, 65);
+        }
+      };
+      pollLoop();
+    }
+
+    async function stopStream() {
+      framePollingActive = false;
+      try {
+        await fetch("/hardware", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          body: JSON.stringify({
+            operation: "STOP_LIVE_CALL",
+            params: { reason: "User stopped viewer" }
+          })
+        });
+      } catch (e) {}
+
+      isStreaming = false;
+      stopFpsTracking();
+      const img = document.getElementById("stream-img");
+      img.src = "";
+      img.style.display = "none";
+      document.getElementById("placeholder").style.display = "block";
+      document.getElementById("telemetry").style.display = "none";
+      document.getElementById("btn-toggle").textContent = "▶ Start Stream";
+      document.getElementById("btn-toggle").className = "btn-primary";
+      updateBadge("STANDBY", "");
+    }
+
+    async function switchCamera() {
+      activeCamera = activeCamera === "0" ? "1" : "0";
+      document.getElementById("pill-cam").textContent = activeCamera === "1" ? "Front (1)" : "Rear (0)";
+      if (isStreaming) {
+        await fetch("/hardware", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          body: JSON.stringify({
+            operation: "UPDATE_LIVE_CALL",
+            params: { camera_id: activeCamera }
+          })
+        });
+      }
+    }
+
+    async function changeQuality() {
+      const q = document.getElementById("select-res").value;
+      document.getElementById("pill-res").textContent = q;
+      if (isStreaming) {
+        await fetch("/hardware", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          body: JSON.stringify({
+            operation: "UPDATE_LIVE_CALL",
+            params: { quality: q }
+          })
+        });
+      }
+    }
+
+    function startFpsTracking() {
+      stopFpsTracking();
+      fpsInterval = setInterval(async () => {
+        if (!isStreaming) return;
+        try {
+          const res = await fetch("/camera/status", {
+            headers: { ...getAuthHeaders() }
+          });
+          const data = await res.json();
+          const sess = (data && data.session) || {};
+          const fps = (sess.quality && sess.quality.fps) ? sess.quality.fps : 15;
+          document.getElementById("pill-fps").textContent = fps + " FPS";
+
+          const thm = (data && data.thermal) || {};
+          const thmPill = document.getElementById("pill-thermal");
+          if (thmPill && thm.temperature_c !== undefined && thm.temperature_c !== null) {
+            const st = thm.state || "NORMAL";
+            if (st === "CRITICAL") {
+              thmPill.textContent = "🚨 " + thm.temperature_c + "°C CRITICAL";
+              thmPill.style.color = "#ef4444";
+              thmPill.style.borderColor = "#ef4444";
+            } else if (st === "THROTTLED") {
+              thmPill.textContent = "🔥 " + thm.temperature_c + "°C THROTTLED";
+              thmPill.style.color = "#f97316";
+              thmPill.style.borderColor = "#f97316";
+              document.getElementById("pill-res").textContent = "360p (Throttled)";
+            } else if (st === "WARM") {
+              thmPill.textContent = "🌡️ " + thm.temperature_c + "°C WARM";
+              thmPill.style.color = "#fbbf24";
+              thmPill.style.borderColor = "#fbbf24";
+            } else {
+              thmPill.textContent = "🌡️ " + thm.temperature_c + "°C";
+              thmPill.style.color = "#38bdf8";
+              thmPill.style.borderColor = "rgba(255,255,255,0.1)";
+            }
+          }
+        } catch (e) {}
+      }, 3000);
+    }
+
+    function stopFpsTracking() {
+      if (fpsInterval) clearInterval(fpsInterval);
+    }
+
+    async function takeSnapshot() {
+      const url = `/camera/frame?t=${Date.now()}` + (token ? `&token=${encodeURIComponent(token)}` : "");
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `cctv-snapshot-${Date.now()}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    function toggleFullscreen() {
+      const box = document.getElementById("viewport-box");
+      if (!document.fullscreenElement) {
+        box.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      // Clean STANDBY state on page load - strictly on-demand
+      updateBadge("STANDBY", "");
+      document.getElementById("btn-toggle").textContent = "▶ Start Stream";
+      document.getElementById("btn-toggle").className = "btn-primary";
+    });
+
+    // Auto-release camera hardware on tab close or navigation
+    window.addEventListener("beforeunload", () => {
+      if (isStreaming) {
+        navigator.sendBeacon("/hardware", JSON.stringify({
+          operation: "STOP_LIVE_CALL",
+          params: { reason: "Page unload" }
+        }));
+      }
+    });
+
+    window.addEventListener("pagehide", () => {
+      if (isStreaming) {
+        navigator.sendBeacon("/hardware", JSON.stringify({
+          operation: "STOP_LIVE_CALL",
+          params: { reason: "Page hidden" }
+        }));
+      }
+    });
+  </script>
+</body>
+</html>
