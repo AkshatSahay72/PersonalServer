@@ -104,10 +104,10 @@ PersonalServer/
 2. **M1 — CCTV & Camera Dashboard Integration (Completed & Stabilized on V2334):**
    - Embed live 720p/480p Camera2 video feed and controls directly into the central Operations Dashboard (`server.akshatsahay.space` / `:8080`).
    - Integrated front/rear camera flip, strict on-demand auto-release, and real-time telemetry overlay.
-3. **M3 — Node Health, Thermal Protection & Auto-Recovery (Current Focus):**
+3. **M3 — Node Health, Thermal Protection & Auto-Recovery (Completed):**
    - Enforce active battery thermal throttling (> 42°C) and background process resurrection.
    - Guard mobile hardware longevity and self-healing across nodes before multi-device rollout.
-4. **M4 — Deployment Pipeline Fixes:**
+4. **M4 — Deployment Pipeline Fixes (Current Focus):**
    - Reconfigure and resolve application deployment bugs in `controller/deployment_manager.py`.
    - Ensure clean atomic rollbacks when health checks fail across multi-runtime applications.
 5. **M2 — Cross-Device APK Stabilization & Multi-Node Rollout:**

@@ -60,8 +60,16 @@ Tested directly on live Vivo V2334 hardware (`100.113.234.61:8080`) on November 
 
 ---
 
+### 3.4 Milestone M3: Thermal Protection & Node Auto-Recovery Completed
+Implemented and verified on November 16, 2026:
+- **Thermal Protection Engine (`config/node_telemetry.py`):** Added `ThermalProtectionManager` with state machine (`NORMAL` <= 39°C, `WARM` 39.1-41.9°C, `THROTTLED` 42.0-44.9°C, `CRITICAL` >= 45.0°C).
+- **Active Throttling & Cutoff (`agent/hardware/live_call.py`):** Proactive stream quality reduction to `360p` / `5 FPS` at 42°C, emergency hardware cutoff at 45°C with hysteresis cooldown lock until battery reaches <= 39°C. Rejects `START_LIVE_CALL` with HTTP 429 `THERMAL_COOLDOWN_ACTIVE` while cooling.
+- **Autonomous Process Supervisor (`scripts/node_supervisor.py`):** Zero-dependency daemon providing automated health inspection and detached resurrection of dead daemons (`node-api` :8080, `node-worker`, `node-heartbeat`, `controller`, `app-router`) with anti-churn rate limiting.
+- **Test Evidence:** 28/28 unit tests passing (100%) in `tests/unit/test_thermal_protection.py`, `tests/unit/test_node_supervisor.py`, and `tests/unit/test_e07_live_call.py`.
+
+---
+
 ## 4. Known Gaps & In-Flight Priorities
 
-1. **Node Health & Thermal Protection (M3 — Immediate Next):** Implement battery thermal monitoring (> 42°C active throttling) and enhance node process resurrection before expanding to more devices.
-2. **Application Deployment Subsystem Bugs (M4):** Resolve reported deployment bugs in `controller/deployment_manager.py` and verify atomic rollback mechanics.
-3. **Gujarat Node APK Rollout (M2 — Deferred after M3/M4):** Deploy APK v1.0.9+ across Android 11 devices (Vivo Y31, Realme 5 Pro) once node health and deployment stability are verified.
+1. **Application Deployment Subsystem Bugs (M4 — Immediate Next Focus):** Resolve reported deployment bugs in `controller/deployment_manager.py` and verify atomic rollback mechanics.
+2. **Gujarat Node APK Rollout (M2 — Deferred after M4):** Deploy APK v1.0.9+ across Android 11 devices (Vivo Y31, Realme 5 Pro) once node health and deployment stability are verified.
